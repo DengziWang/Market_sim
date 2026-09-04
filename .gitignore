@@ -1,0 +1,12 @@
+/target/
+**/target/
+*.pyc
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+runs/
+*.whl
+.DS_Store
+*.png

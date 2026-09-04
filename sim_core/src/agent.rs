@@ -1,0 +1,156 @@
+//! Agent state shared by every bot type/variant, and the small vocabulary
+//! (`Action`, `StepResult`) bots use to talk to the engine.
+
+use std::collections::HashMap;
+
+use rand_chacha::ChaCha8Rng;
+
+use crate::types::{AgentId, AssetId, OrderId, OrderType, PriceTicks, Side, SimTime, TimeInForce};
+
+/// A leveraged position, held by the configurable sub-population of agents that
+/// trade on margin (Phase 1 simplified model: see sim_core::liquidation).
+#[derive(Debug, Clone)]
+pub struct MarginPosition {
+    pub asset_id: AssetId,
+    pub side: Side,
+    pub size: f64,
+    pub entry_price: f64,
+    pub leverage: f64,
+    /// Fraction of the theoretical liquidation distance (1/leverage) actually used,
+    /// e.g. 0.8 => at 10x a position liquidates around an ~8% adverse move, not 10%.
+    pub maintenance_margin_buffer: f64,
+    pub collateral: f64,
+}
+
+impl MarginPosition {
+    /// Liquidation trigger price against the (EMA) mark price.
+    pub fn liquidation_price(&self) -> f64 {
+        let raw_distance = 1.0 / self.leverage;
+        let distance = raw_distance * self.maintenance_margin_buffer;
+        match self.side {
+            Side::Buy => self.entry_price * (1.0 - distance),
+            Side::Sell => self.entry_price * (1.0 + distance),
+        }
+    }
+
+    pub fn is_liquidatable(&self, mark_price: f64) -> bool {
+        match self.side {
+            Side::Buy => mark_price <= self.liquidation_price(),
+            Side::Sell => mark_price >= self.liquidation_price(),
+        }
+    }
+
+    pub fn unrealized_pnl(&self, mark_price: f64) -> f64 {
+        match self.side {
+            Side::Buy => (mark_price - self.entry_price) * self.size,
+            Side::Sell => (self.entry_price - mark_price) * self.size,
+        }
+    }
+}
+
+/// Present only for the configurable fraction of agents (of any bot type -- see spec
+/// 5.7) that additionally carry a leveraged directional side-bet alongside their
+/// primary strategy.
+#[derive(Debug, Clone, Copy)]
+pub struct LeverageCfg {
+    pub leverage_range: (f64, f64),
+    pub position_frac_of_cash: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiquidationExecStyle {
+    Full,
+    /// Staggered/partial execution over several slices (TWAP-like), to reduce impact.
+    StaggeredTwap { slices: u32 },
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentCommon {
+    pub id: AgentId,
+    pub cash: f64,
+    pub inventory: HashMap<AssetId, f64>,
+    pub bankrupt: bool,
+    pub margin: Option<MarginPosition>,
+    pub liquidation_style: LiquidationExecStyle,
+    /// Set only for agents in a leveraged sub-population; drives the generic
+    /// "maybe open a leveraged side-bet" piggyback check in `sim.rs`.
+    pub leverage_cfg: Option<LeverageCfg>,
+    /// Per-agent-class network delay applied to this agent's outgoing orders.
+    pub latency: SimTime,
+    pub maker_fee: f64,
+    pub taker_fee: f64,
+    /// Orders this agent believes are currently resting, tracked by the agent itself
+    /// (the book is the source of truth; agents reconcile via fill/cancel events).
+    pub open_orders: Vec<OrderId>,
+    pub rng: ChaCha8Rng,
+    /// Realized PnL accumulator (for agent_state export).
+    pub realized_pnl: f64,
+    /// Cumulative notional traded (maker + taker fills), for concentration (HHI) and
+    /// volume-authenticity analysis.
+    pub cumulative_volume: f64,
+}
+
+impl AgentCommon {
+    pub fn inventory_of(&self, asset_id: AssetId) -> f64 {
+        *self.inventory.get(&asset_id).unwrap_or(&0.0)
+    }
+
+    pub fn add_inventory(&mut self, asset_id: AssetId, delta: f64) {
+        *self.inventory.entry(asset_id).or_insert(0.0) += delta;
+    }
+
+    pub fn equity(&self, mark_prices: &HashMap<AssetId, f64>) -> f64 {
+        let inv_value: f64 = self
+            .inventory
+            .iter()
+            .map(|(a, q)| q * mark_prices.get(a).copied().unwrap_or(0.0))
+            .sum();
+        let margin_value = self
+            .margin
+            .as_ref()
+            .map(|m| {
+                let mp = mark_prices.get(&m.asset_id).copied().unwrap_or(m.entry_price);
+                m.collateral + m.unrealized_pnl(mp)
+            })
+            .unwrap_or(0.0);
+        self.cash + inv_value + margin_value
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NewOrderRequest {
+    pub asset_id: AssetId,
+    pub side: Side,
+    pub order_type: OrderType,
+    pub tif: TimeInForce,
+    pub post_only: bool,
+    pub price: Option<f64>,
+    pub qty: f64,
+}
+
+#[derive(Debug, Clone)]
+pub enum Action {
+    Submit(NewOrderRequest),
+    Cancel(OrderId),
+}
+
+pub struct StepResult {
+    pub actions: Vec<Action>,
+    /// Absolute simulated time this agent wants to be woken next; `None` means it
+    /// goes dormant (e.g. bankrupt, or a one-shot stress-test trader).
+    pub next_wake: Option<SimTime>,
+}
+
+impl StepResult {
+    pub fn sleep_only(next_wake: Option<SimTime>) -> Self {
+        Self {
+            actions: Vec::new(),
+            next_wake,
+        }
+    }
+}
+
+/// Suppresses an unused-import warning until PriceTicks is used directly by a bot
+/// (most bots work in plain f64 prices via NewOrderRequest).
+#[allow(dead_code)]
+type _Unused = PriceTicks;

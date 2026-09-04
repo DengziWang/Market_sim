@@ -1,0 +1,193 @@
+# =============================================================================
+# Scenario (c): stress test -- high wash-trading + MEV share, calibrated toward the
+# report's explicit "worst case" anchor (wash trading >70% of reported volume on
+# unregulated exchanges). Liquidity provision (market_maker) and the noise/retail
+# control group are both deliberately thinned out, to isolate what a market
+# dominated by extractive/manipulative bot activity looks like in the market_health
+# metrics, vs. realistic_mix.toml and pure_bot_market.toml.
+#
+# Shorter nominal session than the other two scenarios, per spec 6a's guidance that
+# crash-/stress-test experiments want short focused windows with more seed repeats
+# (run this through `market_sim.build_stress_test_plan` / more seeds than the
+# realistic/pure-bot scenarios, not longer sessions).
+# =============================================================================
+
+[run]
+seed = 1
+session_seconds = 600.0
+min_trades = 10000
+max_session_seconds = 7200.0
+extension_step_seconds = 600.0
+
+[[assets]]
+symbol = "BTC"
+tick_size = 0.5
+initial_price = 60000.0
+fundamental_vol = 0.02
+fundamental_theta = 0.08
+
+[[assets]]
+symbol = "ETH"
+tick_size = 0.05
+initial_price = 3000.0
+fundamental_vol = 0.025
+fundamental_theta = 0.08
+
+[[assets]]
+symbol = "SOL"
+tick_size = 0.01
+initial_price = 150.0
+fundamental_vol = 0.035
+fundamental_theta = 0.1
+
+[[venues]]
+name = "primary"
+inter_venue_latency_secs = 0.05
+
+[[venues]]
+name = "secondary"
+inter_venue_latency_secs = 0.08
+
+[market]
+snapshot_interval_secs = 0.5
+snapshot_depth_levels = 10
+mark_price_ema_halflife_secs = 20.0
+
+[fees]
+default_maker_fee = 0.0002
+default_taker_fee = 0.0005
+[fees.by_bot_type]
+market_maker = [0.0000, 0.0004]
+wash_trading = [0.0002, 0.0005]
+
+[latency]
+default_latency_secs = 0.08
+[latency.by_bot_type]
+market_maker = 0.03
+mev = 0.008
+
+[mempool]
+enabled = true
+reveal_delay_secs = 0.3
+large_order_notional_threshold = 15000.0
+
+[liquidation]
+maintenance_margin_buffer = 0.75
+sweep_interval_secs = 0.5
+staggered_slices = 5
+full_liquidation_fraction = 0.6
+
+[export]
+out_dir = "runs/stress_wash_mev"
+write_snapshots = true
+
+# ---- wash_trading (350 agents, 70% -- the report's "worst case" anchor) --------------
+[[population.groups]]
+bot_type = "wash_trading"
+variant = "self_ring"
+count = 200
+[population.groups.params]
+wake_interval_secs = 1.0
+qty_round = 0.5
+
+[[population.groups]]
+bot_type = "wash_trading"
+variant = "volume_ranking"
+count = 150
+[population.groups.params]
+wake_interval_secs = 1.5
+target_session_volume = 500000.0
+
+# ---- mev (10 agents, 2% -- concentrated & very active) -------------------------------
+[[population.groups]]
+bot_type = "mev"
+variant = "sandwich"
+count = 5
+initial_cash_range = [150000.0, 400000.0]
+[population.groups.params]
+wake_interval_secs = 0.02
+min_victim_qty = 0.3
+
+[[population.groups]]
+bot_type = "mev"
+variant = "frontrun"
+count = 3
+initial_cash_range = [150000.0, 400000.0]
+[population.groups.params]
+wake_interval_secs = 0.02
+
+[[population.groups]]
+bot_type = "mev"
+variant = "backrun"
+count = 2
+initial_cash_range = [150000.0, 400000.0]
+[population.groups.params]
+wake_interval_secs = 0.02
+
+# ---- market_maker (40 agents, 8% -- thinned to stress liquidity provision) -----------
+[[population.groups]]
+bot_type = "market_maker"
+variant = "adaptive_spread"
+count = 20
+initial_cash_range = [15000.0, 60000.0]
+[population.groups.params]
+wake_interval_secs = 0.3
+withdrawal_vol_frac = 0.006
+
+[[population.groups]]
+bot_type = "market_maker"
+variant = "avellaneda_stoikov"
+count = 20
+initial_cash_range = [15000.0, 60000.0]
+
+# ---- momentum (30 agents, 6%) -------------------------------------------------------
+[[population.groups]]
+bot_type = "momentum"
+variant = "ma_crossover"
+count = 15
+
+[[population.groups]]
+bot_type = "momentum"
+variant = "breakout_donchian"
+count = 15
+
+# ---- mean_reversion (20 agents, 4%) --------------------------------------------------
+[[population.groups]]
+bot_type = "mean_reversion"
+variant = "zscore"
+count = 20
+
+# ---- arbitrage (20 agents, 4%) --------------------------------------------------------
+[[population.groups]]
+bot_type = "arbitrage"
+variant = "latency_arb"
+count = 10
+[population.groups.params]
+wake_interval_secs = 0.05
+
+[[population.groups]]
+bot_type = "arbitrage"
+variant = "cross_venue"
+count = 10
+
+# ---- grid (10), dca (10), liquidation_trader (10) -- 2% each --------------------------
+[[population.groups]]
+bot_type = "grid"
+variant = "geometric"
+count = 10
+
+[[population.groups]]
+bot_type = "dca"
+variant = "time_based"
+count = 10
+initial_cash_range = [1000.0, 8000.0]
+
+[[population.groups]]
+bot_type = "liquidation_trader"
+variant = "full"
+count = 10
+initial_cash_range = [3000.0, 25000.0]
+[population.groups.params]
+wake_interval_secs = 120.0
+leverage_range = [5.0, 25.0]
+position_frac_of_cash = 0.7

@@ -1,0 +1,246 @@
+# crypto-bot-market-sim
+
+A research simulation for one question: **can a crypto market that's dominated by
+algorithmic bots function in a healthy way**, and how does that depend on the mix of
+bot strategies present? See `docs/marktgesundheit_bericht.md` for the market-health
+framework this project measures against, and `scenarios/` for three example
+compositions (a realistic mix, a pure-bot market, and an adversarial stress test).
+
+## Architecture
+
+- **`sim_core/`** (Rust): the event-driven engine -- multi-asset/multi-venue limit
+  order book with strict price-time priority, a min-heap event queue (agents only
+  wake on their own timer or a relevant event, never a fixed global tick), all bot
+  decision logic, the simplified leveraged-liquidation model, and a deterministic
+  ChaCha8-seeded PRNG per agent. Pure Rust, `cargo test`-able with no Python
+  involved. See `sim_core/src/`.
+- **`sim_pyo3/`**: a thin PyO3 wrapper crate (built by `maturin`) that runs a
+  `sim_core::Simulation` from Python and hands the result back as plain columnar
+  `dict[str, list]` data -- no parquet/arrow dependency on the Rust side at all.
+- **`python/market_sim/`**: orchestration -- config read/write, single-run helpers
+  (`run_scenario_file`, `simulate_and_plot`), the parquet/JSON export (spec section
+  7), plotting, and the batch experiment runner (spec section 6).
+- **`python/market_health/`**: the analysis module (spec section 9) -- computes every
+  metric from `docs/marktgesundheit_bericht.md` directly from the exported parquet
+  files, never by re-running the simulation, plus the composite market-health score
+  and batch composition-comparison plots.
+- **`scenarios/`**: three example scenario configs (spec section 10).
+- **`scripts/benchmark.py`**: the mandatory benchmark-first script (spec 6a) -- run
+  this before any large batch.
+- **`tests_py/`**: Python tests for `market_health` against synthetic data with a
+  known expected result.
+
+## Setup
+
+Requires a Rust toolchain and Python 3.9+. If Python has no `pip`/`venv` available
+(true in the environment this was built in -- Debian/Ubuntu images sometimes ship
+`python3-minimal` without `ensurepip`), bootstrap `pip` first:
+
+```bash
+# Rust toolchain (skip if you already have one)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+source "$HOME/.cargo/env"
+
+# pip, if `python3 -m pip --version` fails
+curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+python3 /tmp/get-pip.py --user
+export PATH="$HOME/.local/bin:$PATH"   # put this in your shell rc too
+
+python3 -m pip install --user maturin
+```
+
+Then build and install the extension. `maturin develop` needs a virtualenv or conda
+env; without one, build a wheel and install it directly:
+
+```bash
+cd crypto-bot-market-sim
+
+# with a venv (recommended if you have one):
+#   python3 -m venv .venv && source .venv/bin/activate && pip install -e .
+#   maturin develop --release
+
+# without a venv (what this repo was actually built/tested with):
+maturin build --release
+python3 -m pip install --user --force-reinstall --no-deps target/wheels/market_sim-*.whl
+python3 -m pip install --user pandas pyarrow numpy matplotlib scipy pyyaml toml tqdm pytest
+```
+
+Re-run `maturin build --release` + reinstall after *any* change under `sim_core/`,
+`sim_pyo3/`, **or** `python/` -- the wheel is a snapshot, not a live link (this is a
+consequence of not using `maturin develop`/editable installs; switch to a venv if
+you're iterating a lot).
+
+### Verify the install
+
+```bash
+cargo test -p sim_core                      # Rust: matching engine + full-population smoke test
+python3 -m pytest tests_py/                  # Python: market_health against synthetic data
+python3 -c "from market_sim import validate_config; print(validate_config(open('scenarios/realistic_mix.toml').read()))"
+```
+
+## Quickstart
+
+```python
+from market_sim import run_scenario_file
+
+run = run_scenario_file("scenarios/realistic_mix.toml")
+print(run.meta)                              # {'actual_session_seconds': ..., 'n_trades': ..., ...}
+run.export("runs/realistic_mix/seed_1")       # writes trades.parquet, order_events.parquet, ...
+fig = run.plot()                              # price/volume per asset (spec section 8)
+fig.savefig("run.png")
+```
+
+or from the CLI for a one-shot look:
+
+```bash
+python3 -c "from market_sim import simulate_and_plot; simulate_and_plot('scenarios/realistic_mix.toml', save_path='run.png')"
+```
+
+### Batch experiments (spec section 6/6a)
+
+**Always run `scripts/benchmark.py` on your actual machine before a big batch** --
+see the Performance section below for why.
+
+```python
+from market_sim import build_plan_from_compositions, run_experiment
+
+plan = build_plan_from_compositions(
+    base_config_path="scenarios/realistic_mix.toml",
+    compositions={
+        "realistic_mix": {},
+        "pure_bot_market": {"population": __import__("market_sim.config", fromlist=["load_config_dict"]).load_config_dict("scenarios/pure_bot_market.toml")["population"]},
+    },
+    seeds=range(20, 40),        # 20 seeds per composition (spec 6a: 20-50 default)
+    out_dir="runs/experiment_1",
+)
+summary = run_experiment(plan, n_workers=5)   # 5 workers: spec 6a's "leave one core free" default
+print(summary)
+```
+
+Then analyze the whole batch:
+
+```python
+from market_health import load_and_score_runs, compare_compositions, plot_composition_comparison
+
+metrics = load_and_score_runs(plan.all_run_dirs())
+comparison = compare_compositions(metrics)     # mean +/- 95% CI per composition, per dimension
+plot_composition_comparison(comparison).savefig("comparison.png")
+```
+
+A killed/interrupted `run_experiment` call can just be re-run with the same `plan` --
+completed cells (those with a `run_metadata.json`) are skipped (`resume=True` is the
+default).
+
+### Crash-/stress-test experiments
+
+Spec 6a treats these as a distinct experiment *type* (short focused window, more
+repeats) rather than a special code path -- `build_stress_test_plan` is a thin
+wrapper around the same mechanism, and `scenarios/stress_wash_mev.toml` is a ready-
+made short-session, wash/MEV-heavy example to point it at.
+
+## Configuration format
+
+Everything is a TOML file matching `sim_core::config::ScenarioConfig` (see
+`sim_core/src/config.rs` for the authoritative schema/defaults). Top level:
+
+```toml
+[run]            # seed, session_seconds, min_trades, max_session_seconds, extension_step_seconds
+[[assets]]        # symbol, tick_size, initial_price, fundamental_vol, fundamental_theta (repeat per asset)
+[[venues]]        # name, inter_venue_latency_secs (repeat per venue; omit for a single "primary" venue)
+[market]          # snapshot_interval_secs, snapshot_depth_levels, mark_price_ema_halflife_secs
+[fees]            # default_maker_fee/default_taker_fee, [fees.by_bot_type]
+[latency]         # default_latency_secs, [latency.by_bot_type]
+[mempool]         # enabled, reveal_delay_secs, large_order_notional_threshold
+[liquidation]     # maintenance_margin_buffer, sweep_interval_secs, staggered_slices, full_liquidation_fraction
+[export]          # out_dir, write_snapshots
+[[population.groups]]   # bot_type, variant, count, initial_cash_range, leveraged_fraction,
+                         # leverage_range, [population.groups.params] (variant-specific), notes
+```
+
+`bot_type` is one of `market_maker`, `arbitrage`, `momentum`, `mean_reversion`,
+`grid`, `dca`, `liquidation_trader`, `mev`, `wash_trading`, `noise` -- see
+`sim_core/src/bots/` for each type's variants and their `params` keys/defaults
+(every module has them in a doc comment at the top of its `State::from_params`).
+
+**Bot-type weighting**: the three example scenarios use a documented-but-provisional
+weighting (see the comments at the top of each file) -- confirm/adjust it before
+treating results as a real finding, not just a smoke test.
+
+## Performance
+
+Measured with `scripts/benchmark.py --release` on the machine this was built on --
+its hostname identifies it as the actual Acer Nitro AN517-51 target hardware from
+spec section 11 (`Linux-6.8.0-138-generic-x86_64`, 12 logical cores visible via
+`nproc`), so these numbers should be directly usable for planning. Still: laptops
+throttle under sustained load in a way a short benchmark run won't catch, so if you
+run a long batch and it's much slower than this predicts, that's the likely cause --
+see the note at the end of this section.
+
+| agents | simulated session | wall time | events/sec |
+|---|---|---|---|
+| 300  | 300s  | ~0.2s | ~1.6M/s |
+| 3000 | 600s  | ~5.2s | ~1.25M/s |
+
+That's roughly **30-50x the "several zehntausend events/sec" target** from a single
+un-parallelized run, on this machine. Two things this does *not* yet include:
+
+1. **Per-run parallelism (Rayon)**: not wired up. The spec's Rayon requirement is
+   satisfied at the *batch* level (`market_sim.run_experiment`'s multiprocessing
+   pool runs independent simulations across worker processes -- the actual
+   embarrassingly-parallel axis, since a batch is many independent runs). A single
+   simulation's event loop is inherently sequential (each event can depend on the
+   book state left by the previous one), so intra-run Rayon parallelism would need
+   splitting work per-asset at best, which wasn't necessary given the numbers above.
+2. Numbers will be lower with `write_snapshots = true` at a tight
+   `snapshot_interval_secs` on many assets, and with `mempool.enabled = true` (extra
+   bookkeeping per large order) -- the benchmark script's default config exercises a
+   representative but not maximal mix; adjust it or your scenario file if your
+   composition is unusually snapshot- or mempool-heavy.
+
+Given these numbers, the spec 4/6a agent-count defaults (1,000-3,000 for batch runs,
+5,000-15,000 for confirmation runs) look comfortably achievable on this hardware --
+with a lot of headroom left over. Still re-run `scripts/benchmark.py` before a big
+batch if it's been a while (thermal state, other load on the machine, etc. all
+matter), and per spec 6a/12: if a real batch run turns out much worse than this
+predicts, reduce the defaults and confirm the change with the user rather than
+deciding alone.
+
+## Known simplifications (read before treating results as findings)
+
+Documented in more detail at each site in the code; the significant ones:
+
+- **Triangular arbitrage** operates on 3 assets that should maintain a configured
+  `peg_ratio`, not on dedicated A/B, B/C, A/C pair order books (the engine models
+  each asset as a single spot book against a common numeraire). Real pair-based
+  triangular arbitrage is a natural extension once pair books exist.
+- **Wash-trading `self_ring`** is one agent crossing its own resting order (proven
+  safe against accidentally trading a real counterparty -- see the comment in
+  `sim_core/src/bots/wash_trading.rs`), not coordinated multi-wallet ring trading
+  across distinct agent ids.
+- **Grid bots** tear down and rebuild their whole ladder every `wake_interval`
+  (like a market-maker requote) rather than replacing only the level that just filled.
+- **Liquidation**: Phase-1 simplified margin model only (leverage + maintenance-
+  margin buffer + EMA mark price + partial/staggered liquidation) -- no funding rate,
+  funding-arbitrage bots, insurance fund, or auto-deleveraging (spec 5.7's explicit
+  scope cut; the architecture -- `AgentCommon::margin`, `LiquidationExecStyle` --
+  is meant to take a Phase-2 funding-rate extension without a core rewrite).
+- **Cancel latency**: cancels apply immediately; only new-order submission is delayed
+  by an agent's configured latency (and by the mempool model for large orders).
+- **MEV bots' "mempool"**: a configurable notional threshold decides which orders are
+  staged through the public pending-order queue at all; below it, orders land
+  directly (real mempools don't filter by size, but modeling every order that way
+  would make *every* agent latency-sensitive to *every* other agent's flow, which
+  isn't the phenomenon spec 5.8 is asking to isolate).
+- **Kyle's Lambda / order-flow-imbalance / VPIN** use the trade table's `taker_side`
+  directly (this simulation actually knows it); `Amihud` and `variance_ratio` use a
+  fixed time-bucket/resample rather than a tick-imbalance clock.
+
+## Tests
+
+```bash
+cargo test -p sim_core          # matching engine (price-time priority, partial fills,
+                                 # IOC/FOK/post-only edge cases) + a full-population
+                                 # end-to-end smoke test across every bot type/variant
+python3 -m pytest tests_py/     # market_health metrics against synthetic data with a
+                                 # known expected result
+```

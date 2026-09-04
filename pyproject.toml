@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "market-sim"
+version = "0.1.0"
+description = "Bot-dominated crypto market simulation (research)"
+requires-python = ">=3.9"
+dependencies = [
+    "pandas>=1.5",
+    "pyarrow>=12.0",
+    "numpy>=1.23",
+    "matplotlib>=3.5",
+    "scipy>=1.8",
+    "pyyaml>=5.4",
+    "toml>=0.10",
+    "tqdm>=4.60",
+]
+
+[tool.maturin]
+manifest-path = "sim_pyo3/Cargo.toml"
+python-source = "python"
+module-name = "market_sim.sim_pyo3"
+python-packages = ["market_health"]
