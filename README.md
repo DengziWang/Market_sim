@@ -138,6 +138,33 @@ repeats) rather than a special code path -- `build_stress_test_plan` is a thin
 wrapper around the same mechanism, and `scenarios/stress_wash_mev.toml` is a ready-
 made short-session, wash/MEV-heavy example to point it at.
 
+## Dashboard (local, interactive)
+
+`app/dashboard.py` is a local Streamlit UI over the same `market_sim`/`market_health`
+packages above -- no separate backend, nothing leaves your machine. It gives you:
+
+- Every field of the scenario config as widgets: session length/seed, the asset
+  ("stock") list, venues, fees/latency/mempool/liquidation, and the full bot
+  population as an editable table (bot type, variant, count, cash range, leverage,
+  and each variant's own JSON params) -- plus a raw-TOML tab as a full-coverage
+  escape hatch for anything the structured widgets don't have a dedicated field for.
+- Zoomable/pannable per-asset price+volume charts (Plotly: drag to zoom, double-click
+  to reset, scroll to zoom) with best bid/ask and the fundamental-value reference
+  overlaid when snapshots are exported.
+- The full `market_health` metric set for the run.
+- A searchable/filterable trade table (asset, bot type, agent id, time range, min
+  quantity, free-text) with CSV export of the filtered rows.
+
+```bash
+python3 -m pip install --user streamlit plotly   # once
+cd crypto-bot-market-sim
+streamlit run app/dashboard.py
+```
+
+Opens at `http://localhost:8501` in your browser. Pick a base scenario in the
+sidebar, edit whatever you want across the tabs, click **Run simulation**, then look
+at the **Results** tab.
+
 ## Configuration format
 
 Everything is a TOML file matching `sim_core::config::ScenarioConfig` (see

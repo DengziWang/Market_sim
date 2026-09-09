@@ -18,6 +18,9 @@ dependencies = [
     "tqdm>=4.60",
 ]
 
+[project.optional-dependencies]
+dashboard = ["streamlit>=1.60", "plotly>=5.20"]
+
 [tool.maturin]
 manifest-path = "sim_pyo3/Cargo.toml"
 python-source = "python"
