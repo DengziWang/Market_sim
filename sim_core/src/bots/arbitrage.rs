@@ -92,6 +92,22 @@ fn ioc(asset_id: AssetId, side: Side, qty: f64) -> Action {
     })
 }
 
+/// Rebalance toward a signed target position, bounded by `s.order_qty` on either
+/// side -- same pattern as momentum/mean_reversion. Without this, a strategy that
+/// re-evaluates every `wake_interval` while its trigger condition (a persistent
+/// mispricing) holds would otherwise keep firing a fresh, uncapped order every wake
+/// with no memory of the position it already built up; that compounded into an
+/// effectively unbounded one-directional position in testing (see git history) for
+/// CrossVenue/Triangular/LatencyArb, which (unlike StatArbPairs) had no such cap.
+fn rebalance(asset_id: AssetId, current: f64, target: f64) -> Option<Action> {
+    let delta = target - current;
+    if delta.abs() < 1e-9 {
+        return None;
+    }
+    let side = if delta > 0.0 { Side::Buy } else { Side::Sell };
+    Some(ioc(asset_id, side, delta.abs()))
+}
+
 pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult {
     let mut actions = Vec::new();
     match s.variant {
@@ -99,13 +115,20 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             if let (Some(pa), Some(pb)) = (ctx.market.mid_price(s.venue_a, s.asset_a), ctx.market.mid_price(s.venue_b, s.asset_a)) {
                 let diff = pb - pa;
                 let cost = pa * s.transfer_cost_frac;
-                if diff.abs() > cost && agent.cash > pa.max(pb) * s.order_qty {
-                    // buy on the cheaper venue, sell on the pricier one (both venues
-                    // assumed pre-funded, i.e. no real-time asset transfer modeled).
-                    if diff > 0.0 {
-                        actions.push(ioc(s.asset_a, Side::Buy, s.order_qty));
-                    } else {
-                        actions.push(ioc(s.asset_a, Side::Sell, s.order_qty));
+                let current = agent.inventory_of(s.asset_a);
+                // Target flips sign with which venue is cheaper, but stays 0 (no
+                // legitimate signal) once the gap is inside transfer cost -- and
+                // rebalance() only trades the *delta* to get there, so a persistent
+                // gap does not cause repeated re-entry (both venues assumed
+                // pre-funded, i.e. no real-time asset transfer modeled).
+                let target = if diff.abs() > cost {
+                    if diff > 0.0 { s.order_qty } else { -s.order_qty }
+                } else {
+                    0.0
+                };
+                if agent.cash > pa.max(pb) * s.order_qty {
+                    if let Some(a) = rebalance(s.asset_a, current, target) {
+                        actions.push(a);
                     }
                 }
             }
@@ -118,16 +141,22 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             ) {
                 let implied_c = pa / pb.max(1e-9) * s.peg_ratio;
                 let deviation = (pc - implied_c) / implied_c.max(1e-9);
-                if deviation.abs() > s.peg_deviation_threshold && agent.cash > (pa + pb + pc) * s.order_qty {
-                    if deviation > 0.0 {
-                        // C overpriced relative to A/B: sell C, buy A, sell B (cycle).
-                        actions.push(ioc(s.asset_c, Side::Sell, s.order_qty));
-                        actions.push(ioc(s.asset_a, Side::Buy, s.order_qty));
-                        actions.push(ioc(s.asset_b, Side::Sell, s.order_qty));
-                    } else {
-                        actions.push(ioc(s.asset_c, Side::Buy, s.order_qty));
-                        actions.push(ioc(s.asset_a, Side::Sell, s.order_qty));
-                        actions.push(ioc(s.asset_b, Side::Buy, s.order_qty));
+                let target_c = if deviation.abs() > s.peg_deviation_threshold {
+                    if deviation > 0.0 { -s.order_qty } else { s.order_qty }
+                } else {
+                    0.0
+                };
+                let target_a = -target_c; // opposite legs of the same cycle
+                let target_b = target_c;
+                if agent.cash > (pa + pb + pc) * s.order_qty {
+                    if let Some(a) = rebalance(s.asset_c, agent.inventory_of(s.asset_c), target_c) {
+                        actions.push(a);
+                    }
+                    if let Some(a) = rebalance(s.asset_a, agent.inventory_of(s.asset_a), target_a) {
+                        actions.push(a);
+                    }
+                    if let Some(a) = rebalance(s.asset_b, agent.inventory_of(s.asset_b), target_b) {
+                        actions.push(a);
                     }
                 }
             }
@@ -165,15 +194,19 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                         // Exploits the fact this bot polls far more frequently
                         // (short wake_interval, low configured latency) than most of
                         // the population, letting it react to a move before it fully
-                        // propagates through slower agents' quotes.
-                        let side = if ret > 0.0 { Side::Buy } else { Side::Sell };
-                        actions.push(ioc(s.asset_a, side, s.order_qty));
+                        // propagates through slower agents' quotes. Bounded by
+                        // order_qty via rebalance(), not fired unconditionally every
+                        // wake: its own trades otherwise could look like a fresh
+                        // "jump" and re-trigger itself indefinitely in one direction.
+                        let target = if ret > 0.0 { s.order_qty } else { -s.order_qty };
+                        if let Some(a) = rebalance(s.asset_a, agent.inventory_of(s.asset_a), target) {
+                            actions.push(a);
+                        }
                     }
                 }
                 s.last_seen_price = Some(p);
             }
         }
     }
-    let _ = agent;
     StepResult { actions, next_wake: Some(ctx.now + s.wake_interval) }
 }

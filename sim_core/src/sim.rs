@@ -138,10 +138,21 @@ impl Simulation {
         // happened directly in open_leveraged_position) rather than normal spot
         // settlement, and skip the latency/mempool staging normal orders get.
         let is_leveraged_bot = matches!(self.strategies[idx], BotStrategy::LiquidationTrader(_));
+        // wash_trading's self-cross (bots/wash_trading.rs) prices its resting leg
+        // against the book state *at decision time* and relies on its own IOC leg
+        // matching that same resting order immediately afterward. Latency breaks that:
+        // the two legs would be independently delayed, and if the book moved in
+        // between, the resting leg can get silently rejected while the IOC leg still
+        // fires unconditionally -- a naked, unbounded market order with nothing to
+        // absorb it (this produced a genuine runaway price crash in testing; see git
+        // history). So wash_trading orders always bypass configured latency/mempool
+        // staging, the same way margin orders do.
+        let is_wash_trading = matches!(self.strategies[idx], BotStrategy::WashTrading(_));
         for a in actions {
-            match (is_leveraged_bot, a) {
-                (true, Action::Submit(req)) => self.apply_submit_margin(agent_id, req),
-                (_, a) => self.apply_action(agent_id, a),
+            match (is_leveraged_bot, is_wash_trading, a) {
+                (true, _, Action::Submit(req)) => self.apply_submit_margin(agent_id, req),
+                (_, true, Action::Submit(req)) => self.apply_submit(agent_id, req),
+                (_, _, a) => self.apply_action(agent_id, a),
             }
         }
 
@@ -525,24 +536,30 @@ fn build_population(cfg: &ScenarioConfig) -> Result<(Vec<AgentCommon>, Vec<BotSt
 
         for i in 0..group.count {
             let mut rng = rng::agent_rng(cfg.run.seed, agent_id);
-            let cash = if cash_hi > cash_lo { rng.gen_range(cash_lo..cash_hi) } else { cash_lo };
+            let mut cash = if cash_hi > cash_lo { rng.gen_range(cash_lo..cash_hi) } else { cash_lo };
             let asset_a = (i as usize % n_assets) as AssetId;
             let asset_b = ((i as usize + 1) % n_assets) as AssetId;
             let asset_c = ((i as usize + 2) % n_assets) as AssetId;
             let venue_b: VenueId = if n_venues > 1 { 1 } else { 0 };
 
             let strat = match group.bot_type.as_str() {
-                "market_maker" => BotStrategy::MarketMaker(market_maker::State::from_params(parse_mm_variant(&group.variant)?, asset_a, &params)),
+                "market_maker" => BotStrategy::MarketMaker(market_maker::State::from_params(parse_mm_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
                 "arbitrage" => BotStrategy::Arbitrage(arbitrage::State::from_params(parse_arb_variant(&group.variant)?, asset_a, asset_b, asset_c, PRIMARY_VENUE, venue_b, &params)),
                 "momentum" => BotStrategy::Momentum(momentum::State::from_params(parse_momentum_variant(&group.variant)?, asset_a, &params)),
                 "mean_reversion" => BotStrategy::MeanReversion(mean_reversion::State::from_params(parse_mr_variant(&group.variant)?, asset_a, &params)),
-                "grid" => BotStrategy::Grid(grid::State::from_params(parse_grid_variant(&group.variant)?, asset_a, &params)),
+                "grid" => BotStrategy::Grid(grid::State::from_params(parse_grid_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
                 "dca" => BotStrategy::Dca(dca::State::from_params(parse_dca_variant(&group.variant)?, asset_a, &params)),
                 "liquidation_trader" => {
                     BotStrategy::LiquidationTrader(liquidation_trader::State::from_params(parse_liq_variant(&group.variant)?, asset_a, cfg.liquidation.maintenance_margin_buffer, &params))
                 }
                 "mev" => BotStrategy::Mev(mev::State::from_params(parse_mev_variant(&group.variant)?, asset_a, &params)),
-                "wash_trading" => BotStrategy::WashTrading(wash_trading::State::from_params(parse_wash_variant(&group.variant)?, asset_a, cfg.run.session_seconds, &params)),
+                "wash_trading" => BotStrategy::WashTrading(wash_trading::State::from_params(
+                    parse_wash_variant(&group.variant)?,
+                    asset_a,
+                    cfg.run.session_seconds,
+                    cfg.assets[asset_a as usize].initial_price,
+                    &params,
+                )),
                 "noise" => BotStrategy::Noise(noise::State::from_params(parse_noise_variant(&group.variant)?, asset_a, &params)),
                 other => return Err(format!("unknown bot_type '{other}' in population config")),
             };
@@ -564,10 +581,27 @@ fn build_population(cfg: &ScenarioConfig) -> Result<(Vec<AgentCommon>, Vec<BotSt
                 None
             };
 
+            // Noise/retail agents start with an existing spot holding (like a real
+            // trader who already owns some of the asset), not zero -- otherwise the
+            // *entire* population is structurally buy-only until it organically
+            // accumulates inventory (sells are correctly gated to what's actually
+            // held; see bots/noise.rs), which biased price sharply upward at the
+            // start of every session in testing (see git history). 20-60% of the
+            // agent's starting budget is pre-converted into inventory at the asset's
+            // initial price; the rest stays as cash.
+            let mut inventory = HashMap::new();
+            if group.bot_type == "noise" {
+                let frac = rng.gen_range(0.2..0.6);
+                let initial_price = cfg.assets[asset_a as usize].initial_price.max(1e-9);
+                let value = cash * frac;
+                inventory.insert(asset_a, value / initial_price);
+                cash -= value;
+            }
+
             agents.push(AgentCommon {
                 id: agent_id,
                 cash,
-                inventory: HashMap::new(),
+                inventory,
                 bankrupt: false,
                 margin: None,
                 liquidation_style,

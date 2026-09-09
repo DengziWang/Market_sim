@@ -29,6 +29,16 @@ pub struct State {
     pub target_session_volume: f64,
     pub session_end: SimTime,
     pub cumulative_volume: f64,
+    /// volume_ranking's per-wake unit size, fixed once at construction from the
+    /// asset's *initial* price (target_session_volume / initial_price / planned
+    /// wake count) rather than recomputed from the live price every wake. Dividing a
+    /// dollar target by the *live* price is unstable: if price dips at all, the
+    /// computed unit quantity grows, and executing that larger self-cross nudges
+    /// price down further, which grows the next quantity again -- a real runaway
+    /// feedback loop observed in testing (see git history), not just a theoretical
+    /// risk. Pacing off a fixed reference price trades a little target-volume
+    /// accuracy (if price moves a lot over the session) for not being able to blow up.
+    pub unit_qty_per_wake: f64,
 }
 
 impl State {
@@ -39,15 +49,32 @@ impl State {
         }
     }
 
-    pub fn from_params(variant: Variant, asset_id: AssetId, session_end: SimTime, p: &toml::Value) -> Self {
+    pub fn from_params(variant: Variant, asset_id: AssetId, session_end: SimTime, initial_price: f64, p: &toml::Value) -> Self {
+        let wake_interval = params::get_f64(p, "wake_interval_secs", 2.0);
+        let target_session_volume = params::get_f64(p, "target_session_volume", 5000.0);
+        let planned_wakes = (session_end / wake_interval.max(1e-6)).max(1.0);
+        let qty_round = params::get_f64(p, "qty_round", 1.0);
+        // A dollar target applied blindly to a cheap asset implies an enormous *unit*
+        // quantity (e.g. $200k / $0.15 DOGE = ~1.3M units) -- wildly disproportionate
+        // to realistic resting liquidity (market-maker quotes are ~0.05-0.6 units in
+        // these scenarios) regardless of how correctly the self-cross itself is
+        // implemented, and drove a real price-crash cascade in testing (the
+        // self-cross's own momentary price prints were enough to trigger adaptive
+        // market-makers' volatility withdrawal, removing the real book entirely --
+        // see git history). Cap it to a bounded multiple of qty_round; a
+        // misconfigured target_session_volume degrades to "trade qty_round-ish size
+        // more often" rather than "trade a liquidity-swamping size".
+        let uncapped = (target_session_volume / initial_price.max(1e-9)) / planned_wakes;
+        let max_unit_qty = params::get_f64(p, "max_qty_per_wake", qty_round * 20.0);
         Self {
             variant,
             asset_id,
-            wake_interval: params::get_f64(p, "wake_interval_secs", 2.0),
-            qty_round: params::get_f64(p, "qty_round", 1.0),
-            target_session_volume: params::get_f64(p, "target_session_volume", 5000.0),
+            wake_interval,
+            qty_round,
+            target_session_volume,
             session_end,
             cumulative_volume: 0.0,
+            unit_qty_per_wake: uncapped.min(max_unit_qty),
         }
     }
 }
@@ -61,12 +88,7 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
 
     let qty = match s.variant {
         Variant::SelfRing => s.qty_round,
-        Variant::VolumeRanking => {
-            let remaining_time = (s.session_end - ctx.now).max(s.wake_interval);
-            let remaining_volume = (s.target_session_volume - s.cumulative_volume).max(0.0);
-            let n_remaining_wakes = (remaining_time / s.wake_interval).max(1.0);
-            (remaining_volume / n_remaining_wakes / mid.max(1e-9)).max(0.0)
-        }
+        Variant::VolumeRanking => s.unit_qty_per_wake,
     };
     if qty <= 1e-9 {
         return StepResult { actions, next_wake: Some(ctx.now + s.wake_interval) };

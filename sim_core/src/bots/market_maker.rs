@@ -46,18 +46,32 @@ impl State {
         }
     }
 
-    pub fn from_params(variant: Variant, asset_id: AssetId, p: &toml::Value) -> Self {
+    /// `initial_price`: the asset's configured reference price, used to convert
+    /// dollar-notional-denominated size params (`order_notional`,
+    /// `max_inventory_notional`) into asset units. Without this, a single
+    /// unit-denominated `order_qty` default applied uniformly across assets spanning
+    /// a wide price range (e.g. BTC at $60k next to DOGE at $0.15) provides wildly
+    /// different *dollar* depth per asset -- a fixed 0.05-unit quote is $3,000 of
+    /// resting liquidity on BTC but $0.0075 on DOGE, leaving cheap assets
+    /// structurally paper-thin against any real-sized order. This produced a genuine
+    /// price-collapse cascade in testing (see git history) once a cheap asset's
+    /// market-maker depth was orders of magnitude too thin relative to other bots'
+    /// (also now notional-scaled) order sizes.
+    pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value) -> Self {
         let vol_window_len = params::get_u32(p, "vol_window", 30) as usize;
+        let price = initial_price.max(1e-9);
+        let order_qty = params::get_f64(p, "order_notional", 3000.0) / price;
+        let max_inventory = params::get_f64(p, "max_inventory_notional", 30_000.0) / price;
         Self {
             variant,
             asset_id,
             wake_interval: params::get_f64(p, "wake_interval_secs", 0.5),
-            order_qty: params::get_f64(p, "order_qty", 0.05),
+            order_qty,
             base_half_spread_frac: params::get_f64(p, "base_half_spread_frac", 0.0008),
             gamma: params::get_f64(p, "gamma", 0.1),
             k: params::get_f64(p, "k", 1.5),
             horizon_secs: params::get_f64(p, "horizon_secs", 60.0),
-            max_inventory: params::get_f64(p, "max_inventory", 5.0),
+            max_inventory,
             skew_factor: params::get_f64(p, "skew_factor", 0.0005),
             vol_window: RollingWindow::new(vol_window_len),
             toxicity_window: RollingWindow::new(vol_window_len),

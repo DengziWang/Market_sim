@@ -21,6 +21,13 @@ pub struct State {
     pub price_band_frac: f64,
     pub qty_range: (f64, f64),
     pub herd_strength: f64,
+    /// Position cap (both directions -- inventory is kept in [0, max_position], sells
+    /// are separately capped to what's actually held). Without *some* bound, a purely
+    /// cash-limited buy side is effectively unconstrained for a cheap asset, and a
+    /// herding population chasing an uptrend can compound an unbounded one-directional
+    /// position exactly as an uncapped sell side did for a downtrend (see git history:
+    /// this is the buy-side twin of the earlier short-selling bug).
+    pub max_position: f64,
     pub recent_prices: RollingWindow,
 }
 
@@ -40,6 +47,7 @@ impl State {
             price_band_frac: params::get_f64(p, "price_band_frac", 0.01),
             qty_range: params::get_range(p, "qty_range", (0.01, 0.2)),
             herd_strength: params::get_f64(p, "herd_strength", 0.7),
+            max_position: params::get_f64(p, "max_position", 20.0),
             recent_prices: RollingWindow::new(5),
         }
     }
@@ -79,12 +87,24 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
 
     let offset = agent.rng.gen_range(-s.price_band_frac..s.price_band_frac);
     let price = mid * (1.0 + offset);
-    let qty = agent.rng.gen_range(s.qty_range.0..=s.qty_range.1.max(s.qty_range.0 + 1e-6));
+    let mut qty = agent.rng.gen_range(s.qty_range.0..=s.qty_range.1.max(s.qty_range.0 + 1e-6));
 
-    if price > 0.0 && qty > 0.0 {
+    // Retail/noise traders don't short spot assets: a sell is capped at (and skipped
+    // if there's none of) what the agent actually holds. Without this, a herding
+    // trader population facing a downtrend has literally unlimited, uncapitalized
+    // sell pressure to add to it -- unlike every capital-/position-bounded bot type,
+    // this drove an unbounded price collapse toward zero in testing (see git history).
+    let inventory = agent.inventory_of(s.asset_id);
+    if side == Side::Sell {
+        qty = qty.min(inventory.max(0.0));
+    } else {
+        qty = qty.min((s.max_position - inventory).max(0.0));
+    }
+
+    if price > 0.0 && qty > 1e-9 {
         let affordable = match side {
             Side::Buy => agent.cash >= price * qty,
-            Side::Sell => true, // spot short-selling not modeled for noise traders; engine still accepts it (inventory can go negative) but keep it rare by preferring buys when flat
+            Side::Sell => true, // already capped to held inventory above
         };
         if affordable {
             actions.push(Action::Submit(NewOrderRequest {

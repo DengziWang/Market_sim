@@ -41,14 +41,26 @@ impl State {
         }
     }
 
-    pub fn from_params(variant: Variant, asset_id: AssetId, p: &toml::Value) -> Self {
+    /// `initial_price`: converts the dollar-notional `order_notional` param into
+    /// asset units, so a single default provides comparable *dollar* depth across
+    /// assets of very different price scales -- see market_maker.rs's from_params
+    /// doc comment for why a fixed unit-quantity default doesn't.
+    pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value) -> Self {
+        let order_qty = params::get_f64(p, "order_notional", 1500.0) / initial_price.max(1e-9);
+        // Static grid spacing has the same scale problem as a unit-denominated order
+        // size: a fixed absolute price offset (e.g. 5.0) is negligible for a $60k
+        // asset but enormous relative to a $0.60 one, leaving huge, effectively-empty
+        // gaps between levels. Default it as a fraction of the reference price
+        // instead (still overridable directly via `spacing_abs` for a scenario that
+        // genuinely wants a fixed absolute grid).
+        let spacing_abs = params::get_f64(p, "spacing_abs", initial_price.max(1e-9) * 0.004);
         Self {
             variant,
             asset_id,
             wake_interval: params::get_f64(p, "wake_interval_secs", 10.0),
-            order_qty: params::get_f64(p, "order_qty", 0.02),
+            order_qty,
             n_levels: params::get_u32(p, "n_levels", 5),
-            spacing_abs: params::get_f64(p, "spacing_abs", 5.0),
+            spacing_abs,
             spacing_pct: params::get_f64(p, "spacing_pct", 0.004),
             atr_window: RollingWindow::new(params::get_u32(p, "atr_window", 14) as usize),
             atr_multiplier: params::get_f64(p, "atr_multiplier", 0.5),

@@ -78,15 +78,28 @@ DEFAULT_DIMENSION_WEIGHTS: Dict[str, float] = {
 }
 
 
+def _as_frame(x: Any) -> pd.DataFrame:
+    """Accepts either an already-built DataFrame or the raw columnar
+    dict[str, list] shape the Rust extension returns, and normalizes to a
+    DataFrame either way."""
+    if isinstance(x, pd.DataFrame):
+        return x
+    return pd.DataFrame(x) if x else pd.DataFrame()
+
+
 def compute_run_metrics(run: Dict[str, Any], asset_ids: Optional[Sequence[int]] = None) -> Dict[str, float]:
-    """All metrics for one already-loaded run (as returned by
-    `market_sim.export.load_run` / `market_sim.SimulationRun.result`), per-asset
-    metrics averaged across assets into one flat dict. Use the individual
-    `market_health.<module>` functions directly for per-asset breakdowns."""
-    trades = run["trades"]
-    snapshots = run.get("orderbook_snapshots", run.get("snapshots", pd.DataFrame()))
-    order_events = run["order_events"]
-    agent_state = run["agent_state"]
+    """All metrics for one run, accepting either shape: an already-loaded run (as
+    returned by `market_sim.export.load_run`, DataFrames under `trades`,
+    `order_events`, `orderbook_snapshots`, `agent_state`) or a raw in-memory result
+    (`market_sim.SimulationRun.result` / `market_sim.run_simulation(...)`'s return
+    value, columnar dict[str, list] under `trades`, `order_events`, `snapshots`,
+    `agent_states`). Per-asset metrics are averaged across assets into one flat dict
+    -- use the individual `market_health.<module>` functions directly for per-asset
+    breakdowns."""
+    trades = _as_frame(run["trades"])
+    snapshots = _as_frame(run.get("orderbook_snapshots", run.get("snapshots")))
+    order_events = _as_frame(run["order_events"])
+    agent_state = _as_frame(run.get("agent_state", run.get("agent_states")))
 
     if asset_ids is None:
         asset_ids = sorted(trades["asset_id"].unique()) if not trades.empty else []
