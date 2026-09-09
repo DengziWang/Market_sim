@@ -91,8 +91,8 @@ with st.sidebar:
     st.title("Bot Market Sim")
     st.caption("Configure, run, and explore -- all local.")
 
-    chosen = st.selectbox("Load a base scenario", list(SCENARIOS))
-    if st.button("Load scenario (discards current edits)"):
+    chosen = st.selectbox("Load a base scenario", list(SCENARIOS), key="scenario_choice")
+    if st.button("Load scenario (discards current edits)", key="load_scenario_btn"):
         st.session_state.cfg = cfgmod.load_config_dict(SCENARIOS[chosen])
         st.rerun()
 
@@ -103,7 +103,7 @@ with st.sidebar:
     st.metric("Assets configured", n_assets)
 
     st.divider()
-    run_clicked = st.button("Run simulation", type="primary", width="stretch")
+    run_clicked = st.button("Run simulation", type="primary", width="stretch", key="run_sim_btn")
     if run_clicked:
         st.session_state.run_error = None
         try:
@@ -130,12 +130,27 @@ tab_setup, tab_pop, tab_advanced, tab_results = st.tabs(["Run & Market Setup", "
 with tab_setup:
     st.subheader("Session")
     c1, c2, c3 = st.columns(3)
-    cfg["run"]["seed"] = c1.number_input("Seed", value=int(cfg["run"].get("seed", 1)), step=1)
-    cfg["run"]["session_seconds"] = c2.number_input("Session length (simulated seconds)", value=float(cfg["run"].get("session_seconds", 1800.0)), min_value=1.0, step=60.0)
-    cfg["run"]["min_trades"] = c3.number_input("Minimum trades (extends session if unmet)", value=int(cfg["run"].get("min_trades", 0) or 0), min_value=0, step=1000)
+    cfg["run"]["seed"] = c1.number_input("Seed", value=int(cfg["run"].get("seed", 1)), step=1, key="run_seed")
+    cfg["run"]["session_seconds"] = c2.number_input("Session length (simulated seconds)", value=float(cfg["run"].get("session_seconds", 1800.0)), min_value=1.0, step=60.0, key="run_session_seconds")
+    cfg["run"]["min_trades"] = c3.number_input("Minimum trades (extends session if unmet)", value=int(cfg["run"].get("min_trades", 0) or 0), min_value=0, step=1000, key="run_min_trades")
     c4, c5 = st.columns(2)
-    cfg["run"]["max_session_seconds"] = c4.number_input("Max session length (extension cap)", value=float(cfg["run"].get("max_session_seconds", cfg["run"]["session_seconds"] * 4) or cfg["run"]["session_seconds"] * 4), min_value=cfg["run"]["session_seconds"], step=60.0)
-    cfg["run"]["extension_step_seconds"] = c5.number_input("Extension step", value=float(cfg["run"].get("extension_step_seconds", 1800.0)), min_value=1.0, step=60.0)
+    session_seconds = cfg["run"]["session_seconds"]
+    stored_max = cfg["run"].get("max_session_seconds") or session_seconds * 4
+    # min_value tracks the session-length field above, which can change every rerun.
+    # A widget with an explicit key ignores `value=` once its session_state entry
+    # exists (Streamlit's documented behavior), so the entry itself -- not just the
+    # value= default -- must be kept >= min_value, or raising session length past a
+    # previously-set max throws StreamlitValueBelowMinError. Streamlit also warns if
+    # `value=` and a pre-set session_state entry are given together, so pass `value=`
+    # only on the widget's first-ever creation and rely on the direct session_state
+    # clamp for every rerun after that.
+    key = "run_max_session_seconds"
+    if key not in st.session_state:
+        st.session_state[key] = max(float(stored_max), session_seconds)
+    elif st.session_state[key] < session_seconds:
+        st.session_state[key] = max(float(stored_max), session_seconds)
+    cfg["run"]["max_session_seconds"] = c4.number_input("Max session length (extension cap)", min_value=session_seconds, step=60.0, key=key)
+    cfg["run"]["extension_step_seconds"] = c5.number_input("Extension step", value=float(cfg["run"].get("extension_step_seconds", 1800.0)), min_value=1.0, step=60.0, key="run_extension_step")
 
     st.subheader("Assets (\"stocks\")")
     st.caption("symbol / tick size / starting price / fundamental-value volatility & mean-reversion speed (the latent \"true value\" process fundamentalist bots and price-efficiency metrics reference)")
@@ -166,28 +181,28 @@ with tab_setup:
 
     st.subheader("Fees, latency, mempool")
     c1, c2, c3 = st.columns(3)
-    cfg["fees"]["default_maker_fee"] = c1.number_input("Default maker fee", value=float(cfg["fees"]["default_maker_fee"]), format="%.5f", step=0.0001)
-    cfg["fees"]["default_taker_fee"] = c2.number_input("Default taker fee", value=float(cfg["fees"]["default_taker_fee"]), format="%.5f", step=0.0001)
-    cfg["latency"]["default_latency_secs"] = c3.number_input("Default agent latency (s)", value=float(cfg["latency"]["default_latency_secs"]), min_value=0.0, step=0.01)
+    cfg["fees"]["default_maker_fee"] = c1.number_input("Default maker fee", value=float(cfg["fees"]["default_maker_fee"]), format="%.5f", step=0.0001, key="fees_maker")
+    cfg["fees"]["default_taker_fee"] = c2.number_input("Default taker fee", value=float(cfg["fees"]["default_taker_fee"]), format="%.5f", step=0.0001, key="fees_taker")
+    cfg["latency"]["default_latency_secs"] = c3.number_input("Default agent latency (s)", value=float(cfg["latency"]["default_latency_secs"]), min_value=0.0, step=0.01, key="latency_default")
     c1, c2, c3 = st.columns(3)
-    cfg["mempool"]["enabled"] = c1.checkbox("Mempool model enabled (needed for MEV bots)", value=bool(cfg["mempool"]["enabled"]))
-    cfg["mempool"]["reveal_delay_secs"] = c2.number_input("Mempool reveal delay (s)", value=float(cfg["mempool"]["reveal_delay_secs"]), min_value=0.0, step=0.05)
-    cfg["mempool"]["large_order_notional_threshold"] = c3.number_input("Mempool notional threshold ($)", value=float(cfg["mempool"]["large_order_notional_threshold"]), min_value=0.0, step=1000.0)
+    cfg["mempool"]["enabled"] = c1.checkbox("Mempool model enabled (needed for MEV bots)", value=bool(cfg["mempool"]["enabled"]), key="mempool_enabled")
+    cfg["mempool"]["reveal_delay_secs"] = c2.number_input("Mempool reveal delay (s)", value=float(cfg["mempool"]["reveal_delay_secs"]), min_value=0.0, step=0.05, key="mempool_delay")
+    cfg["mempool"]["large_order_notional_threshold"] = c3.number_input("Mempool notional threshold ($)", value=float(cfg["mempool"]["large_order_notional_threshold"]), min_value=0.0, step=1000.0, key="mempool_threshold")
     st.caption("Per-bot-type fee/latency overrides ([fees.by_bot_type] / [latency.by_bot_type]) are available in the Advanced tab.")
 
     st.subheader("Leveraged liquidation model")
     c1, c2, c3, c4 = st.columns(4)
-    cfg["liquidation"]["maintenance_margin_buffer"] = c1.number_input("Maintenance margin buffer", value=float(cfg["liquidation"]["maintenance_margin_buffer"]), min_value=0.01, max_value=1.0, step=0.05)
-    cfg["liquidation"]["sweep_interval_secs"] = c2.number_input("Liquidation sweep interval (s)", value=float(cfg["liquidation"]["sweep_interval_secs"]), min_value=0.01, step=0.5)
-    cfg["liquidation"]["staggered_slices"] = c3.number_input("Staggered-TWAP slices", value=int(cfg["liquidation"]["staggered_slices"]), min_value=1, step=1)
-    cfg["liquidation"]["full_liquidation_fraction"] = c4.number_input("Fraction using immediate full liquidation", value=float(cfg["liquidation"]["full_liquidation_fraction"]), min_value=0.0, max_value=1.0, step=0.1)
+    cfg["liquidation"]["maintenance_margin_buffer"] = c1.number_input("Maintenance margin buffer", value=float(cfg["liquidation"]["maintenance_margin_buffer"]), min_value=0.01, max_value=1.0, step=0.05, key="liq_mm_buffer")
+    cfg["liquidation"]["sweep_interval_secs"] = c2.number_input("Liquidation sweep interval (s)", value=float(cfg["liquidation"]["sweep_interval_secs"]), min_value=0.01, step=0.5, key="liq_sweep_interval")
+    cfg["liquidation"]["staggered_slices"] = c3.number_input("Staggered-TWAP slices", value=int(cfg["liquidation"]["staggered_slices"]), min_value=1, step=1, key="liq_slices")
+    cfg["liquidation"]["full_liquidation_fraction"] = c4.number_input("Fraction using immediate full liquidation", value=float(cfg["liquidation"]["full_liquidation_fraction"]), min_value=0.0, max_value=1.0, step=0.1, key="liq_full_frac")
 
     st.subheader("Market microstructure / export")
     c1, c2, c3, c4 = st.columns(4)
-    cfg["market"]["snapshot_interval_secs"] = c1.number_input("Orderbook snapshot interval (s)", value=float(cfg["market"]["snapshot_interval_secs"]), min_value=0.01, step=0.5)
-    cfg["market"]["snapshot_depth_levels"] = c2.number_input("Snapshot depth (levels)", value=int(cfg["market"]["snapshot_depth_levels"]), min_value=1, step=1)
-    cfg["market"]["mark_price_ema_halflife_secs"] = c3.number_input("Mark-price EMA half-life (s)", value=float(cfg["market"]["mark_price_ema_halflife_secs"]), min_value=0.1, step=1.0)
-    cfg["export"]["write_snapshots"] = c4.checkbox("Export orderbook snapshots", value=bool(cfg["export"]["write_snapshots"]))
+    cfg["market"]["snapshot_interval_secs"] = c1.number_input("Orderbook snapshot interval (s)", value=float(cfg["market"]["snapshot_interval_secs"]), min_value=0.01, step=0.5, key="market_snapshot_interval")
+    cfg["market"]["snapshot_depth_levels"] = c2.number_input("Snapshot depth (levels)", value=int(cfg["market"]["snapshot_depth_levels"]), min_value=1, step=1, key="market_snapshot_depth")
+    cfg["market"]["mark_price_ema_halflife_secs"] = c3.number_input("Mark-price EMA half-life (s)", value=float(cfg["market"]["mark_price_ema_halflife_secs"]), min_value=0.1, step=1.0, key="market_mark_halflife")
+    cfg["export"]["write_snapshots"] = c4.checkbox("Export orderbook snapshots", value=bool(cfg["export"]["write_snapshots"]), key="export_write_snapshots")
 
 # ---------------------------------------------------------------------------------
 # Tab: Bot Population
@@ -249,8 +264,8 @@ with tab_pop:
         st.json(VARIANTS_BY_TYPE)
 
     scale_col1, scale_col2 = st.columns([1, 3])
-    scale_factor = scale_col1.number_input("Scale all counts by", value=1.0, min_value=0.0, step=0.1)
-    if scale_col2.button("Apply scale factor to every group's count"):
+    scale_factor = scale_col1.number_input("Scale all counts by", value=1.0, min_value=0.0, step=0.1, key="pop_scale_factor")
+    if scale_col2.button("Apply scale factor to every group's count", key="pop_scale_apply"):
         groups_edited["count"] = (groups_edited["count"] * scale_factor).round().astype(int)
 
     new_groups = []
@@ -293,14 +308,14 @@ with tab_advanced:
     )
     raw_text = st.text_area("Scenario TOML", value=cfgmod.dump_config_str(cfg), height=500, key="raw_toml")
     col1, col2 = st.columns([1, 5])
-    if col1.button("Apply raw TOML"):
+    if col1.button("Apply raw TOML", key="apply_raw_toml"):
         try:
             st.session_state.cfg = toml.loads(raw_text)
             st.success("Applied.")
             st.rerun()
         except toml.TomlDecodeError as e:
             st.error(f"TOML parse error: {e}")
-    col2.download_button("Download this config as .toml", data=raw_text, file_name="scenario.toml", mime="text/plain")
+    col2.download_button("Download this config as .toml", data=raw_text, file_name="scenario.toml", mime="text/plain", key="download_toml")
 
 # ---------------------------------------------------------------------------------
 # Tab: Results
@@ -364,17 +379,24 @@ with tab_results:
         if trades.empty:
             st.caption("No trades to search.")
         else:
+            # Deliberately no explicit `key=` on the multiselect/slider filters below:
+            # their valid options/range come from *this run's* trades and change
+            # between runs, so a stale key (from a previous, differently-ranged run)
+            # could hold a selection outside the new valid set -- letting Streamlit
+            # derive a fresh key from the (also-changing) options/min/max args avoids
+            # that rather than needing to reproduce the same clamp-before-render
+            # pattern used for max_session_seconds above.
             f1, f2, f3, f4 = st.columns(4)
             asset_filter = f1.multiselect("Asset", options=sorted(trades["asset_id"].unique()), format_func=lambda a: asset_names.get(a, str(a)))
             bot_types_present = sorted(set(trades["maker_type"]).union(trades["taker_type"]))
             bot_type_filter = f2.multiselect("Bot type (maker or taker)", options=bot_types_present)
-            agent_id_filter = f3.text_input("Agent ID (maker or taker)")
-            free_text = f4.text_input("Free-text search (any column)")
+            agent_id_filter = f3.text_input("Agent ID (maker or taker)", key="trade_search_agent_id")
+            free_text = f4.text_input("Free-text search (any column)", key="trade_search_free_text")
 
             f5, f6 = st.columns(2)
             t_min, t_max = float(trades["time"].min()), float(trades["time"].max())
             time_range = f5.slider("Time range (s)", min_value=t_min, max_value=t_max, value=(t_min, t_max))
-            qty_min = f6.number_input("Min quantity", value=0.0, min_value=0.0)
+            qty_min = f6.number_input("Min quantity", value=0.0, min_value=0.0, key="trade_search_min_qty")
 
             filtered = trades[(trades["time"] >= time_range[0]) & (trades["time"] <= time_range[1]) & (trades["qty"] >= qty_min)]
             if asset_filter:
@@ -395,7 +417,7 @@ with tab_results:
             st.dataframe(filtered.sort_values("time").head(5000), width="stretch", height=400)
             if len(filtered) > 5000:
                 st.caption("Showing first 5,000 matching rows; narrow the filters to see more precisely, or download all matches below.")
-            st.download_button("Download filtered trades as CSV", data=filtered.to_csv(index=False), file_name="trades_filtered.csv", mime="text/csv")
+            st.download_button("Download filtered trades as CSV", data=filtered.to_csv(index=False), file_name="trades_filtered.csv", mime="text/csv", key="download_trades_csv")
 
         if not agent_state.empty:
             st.subheader("Agent state (end of session)")
