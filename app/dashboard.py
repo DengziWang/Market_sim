@@ -65,6 +65,44 @@ RUNS_ROOT = os.path.join(REPO_ROOT, "runs")
 
 st.set_page_config(page_title="Bot Market Sim", layout="wide")
 
+# ---------------------------------------------------------------------------------
+# Rough pre-run size estimate -- see the "estimate before you run" note in README's
+# Performance section. Calibrated against a real measurement (realistic_mix.toml
+# scaled to 2,000 agents / 3,000s simulated: 6,130,334 order events, ~9.2s wall,
+# ~2.5GB peak RSS through the full Rust -> numpy -> pandas pipeline), so it's
+# specifically tuned to *this* engine/dashboard's actual memory behavior, not a
+# generic guess. It assumes a population mix with roughly realistic_mix.toml's
+# average per-agent wake frequency -- a config with e.g. only very-high-frequency
+# market_makers would produce more order events per agent-second than this predicts,
+# and a config dominated by slow `human`/`dca` bots would produce fewer. Meant to
+# catch a "this will likely exhaust this machine's RAM" mistake before it happens
+# (see project memory: a 5,000-agent/300,000s run OOM'd the whole desktop, not just
+# the simulation), not to be a precise forecast.
+_EST_ORDER_EVENTS_PER_AGENT_SECOND = 6_130_334 / (2000 * 3000)
+_EST_MB_PER_ORDER_EVENT = 2457 / 6_130_334
+_EST_SECONDS_PER_ORDER_EVENT = 9.2 / 6_130_334
+
+
+def _estimate_run_cost(n_agents: float, session_seconds: float) -> dict:
+    est_events = max(0.0, n_agents) * max(0.0, session_seconds) * _EST_ORDER_EVENTS_PER_AGENT_SECOND
+    return {
+        "order_events": est_events,
+        "peak_mb": est_events * _EST_MB_PER_ORDER_EVENT,
+        "wall_seconds": est_events * _EST_SECONDS_PER_ORDER_EVENT,
+    }
+
+
+def _available_ram_mb() -> float:
+    try:
+        import psutil
+
+        return psutil.virtual_memory().total / 1e6
+    except Exception:  # noqa: BLE001
+        # streamlit itself depends on psutil, so this is only a fallback for the
+        # unusual case it's somehow missing -- a conservative assumption (8GB) so
+        # the warning below errs toward showing up rather than silently not.
+        return 8000.0
+
 
 def _default_cfg() -> dict:
     return cfgmod.load_config_dict(SCENARIOS["Realistic mix"])
@@ -148,9 +186,54 @@ def _activate_result(result: dict, config_toml: str, source: str, save_path: str
     st.session_state.result_version = st.session_state.get("result_version", 0) + 1
 
 
-@st.cache_data(show_spinner=False)
+# `cache_resource` (not `cache_data`): `cache_data` always hands back a fresh
+# deep copy on every call (its whole safety contract), which for a large run's
+# multi-hundred-MB-to-multi-GB DataFrame turned into real, repeated cost on every
+# widget interaction that re-ran this fragment (a full copy just to read a column).
+# Nothing downstream mutates these frames in place -- every filter/search below
+# does `df[mask]` (a new frame), never `df.loc[...] = ...` -- so sharing the same
+# object across reruns is safe, and this is a single-user local dashboard (see
+# README) so there's no other session to leak state to either.
+_LOW_CARDINALITY_COLS = {
+    "trades": ["taker_side", "maker_type", "maker_variant", "taker_type", "taker_variant"],
+    "snapshots": ["side"],
+    "agent_states": ["bot_type", "variant"],
+}
+
+
+def _to_categorical(df: pd.DataFrame, key: str) -> pd.DataFrame:
+    """A handful of string columns (bot type/variant, buy/sell, ...) repeat across
+    every row -- `category` dtype stores each distinct value once and every row as a
+    small integer code instead of a full Python string object per cell, which adds
+    up fast at millions of rows. Same values, same comparisons/groupby/filtering
+    behavior as plain `object` columns everywhere this dashboard uses them; purely a
+    more compact encoding, not a data change."""
+    for col in _LOW_CARDINALITY_COLS.get(key, []):
+        if col in df.columns:
+            df[col] = df[col].astype("category")
+    return df
+
+
+# `max_entries=1`: only the *current* active result's DataFrames need to stay
+# cached -- without this, every new run (result_version bump) adds another cache
+# entry keyed on the new version without evicting the old one, so a session with
+# several large runs would keep *all* of their trades/snapshots/agent_state
+# DataFrames resident in memory simultaneously (the previous run's are no longer
+# reachable through `st.session_state.active_result` and won't be re-queried at
+# their old version number, so there's nothing lost by evicting them).
+@st.cache_resource(show_spinner=False, max_entries=1)
 def _trades_df_cached(version: int) -> pd.DataFrame:
-    return pd.DataFrame(st.session_state.active_result["trades"])
+    return _to_categorical(pd.DataFrame(st.session_state.active_result["trades"]), "trades")
+
+
+@st.cache_resource(show_spinner=False, max_entries=1)
+def _snapshots_df_cached(version: int) -> pd.DataFrame:
+    return _to_categorical(pd.DataFrame(st.session_state.active_result.get("snapshots", {})), "snapshots")
+
+
+@st.cache_resource(show_spinner=False, max_entries=1)
+def _agent_state_df_cached(version: int) -> pd.DataFrame:
+    return _to_categorical(pd.DataFrame(st.session_state.active_result.get("agent_states", {})), "agent_states")
 
 
 def _downsample_minmax(t: "pd.Series", y: "pd.Series", max_points: int):
@@ -242,9 +325,35 @@ with st.sidebar:
     sim_running = st.session_state.sim_thread is not None
 
     if not sim_running:
-        if st.button("Run simulation", type="primary", width="stretch", key="run_sim_btn"):
+        session_seconds = float(cfg.get("run", {}).get("session_seconds", 0.0) or 0.0)
+        max_session_seconds = float(cfg.get("run", {}).get("max_session_seconds") or session_seconds)
+        est = _estimate_run_cost(n_agents, session_seconds)
+        est_worst = _estimate_run_cost(n_agents, max_session_seconds)
+        available_mb = _available_ram_mb()
+        # Threshold: this run's estimated peak memory relative to *total* machine
+        # RAM, not just what's free right now -- other things (browser, OS) need
+        # headroom too, and this same number is what wrecked the whole desktop last
+        # time (see project memory), not just the simulation.
+        risky = est_worst["peak_mb"] > 0.35 * available_mb
+        st.caption(
+            f"Estimated for this config: ~{est['order_events']:,.0f} order events, "
+            f"~{est['peak_mb']:,.0f} MB peak, ~{est['wall_seconds']:,.0f}s wall time"
+            + (f" (up to ~{est_worst['peak_mb']:,.0f} MB / ~{est_worst['wall_seconds']:,.0f}s if `min_trades` extends to the {max_session_seconds:,.0f}s cap)" if max_session_seconds > session_seconds else "")
+            + ". Rough approximation, not a guarantee -- see README's Performance section."
+        )
+        confirmed_large = True
+        if risky:
+            st.warning(
+                f"⚠️ This could use ~{est_worst['peak_mb']/1000:,.1f} GB at peak on a machine with "
+                f"~{available_mb/1000:,.1f} GB total RAM -- likely to make the whole system (not just "
+                f"this tab) unresponsive, or get killed outright, the same way a 5,000-agent/300,000s "
+                f"run did before. Consider a shorter session, fewer agents, or exporting via "
+                f"`market_sim`/`scripts/benchmark.py` directly instead of through the browser."
+            )
+            confirmed_large = st.checkbox("I understand the risk -- run it anyway", key="confirm_large_run")
+        if st.button("Run simulation", type="primary", width="stretch", key="run_sim_btn", disabled=risky and not confirmed_large):
             config_toml = cfgmod.dump_config_str(st.session_state.cfg)
-            target_seconds = float(st.session_state.cfg.get("run", {}).get("session_seconds", 0.0) or 0.0) or None
+            target_seconds = session_seconds or None
             _start_sim_thread(
                 lambda token, progress: (lambda: run_simulation_cancellable(config_toml, token, progress)),
                 config_toml,
@@ -594,7 +703,19 @@ def _render_results_tab():
         c1, c2 = st.columns([3, 1])
         extra_seconds = c1.number_input("Additional simulated seconds", value=1800.0, min_value=1.0, step=60.0, key="continue_extra_seconds")
         sim_running_now = st.session_state.sim_thread is not None
-        if c2.button("▶ Continue", width="stretch", key="continue_sim_btn", disabled=sim_running_now):
+        est = _estimate_run_cost(meta["n_agents"], extra_seconds)
+        available_mb = _available_ram_mb()
+        # Combined with whatever this run's history already uses -- combine_results
+        # (used to show one continuous view) keeps the old segment's tables around
+        # too, so the risk compounds across repeated continuations, not just this leg.
+        already_mb = meta["n_order_events"] * _EST_MB_PER_ORDER_EVENT
+        risky_continue = (est["peak_mb"] + already_mb) > 0.35 * available_mb
+        st.caption(f"Estimated for this extension: ~{est['order_events']:,.0f} more order events, ~{est['peak_mb']:,.0f} MB, ~{est['wall_seconds']:,.0f}s wall time (rough approximation).")
+        confirmed_continue = True
+        if risky_continue:
+            st.warning(f"⚠️ This extension alone could use ~{est['peak_mb']/1000:,.1f} GB on top of what this run already holds, on a machine with ~{available_mb/1000:,.1f} GB total RAM.")
+            confirmed_continue = st.checkbox("I understand the risk -- continue anyway", key="confirm_large_continue")
+        if c2.button("▶ Continue", width="stretch", key="continue_sim_btn", disabled=sim_running_now or (risky_continue and not confirmed_continue)):
             base_config_toml = st.session_state.active_config_toml or ""
             _start_sim_thread(
                 lambda token, progress: (lambda: continue_simulation_cancellable(checkpoint, extra_seconds, token, progress)),
@@ -608,14 +729,22 @@ def _render_results_tab():
             st.caption("A simulation is already running (see the sidebar) -- wait for it to finish before continuing this one.")
 
     trades = _trades_df_cached(version)
-    snapshots = pd.DataFrame(result.get("snapshots", {}))
-    agent_state = pd.DataFrame(result.get("agent_states", {}))
+    snapshots = _snapshots_df_cached(version)
+    agent_state = _agent_state_df_cached(version)
     asset_names = {i: a.get("symbol", f"asset {i}") for i, a in enumerate(cfg.get("assets", []))}
 
-    st.subheader("Price & volume (zoom: drag to select, double-click to reset, scroll to zoom)")
-    if trades.empty:
-        st.warning("No trades occurred in this run.")
-    else:
+    @st.fragment
+    def _render_price_volume():
+        """Its own fragment: rebuilding every asset's Plotly figures (each with
+        several downsampled traces) is the single most expensive thing in this tab,
+        so it should only happen when a chart control changes -- not on every
+        keystroke in the unrelated Trade search box below, which (before this split)
+        forced the *whole* Results tab, charts included, to re-render on every single
+        character typed."""
+        st.subheader("Price & volume (zoom: drag to select, double-click to reset, scroll to zoom)")
+        if trades.empty:
+            st.warning("No trades occurred in this run.")
+            return
         c1, c2, c3 = st.columns(3)
         show_fundamental = c1.checkbox(
             "Show fundamental value",
@@ -670,6 +799,8 @@ def _render_results_tab():
             fig.update_xaxes(title_text="simulated time (s)", row=2, col=1)
             st.plotly_chart(fig, width="stretch", key=f"chart_{aid}")
 
+    _render_price_volume()
+
     st.subheader("Market-health metrics")
     if st.session_state.metrics:
         metrics_df = pd.DataFrame(sorted(st.session_state.metrics.items()), columns=["metric", "value"])
@@ -700,10 +831,17 @@ def _render_results_tab():
         st.caption("`fully_human`: both sides of the trade were human bots. `partially_human`: exactly one side was. `human_involved_pct`: share of that asset's trades touching a human bot at all.")
         st.dataframe(by_asset, width="stretch")
 
-    st.subheader("Trade search")
-    if trades.empty:
-        st.caption("No trades to search.")
-    else:
+    @st.fragment
+    def _render_trade_search():
+        """Its own fragment for the same reason as `_render_price_volume` above:
+        `text_input` reruns on every keystroke, and before this split that meant
+        retyping a search re-rendered every price/volume chart too, on every single
+        character -- the main source of the in-browser lag this whole section of
+        changes was about fixing."""
+        st.subheader("Trade search")
+        if trades.empty:
+            st.caption("No trades to search.")
+            return
         # Deliberately no explicit `key=` on the multiselect/slider filters below:
         # their valid options/range come from *this run's* trades and change
         # between runs, so a stale key (from a previous, differently-ranged run)
@@ -749,6 +887,8 @@ def _render_results_tab():
         if len(filtered) > 5000:
             st.caption("Showing first 5,000 matching rows; narrow the filters to see more precisely, or download all matches below.")
         st.download_button("Download filtered trades as CSV", data=filtered.to_csv(index=False), file_name="trades_filtered.csv", mime="text/csv", key="download_trades_csv")
+
+    _render_trade_search()
 
     if not agent_state.empty:
         st.subheader("Agent state (end of session)")

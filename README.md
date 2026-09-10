@@ -323,12 +323,58 @@ un-parallelized run, on this machine. Two things this does *not* yet include:
    composition is unusually snapshot- or mempool-heavy.
 
 Given these numbers, the spec 4/6a agent-count defaults (1,000-3,000 for batch runs,
-5,000-15,000 for confirmation runs) look comfortably achievable on this hardware --
-with a lot of headroom left over. Still re-run `scripts/benchmark.py` before a big
-batch if it's been a while (thermal state, other load on the machine, etc. all
+5,000-15,000 for confirmation runs) look comfortably achievable in terms of raw
+**event throughput** on this hardware. **Memory is the actual binding constraint**,
+not throughput -- see the next section, which matters more in practice: the numbers
+above are how *fast* the engine computes events, not how much it costs to hold the
+resulting trades/order_events/snapshots afterward, and holding all of it is what
+exhausted this machine's RAM (see below). Still re-run `scripts/benchmark.py` before
+a big batch if it's been a while (thermal state, other load on the machine, etc. all
 matter), and per spec 6a/12: if a real batch run turns out much worse than this
 predicts, reduce the defaults and confirm the change with the user rather than
 deciding alone.
+
+### Memory: the actual scaling limit
+
+Every trade/order-event/snapshot produced during a run is held in memory for the
+whole run, in triplicate -- Rust's own result buffers, a numpy-array-backed Python
+dict (`sim_pyo3`'s return value), and (for the dashboard, `market_sim.export`, and
+`market_health.compute_run_metrics`) a pandas DataFrame built from that dict. None of
+this is streamed to disk incrementally; it all has to fit in RAM at once. Order
+events dominate (every submit/cancel/fill/reject, not just trades -- typically
+5-6x the trade count), and their count scales with `agents x session_seconds x
+average wake frequency`, same as event throughput above -- but throughput measures
+*speed*, not the *size* of what gets retained, which is the thing that actually
+exhausted a real 16GB machine's RAM (not just the simulation process -- `systemd-oomd`
+killed the browser, the window manager, and the terminal session too under the
+resulting memory pressure) on a 5,000-agent, 300,000-simulated-second run: an order
+of magnitude past this project's own documented scenario cap (`realistic_mix.toml`'s
+`max_session_seconds = 21600.0`, "spec 6a upper bound").
+
+Measured on this hardware (`scenarios/realistic_mix.toml` scaled to 2,000 agents /
+3,000s simulated -- 1,015,194 trades, 6,130,334 order events): **~9s wall time,
+~2.5GB peak RSS** for a full run through Rust -> numpy -> pandas (down from ~22s /
+~4GB before an optimization pass that returns numeric columns as numpy arrays
+instead of Python lists of boxed floats/ints -- a representation change only, same
+values, see `sim_pyo3::result_to_pyobject`). Extrapolating linearly to the spec's own
+stated upper range (15,000 agents x 21,600s, ~54x this measurement) implies **tens of
+GB** -- not achievable on a 16GB machine regardless of how fast the event loop itself
+is, with the current engine architecture (everything retained in memory, nothing
+streamed to disk incrementally). If you need the full spec-described scale for real,
+that requires a streaming/chunked export path (write parquet incrementally instead of
+building one giant in-memory result first) -- a real architecture change with
+tradeoffs (e.g. what stays available for live in-dashboard exploration vs. what's
+only on disk afterward), not yet built; ask before assuming a direction there.
+
+**In the meantime**: the dashboard estimates a run's likely peak memory/wall-time
+before you click Run (calibrated from the measurement above) and requires an explicit
+"I understand the risk" acknowledgement past a conservative threshold (currently
+~35% of total system RAM) -- so an oversized config gets caught before it repeats the
+crash above, not after. The same estimate/gate applies to "Continue this simulation".
+For genuinely large runs, prefer fewer agents, a shorter session, `write_snapshots =
+false`, and/or running via `market_sim`/`scripts/benchmark.py` directly (still fully
+in-memory today, but at least without a browser tab and Streamlit's own overhead
+alongside it) over the interactive dashboard.
 
 ## Known simplifications (read before treating results as findings)
 

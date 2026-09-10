@@ -4,6 +4,7 @@
 //! `market_sim.export` turns those into the parquet files from spec section 7 using
 //! pandas/pyarrow, so no parquet/arrow dependency is needed on the Rust side at all.
 
+use numpy::PyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -12,65 +13,87 @@ use sim_core::config::ScenarioConfig;
 use sim_core::export::{AgentStateRow, OrderEventRow, SimResult, SnapshotRow, TradeRow};
 use sim_core::sim::Simulation;
 
+/// Numeric columns are handed to Python as numpy arrays, not plain lists: a plain
+/// `Vec<f64>`/`Vec<u32>`/etc. collected via PyO3's blanket `IntoPy` impl becomes a
+/// Python `list` of individually boxed `PyFloat`/`PyLong` objects -- for a run with
+/// millions of rows (order_events scales with agent count x session length x wake
+/// frequency) that boxing dominated both time and peak memory well before pandas
+/// ever got a chance to convert it into a compact typed column anyway. A numpy array
+/// is the same bits `Vec<T>` already held, handed over with one allocation instead of
+/// one-PyObject-per-element; `pd.DataFrame({...})` accepts numpy arrays directly (see
+/// `market_sim.export.to_dataframes`) with no format change on the Python side. Pure
+/// representation change -- every value transferred is numerically identical.
+fn set_numpy_col<'py, T: numpy::Element>(d: &Bound<'py, PyDict>, key: &str, v: Vec<T>) -> PyResult<()> {
+    d.set_item(key, PyArray1::from_vec_bound(d.py(), v))
+}
+
 fn trades_dict<'py>(py: Python<'py>, rows: &[TradeRow]) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new_bound(py);
-    d.set_item("time", rows.iter().map(|r| r.time).collect::<Vec<_>>())?;
-    d.set_item("asset_id", rows.iter().map(|r| r.asset_id).collect::<Vec<_>>())?;
-    d.set_item("venue_id", rows.iter().map(|r| r.venue_id).collect::<Vec<_>>())?;
-    d.set_item("price", rows.iter().map(|r| r.price).collect::<Vec<_>>())?;
-    d.set_item("qty", rows.iter().map(|r| r.qty).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "time", rows.iter().map(|r| r.time).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "asset_id", rows.iter().map(|r| r.asset_id).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "venue_id", rows.iter().map(|r| r.venue_id).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "price", rows.iter().map(|r| r.price).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "qty", rows.iter().map(|r| r.qty).collect::<Vec<_>>())?;
+    // Strings stay as plain lists (numpy has no compact variable-length string type
+    // without extra complexity); the dashboard/export side collapses these few
+    // repeated values with pandas `.astype("category")` instead.
     d.set_item("taker_side", rows.iter().map(|r| r.taker_side).collect::<Vec<_>>())?;
-    d.set_item("maker_agent_id", rows.iter().map(|r| r.maker_agent_id).collect::<Vec<_>>())?;
-    d.set_item("taker_agent_id", rows.iter().map(|r| r.taker_agent_id).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "maker_agent_id", rows.iter().map(|r| r.maker_agent_id).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "taker_agent_id", rows.iter().map(|r| r.taker_agent_id).collect::<Vec<_>>())?;
     d.set_item("maker_type", rows.iter().map(|r| r.maker_type).collect::<Vec<_>>())?;
     d.set_item("maker_variant", rows.iter().map(|r| r.maker_variant).collect::<Vec<_>>())?;
     d.set_item("taker_type", rows.iter().map(|r| r.taker_type).collect::<Vec<_>>())?;
     d.set_item("taker_variant", rows.iter().map(|r| r.taker_variant).collect::<Vec<_>>())?;
-    d.set_item("maker_fee_paid", rows.iter().map(|r| r.maker_fee_paid).collect::<Vec<_>>())?;
-    d.set_item("taker_fee_paid", rows.iter().map(|r| r.taker_fee_paid).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "maker_fee_paid", rows.iter().map(|r| r.maker_fee_paid).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "taker_fee_paid", rows.iter().map(|r| r.taker_fee_paid).collect::<Vec<_>>())?;
     Ok(d)
 }
 
 fn order_events_dict<'py>(py: Python<'py>, rows: &[OrderEventRow]) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new_bound(py);
-    d.set_item("time", rows.iter().map(|r| r.time).collect::<Vec<_>>())?;
-    d.set_item("order_id", rows.iter().map(|r| r.order_id).collect::<Vec<_>>())?;
-    d.set_item("agent_id", rows.iter().map(|r| r.agent_id).collect::<Vec<_>>())?;
-    d.set_item("asset_id", rows.iter().map(|r| r.asset_id).collect::<Vec<_>>())?;
-    d.set_item("venue_id", rows.iter().map(|r| r.venue_id).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "time", rows.iter().map(|r| r.time).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "order_id", rows.iter().map(|r| r.order_id).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "agent_id", rows.iter().map(|r| r.agent_id).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "asset_id", rows.iter().map(|r| r.asset_id).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "venue_id", rows.iter().map(|r| r.venue_id).collect::<Vec<_>>())?;
     d.set_item("kind", rows.iter().map(|r| r.kind).collect::<Vec<_>>())?;
     d.set_item("side", rows.iter().map(|r| r.side).collect::<Vec<_>>())?;
-    d.set_item("price", rows.iter().map(|r| r.price).collect::<Vec<_>>())?;
-    d.set_item("qty", rows.iter().map(|r| r.qty).collect::<Vec<_>>())?;
+    // `Option<f64>::None` (market orders have no limit price) -> NaN: exactly the
+    // sentinel pandas already uses to represent a missing float64 value, so this
+    // isn't a lossy conversion -- it's the same representation `pd.DataFrame` would
+    // produce from the old list-of-`Option[float]` (which pandas maps to NaN) too.
+    set_numpy_col(&d, "price", rows.iter().map(|r| r.price.unwrap_or(f64::NAN)).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "qty", rows.iter().map(|r| r.qty).collect::<Vec<_>>())?;
     Ok(d)
 }
 
 fn snapshots_dict<'py>(py: Python<'py>, rows: &[SnapshotRow]) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new_bound(py);
-    d.set_item("time", rows.iter().map(|r| r.time).collect::<Vec<_>>())?;
-    d.set_item("asset_id", rows.iter().map(|r| r.asset_id).collect::<Vec<_>>())?;
-    d.set_item("venue_id", rows.iter().map(|r| r.venue_id).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "time", rows.iter().map(|r| r.time).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "asset_id", rows.iter().map(|r| r.asset_id).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "venue_id", rows.iter().map(|r| r.venue_id).collect::<Vec<_>>())?;
     d.set_item("side", rows.iter().map(|r| r.side).collect::<Vec<_>>())?;
-    d.set_item("level", rows.iter().map(|r| r.level).collect::<Vec<_>>())?;
-    d.set_item("price", rows.iter().map(|r| r.price).collect::<Vec<_>>())?;
-    d.set_item("qty", rows.iter().map(|r| r.qty).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "level", rows.iter().map(|r| r.level).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "price", rows.iter().map(|r| r.price).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "qty", rows.iter().map(|r| r.qty).collect::<Vec<_>>())?;
     Ok(d)
 }
 
 fn agent_states_dict<'py>(py: Python<'py>, rows: &[AgentStateRow]) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new_bound(py);
-    d.set_item("agent_id", rows.iter().map(|r| r.agent_id).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "agent_id", rows.iter().map(|r| r.agent_id).collect::<Vec<_>>())?;
     d.set_item("bot_type", rows.iter().map(|r| r.bot_type).collect::<Vec<_>>())?;
     d.set_item("variant", rows.iter().map(|r| r.variant).collect::<Vec<_>>())?;
-    d.set_item("asset_id", rows.iter().map(|r| r.asset_id).collect::<Vec<_>>())?;
-    d.set_item("inventory", rows.iter().map(|r| r.inventory).collect::<Vec<_>>())?;
-    d.set_item("cash", rows.iter().map(|r| r.cash).collect::<Vec<_>>())?;
-    d.set_item("equity", rows.iter().map(|r| r.equity).collect::<Vec<_>>())?;
-    d.set_item("realized_pnl", rows.iter().map(|r| r.realized_pnl).collect::<Vec<_>>())?;
-    d.set_item("cumulative_volume", rows.iter().map(|r| r.cumulative_volume).collect::<Vec<_>>())?;
-    d.set_item("bankrupt", rows.iter().map(|r| r.bankrupt).collect::<Vec<_>>())?;
-    d.set_item("has_margin_position", rows.iter().map(|r| r.has_margin_position).collect::<Vec<_>>())?;
-    d.set_item("margin_leverage", rows.iter().map(|r| r.margin_leverage).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "asset_id", rows.iter().map(|r| r.asset_id).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "inventory", rows.iter().map(|r| r.inventory).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "cash", rows.iter().map(|r| r.cash).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "equity", rows.iter().map(|r| r.equity).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "realized_pnl", rows.iter().map(|r| r.realized_pnl).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "cumulative_volume", rows.iter().map(|r| r.cumulative_volume).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "bankrupt", rows.iter().map(|r| r.bankrupt).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "has_margin_position", rows.iter().map(|r| r.has_margin_position).collect::<Vec<_>>())?;
+    // See the `price` comment in order_events_dict -- same None -> NaN reasoning.
+    set_numpy_col(&d, "margin_leverage", rows.iter().map(|r| r.margin_leverage.unwrap_or(f64::NAN)).collect::<Vec<_>>())?;
     Ok(d)
 }
 

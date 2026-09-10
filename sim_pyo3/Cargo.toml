@@ -10,3 +10,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 sim_core = { path = "../sim_core" }
 pyo3 = { version = "0.21", features = ["extension-module"] }
+# Numeric result columns are returned as numpy arrays (see result_to_pyobject in
+# lib.rs) instead of plain Python lists -- avoids boxing every f64/u32/u64 into an
+# individual PyObject, which dominated both time and peak memory for large runs
+# (millions of order events) before pandas got a chance to convert to a compact
+# typed column anyway.
+numpy = "0.21"
