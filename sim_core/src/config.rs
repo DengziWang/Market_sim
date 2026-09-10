@@ -4,9 +4,9 @@
 
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunConfig {
     pub seed: u64,
     /// Nominal simulated session length. Actual length may be extended (see
@@ -24,7 +24,7 @@ fn default_extension_step() -> f64 {
     1800.0
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetConfig {
     pub symbol: String,
     pub tick_size: f64,
@@ -62,7 +62,7 @@ fn default_sentiment_theta() -> f64 {
     0.05
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VenueConfig {
     pub name: String,
     /// One-way latency (seconds) for information/orders to travel between this venue
@@ -74,7 +74,7 @@ fn default_inter_venue_latency() -> f64 {
     0.05
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketConfig {
     #[serde(default = "default_snapshot_interval")]
     pub snapshot_interval_secs: f64,
@@ -118,7 +118,7 @@ impl Default for MarketConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeConfig {
     #[serde(default = "default_maker_fee")]
     pub default_maker_fee: f64,
@@ -143,7 +143,7 @@ impl Default for FeeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatencyConfig {
     #[serde(default)]
     pub default_latency_secs: f64,
@@ -159,7 +159,7 @@ impl Default for LatencyConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MempoolConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -187,7 +187,7 @@ impl Default for MempoolConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiquidationConfig {
     #[serde(default = "default_mm_buffer")]
     pub maintenance_margin_buffer: f64,
@@ -223,7 +223,7 @@ impl Default for LiquidationConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotGroupConfig {
     /// One of: market_maker, arbitrage, momentum, mean_reversion, grid, dca,
     /// liquidation_exec, mev, wash_trading, noise.
@@ -257,19 +257,19 @@ impl BotGroupConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PopulationConfig {
     pub groups: Vec<BotGroupConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportConfig {
     pub out_dir: String,
     #[serde(default)]
     pub write_snapshots: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioConfig {
     pub run: RunConfig,
     pub assets: Vec<AssetConfig>,

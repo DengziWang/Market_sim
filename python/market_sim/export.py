@@ -25,6 +25,7 @@ class ExportPaths:
     orderbook_snapshots: str
     agent_state: str
     run_metadata: str
+    checkpoint: str
 
 
 def export_paths(out_dir: str) -> ExportPaths:
@@ -35,7 +36,18 @@ def export_paths(out_dir: str) -> ExportPaths:
         orderbook_snapshots=os.path.join(out_dir, "orderbook_snapshots.parquet"),
         agent_state=os.path.join(out_dir, "agent_state.parquet"),
         run_metadata=os.path.join(out_dir, "run_metadata.json"),
+        # Opaque `sim_core::sim::Simulation::to_checkpoint_bytes()` blob -- full
+        # internal engine state (order books, every agent, both RNG streams, pending
+        # events) at the moment the run stopped. Not present for runs saved before
+        # checkpoint/resume existed, or if the caller didn't ask `run_simulation*`
+        # for one; see `has_checkpoint`/`continue_run`.
+        checkpoint=os.path.join(out_dir, "checkpoint.bin"),
     )
+
+
+def has_checkpoint(out_dir: str) -> bool:
+    """Whether a previously exported run directory has a resumable checkpoint."""
+    return os.path.exists(export_paths(out_dir).checkpoint)
 
 
 def to_dataframes(result: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
@@ -71,6 +83,11 @@ def export_run(
     frames["orderbook_snapshots"].to_parquet(paths.orderbook_snapshots, index=False)
     frames["agent_state"].to_parquet(paths.agent_state, index=False)
 
+    checkpoint = result.get("checkpoint")
+    if checkpoint is not None:
+        with open(paths.checkpoint, "wb") as f:
+            f.write(checkpoint)
+
     meta = dict(result.get("meta", {}))
     meta["scenario_name"] = scenario_name
     meta["config_toml"] = config_toml
@@ -84,14 +101,22 @@ def export_run(
 
 def load_run(out_dir: str) -> Dict[str, Any]:
     """Read a previously exported run back in (DataFrames + metadata dict), without
-    re-running the simulation -- what `market_health/` operates on."""
+    re-running the simulation -- what `market_health/` operates on. Also loads the
+    `checkpoint` bytes (as `bytes`, key "checkpoint") when the run has one, i.e.
+    `has_checkpoint(out_dir)` is true -- pass those to `continue_run`/
+    `market_sim.continue_simulation` to keep simulating from exactly where this run
+    stopped, rather than starting a new one from scratch."""
     paths = export_paths(out_dir)
     with open(paths.run_metadata) as f:
         meta = json.load(f)
-    return {
+    out = {
         "trades": pd.read_parquet(paths.trades),
         "order_events": pd.read_parquet(paths.order_events),
         "orderbook_snapshots": pd.read_parquet(paths.orderbook_snapshots),
         "agent_state": pd.read_parquet(paths.agent_state),
         "meta": meta,
     }
+    if os.path.exists(paths.checkpoint):
+        with open(paths.checkpoint, "rb") as f:
+            out["checkpoint"] = f.read()
+    return out

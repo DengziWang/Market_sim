@@ -10,7 +10,7 @@ pub type OrderId = u64;
 /// simpler to work with across the codebase than a fixed-point duration type.
 pub type SimTime = f64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Side {
     Buy,
     Sell,
@@ -31,7 +31,7 @@ impl Side {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OrderType {
     Limit,
     Market,
@@ -40,7 +40,7 @@ pub enum OrderType {
 /// Time-in-force. PostOnly is modeled as a flag on Limit orders (see `Order::post_only`)
 /// rather than a TIF variant, since it composes with GTC/IOC semantics for *placement*
 /// (a post-only order that would cross is rejected/cancelled rather than filled).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TimeInForce {
     /// Good-Til-Cancelled: rests on the book until filled or explicitly cancelled.
     Gtc,
@@ -55,7 +55,7 @@ pub enum TimeInForce {
 /// so config/bot code can work in ordinary decimal prices.
 pub type PriceTicks = i64;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct TickSize(pub f64);
 
 impl TickSize {

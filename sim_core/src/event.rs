@@ -9,7 +9,7 @@ use std::collections::BinaryHeap;
 
 use crate::types::{AgentId, AssetId, OrderId, SimTime, VenueId};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum EventKind {
     /// An agent's own timer fired: it gets a chance to act.
     AgentWake { agent_id: AgentId },
@@ -32,7 +32,7 @@ pub enum EventKind {
     LiquidationSlice { agent_id: AgentId, asset_id: AssetId, slice_no: u32 },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScheduledEvent {
     pub time: SimTime,
     /// Insertion order, used as a deterministic tiebreaker for equal times so that
@@ -63,6 +63,7 @@ impl PartialOrd for ScheduledEvent {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct EventQueue {
     heap: BinaryHeap<ScheduledEvent>,
     next_seq: u64,

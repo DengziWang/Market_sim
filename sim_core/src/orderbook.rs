@@ -16,6 +16,7 @@ pub struct MakerFee(pub f64);
 #[derive(Debug, Clone, Copy)]
 pub struct TakerFee(pub f64);
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct OrderBook {
     pub asset_id: AssetId,
     pub tick_size: TickSize,

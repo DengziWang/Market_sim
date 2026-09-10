@@ -6,7 +6,7 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 
 use sim_core::config::ScenarioConfig;
 use sim_core::export::{AgentStateRow, OrderEventRow, SimResult, SnapshotRow, TradeRow};
@@ -74,12 +74,19 @@ fn agent_states_dict<'py>(py: Python<'py>, rows: &[AgentStateRow]) -> PyResult<B
     Ok(d)
 }
 
-fn result_to_pyobject(py: Python<'_>, result: SimResult, n_agents: u32) -> PyResult<PyObject> {
+/// Builds the same result dict as before, plus a `checkpoint` key (`bytes`) holding
+/// `sim`'s full internal state at the moment it stopped -- see `run_simulation`'s
+/// doc comment. Checkpoint serialization failures are surfaced as a Python
+/// exception rather than silently dropping the checkpoint, since a caller relying on
+/// checkpoint/resume needs to know if it didn't happen.
+fn result_to_pyobject(py: Python<'_>, sim: Simulation, result: SimResult, n_agents: u32) -> PyResult<PyObject> {
+    let checkpoint = sim.to_checkpoint_bytes().map_err(PyValueError::new_err)?;
     let out = PyDict::new_bound(py);
     out.set_item("trades", trades_dict(py, &result.trades)?)?;
     out.set_item("order_events", order_events_dict(py, &result.order_events)?)?;
     out.set_item("snapshots", snapshots_dict(py, &result.snapshots)?)?;
     out.set_item("agent_states", agent_states_dict(py, &result.agent_states)?)?;
+    out.set_item("checkpoint", PyBytes::new_bound(py, &checkpoint))?;
     let meta = PyDict::new_bound(py);
     meta.set_item("actual_session_seconds", result.actual_session_seconds)?;
     meta.set_item("liquidation_events", result.liquidation_events)?;
@@ -94,15 +101,19 @@ fn result_to_pyobject(py: Python<'_>, result: SimResult, n_agents: u32) -> PyRes
 
 /// Run one simulation from a TOML scenario config string. Returns a dict with keys
 /// `trades`, `order_events`, `snapshots`, `agent_states` (each `dict[str, list]`,
-/// columnar) and `meta` (session/run summary) -- see `market_sim.export` for turning
-/// this into the parquet files from spec section 7.
+/// columnar), `meta` (session/run summary) -- see `market_sim.export` for turning
+/// this into the parquet files from spec section 7 -- and `checkpoint` (`bytes`):
+/// the full internal simulation state at the moment the run stopped, opaque to
+/// Python, meant to be saved alongside the result and handed back to
+/// `continue_simulation`/`continue_simulation_cancellable` later to keep simulating
+/// from exactly this point rather than starting over.
 #[pyfunction]
 fn run_simulation(py: Python<'_>, config_toml: &str) -> PyResult<PyObject> {
     let cfg = ScenarioConfig::from_toml_str(config_toml).map_err(|e| PyValueError::new_err(format!("config parse error: {e}")))?;
     let n_agents = cfg.total_agents();
     let sim = Simulation::build(cfg).map_err(PyValueError::new_err)?;
-    let result = py.allow_threads(|| sim.run());
-    result_to_pyobject(py, result, n_agents)
+    let (sim, result) = py.allow_threads(|| sim.run_cancellable_keep_state(None));
+    result_to_pyobject(py, sim, result, n_agents)
 }
 
 /// A cancellation flag shared between Python threads (not tied to any one
@@ -145,8 +156,36 @@ fn run_simulation_cancellable(py: Python<'_>, config_toml: &str, token: &CancelT
     let n_agents = cfg.total_agents();
     let sim = Simulation::build(cfg).map_err(PyValueError::new_err)?;
     let flag = token.flag.clone();
-    let result = py.allow_threads(|| sim.run_cancellable(Some(flag)));
-    result_to_pyobject(py, result, n_agents)
+    let (sim, result) = py.allow_threads(|| sim.run_cancellable_keep_state(Some(flag)));
+    result_to_pyobject(py, sim, result, n_agents)
+}
+
+/// Loads a simulation from a checkpoint produced by a previous `run_simulation`/
+/// `run_simulation_cancellable`/`continue_simulation*` call's `checkpoint` bytes, and
+/// keeps simulating for `additional_seconds` more simulated time from exactly where
+/// it left off -- same order books, every agent's cash/inventory/indicator state,
+/// both RNG streams, and pending events, none of it re-seeded. Returns the same dict
+/// shape as `run_simulation`, covering only this newly-simulated segment (not the
+/// checkpoint's prior history -- concatenate with the earlier result if a single
+/// combined view is needed) plus a fresh `checkpoint` for continuing again later.
+#[pyfunction]
+fn continue_simulation(py: Python<'_>, checkpoint: &[u8], additional_seconds: f64) -> PyResult<PyObject> {
+    let sim = Simulation::from_checkpoint_bytes(checkpoint).map_err(PyValueError::new_err)?;
+    let n_agents = sim.agents.len() as u32;
+    let (sim, result) = py.allow_threads(|| sim.resume_keep_state(additional_seconds, None));
+    result_to_pyobject(py, sim, result, n_agents)
+}
+
+/// Same as `continue_simulation`, but accepts a `CancelToken` (see
+/// `run_simulation_cancellable`) so a long continuation can also be stopped early
+/// from another thread.
+#[pyfunction]
+fn continue_simulation_cancellable(py: Python<'_>, checkpoint: &[u8], additional_seconds: f64, token: &CancelToken) -> PyResult<PyObject> {
+    let sim = Simulation::from_checkpoint_bytes(checkpoint).map_err(PyValueError::new_err)?;
+    let n_agents = sim.agents.len() as u32;
+    let flag = token.flag.clone();
+    let (sim, result) = py.allow_threads(|| sim.resume_keep_state(additional_seconds, Some(flag)));
+    result_to_pyobject(py, sim, result, n_agents)
 }
 
 /// Same as `run_simulation`, but reads the TOML config from a file path.
@@ -169,6 +208,8 @@ fn sim_pyo3(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_simulation, m)?)?;
     m.add_function(wrap_pyfunction!(run_simulation_from_file, m)?)?;
     m.add_function(wrap_pyfunction!(run_simulation_cancellable, m)?)?;
+    m.add_function(wrap_pyfunction!(continue_simulation, m)?)?;
+    m.add_function(wrap_pyfunction!(continue_simulation_cancellable, m)?)?;
     m.add_function(wrap_pyfunction!(validate_config, m)?)?;
     m.add_class::<CancelToken>()?;
     Ok(())

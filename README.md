@@ -164,6 +164,9 @@ packages above -- no separate backend, nothing leaves your machine. It gives you
   export set to a directory you name), and the sidebar's "Load a saved run" expander
   reloads any previously exported run (from the dashboard, `run.export(...)`, or a
   batch experiment) back into the Results tab without re-running anything.
+- **Continue a simulation from where it stopped** (not a restart -- see below): the
+  Results tab's "Continue this simulation" section is available on any run (fresh,
+  stopped-early, or loaded from disk) that has a checkpoint.
 
 ```bash
 python3 -m pip install --user streamlit plotly   # once
@@ -174,6 +177,46 @@ streamlit run app/dashboard.py
 Opens at `http://localhost:8501` in your browser. Pick a base scenario in the
 sidebar, edit whatever you want across the tabs, click **Run simulation**, then look
 at the **Results** tab.
+
+### Checkpoint / resume
+
+Every `run_simulation`/`run_simulation_cancellable` call (and the dashboard's Run
+button, which just wraps the cancellable one) returns a `checkpoint: bytes` alongside
+the usual `trades`/`agent_states`/etc. -- the *entire* internal engine state at the
+moment the run stopped: every order book, every agent's cash/inventory/indicator
+state and RNG stream, the market-level RNG stream, and every event still pending
+(next agent wakes, the next snapshot/liquidation tick, ...). `market_sim.continue_run`
+(Python) / `Simulation::resume` (Rust) load that back and keep simulating for however
+many more seconds you ask for -- genuinely picking up mid-session, not restarting from
+a summary or re-seeding anything. This is what lets a session be extended after the
+fact instead of needing to guess the right length upfront.
+
+```python
+import market_sim as ms
+
+run = ms.run_scenario_file("scenarios/realistic_mix.toml")
+run.export("runs/leg1")                        # writes checkpoint.bin alongside the usual parquet files
+
+# ... later, maybe in a different process: reload and keep going.
+loaded = ms.load_run("runs/leg1")               # checkpoint.bin -> loaded["checkpoint"] if present
+more = ms.continue_run(loaded["checkpoint"], additional_seconds=1800.0)
+more.export("runs/leg2")                        # covers only the new segment -- see below
+```
+
+A couple of things worth knowing:
+
+- The checkpoint excludes accumulated trade/order-event/snapshot history (by design --
+  otherwise every checkpoint would grow with the whole run instead of staying
+  proportional to live state). `continue_run`/`continue_simulation` therefore return
+  only the *newly*-simulated segment; pass `previous_result=` (Python) or use
+  `combine_results` yourself to get one continuous combined table back. The dashboard
+  does this automatically -- continuing a run there always shows the full history.
+- The wire format is CBOR (self-describing, unlike bincode -- needed because bot
+  params are a free-form dynamic TOML value and the order book's maps use tuple keys,
+  neither of which bincode's non-self-describing format can round-trip).
+- Works on a cancelled/stopped-early run too, not just a completed one -- "Stop
+  simulation" already auto-saves, and that saved run's checkpoint can be continued
+  the same way as any other.
 
 ## Configuration format
 

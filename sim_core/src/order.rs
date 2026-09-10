@@ -1,6 +1,6 @@
 use crate::types::{AgentId, AssetId, OrderId, OrderType, PriceTicks, Side, SimTime, TimeInForce};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OrderStatus {
     Open,
     PartiallyFilled,
@@ -9,7 +9,7 @@ pub enum OrderStatus {
     Rejected,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Order {
     pub id: OrderId,
     pub agent_id: AgentId,

@@ -5,13 +5,14 @@ use crate::agent::{Action, AgentCommon, NewOrderRequest, StepResult};
 use crate::params;
 use crate::types::{AssetId, OrderType, Side, SimTime, TimeInForce};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Variant {
     Bollinger,
     OuFairValue,
     ZScore,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct State {
     pub variant: Variant,
     pub asset_id: AssetId,

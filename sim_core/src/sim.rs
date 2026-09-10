@@ -18,6 +18,14 @@ use crate::types::{AgentId, AssetId, OrderId, OrderType, Side, SimTime, TimeInFo
 
 const PRIMARY_VENUE: VenueId = 0;
 
+/// Everything needed to resume a simulation exactly where it left off: order books,
+/// every agent's cash/inventory/indicator state, both RNG streams (market-level and
+/// per-agent), and the still-pending event queue (agent wakes, periodic ticks, etc.
+/// scheduled but not yet due). `result` (accumulated trades/events/snapshots so far)
+/// is deliberately excluded -- see `Simulation::resume`'s doc comment -- so a
+/// checkpoint stays proportional to *state*, not to how long the run has already
+/// gone on for.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Simulation {
     pub market: Market,
     pub agents: Vec<AgentCommon>,
@@ -29,6 +37,7 @@ pub struct Simulation {
     session_end: SimTime,
     last_periodic_tick: SimTime,
     pending_delayed: HashMap<u64, (AgentId, NewOrderRequest)>,
+    #[serde(skip, default)]
     result: SimResult,
 }
 
@@ -82,7 +91,14 @@ impl Simulation {
     /// just a thin wrapper around one, set from another thread (or another Python
     /// thread, via `py.allow_threads` releasing the GIL for the duration of this
     /// call) while this runs.
-    pub fn run_cancellable(mut self, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> SimResult {
+    pub fn run_cancellable(self, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> SimResult {
+        self.run_cancellable_keep_state(cancel).1
+    }
+
+    /// Same as `run_cancellable`, but also returns the `Simulation` in its final
+    /// state (order books, agents, RNG streams, pending event queue), for callers
+    /// that want to checkpoint it (`to_checkpoint_bytes`) rather than discard it.
+    pub fn run_cancellable_keep_state(mut self, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> (Self, SimResult) {
         let seed = self.cfg.run.seed;
         self.market_rng = rng::market_rng(seed);
 
@@ -94,6 +110,64 @@ impl Simulation {
         self.events.push(self.cfg.liquidation.sweep_interval_secs, EventKind::LiquidationSweep);
         self.events.push(self.session_end, EventKind::EndOfSession);
 
+        self.drain_loop(cancel)
+    }
+
+    /// Continues a previously-checkpointed simulation (see `to_checkpoint_bytes` /
+    /// `from_checkpoint_bytes`) for `additional_seconds` more simulated time, with NO
+    /// re-seeding of anything: the order books, every agent's cash/inventory/
+    /// indicator state, both RNG streams (market-level and per-agent), and the
+    /// not-yet-due event queue (pending agent wakes, periodic snapshot/liquidation
+    /// ticks) all carry over exactly as checkpointed.
+    ///
+    /// This works with no special-casing because every bot and every periodic system
+    /// event is self-perpetuating -- each `AgentWake`/`SnapshotTick`/
+    /// `LiquidationSweep` handler reschedules its own successor -- and the original
+    /// run loop only ever exits by `break`ing out on `EndOfSession`. So a checkpoint
+    /// taken from a completed (or cancelled) run already has a queue full of events
+    /// scheduled beyond that point (next agent wakes, next snapshot tick, ...) that
+    /// were simply never popped; resuming just needs to push one new `EndOfSession`
+    /// further out and keep draining the same queue.
+    ///
+    /// Produces a *fresh* `SimResult` covering only the newly-simulated segment --
+    /// trades/order_events/snapshots from before the checkpoint are not duplicated
+    /// here. A caller wanting one combined history should concatenate the original
+    /// run's `SimResult` with this one (e.g. the dashboard does this when showing a
+    /// continued run).
+    pub fn resume(self, additional_seconds: SimTime, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> SimResult {
+        self.resume_keep_state(additional_seconds, cancel).1
+    }
+
+    /// Same as `resume`, but also returns the `Simulation` in its final state, for
+    /// callers that want to checkpoint it again (e.g. to continue a second time).
+    pub fn resume_keep_state(mut self, additional_seconds: SimTime, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> (Self, SimResult) {
+        self.result = SimResult::default();
+        self.session_end = self.now + additional_seconds.max(0.0);
+        self.events.push(self.session_end, EventKind::EndOfSession);
+        self.drain_loop(cancel)
+    }
+
+    /// Serializes the full simulation state (order books, agents, RNG streams,
+    /// pending event queue, config -- everything needed by `resume`) to a compact
+    /// binary blob (CBOR). Excludes `result` (see `resume`'s doc comment): a
+    /// checkpoint's size reflects live state, not how much trading history has
+    /// accumulated.
+    pub fn to_checkpoint_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf).map_err(|e| format!("checkpoint serialization failed: {e}"))?;
+        Ok(buf)
+    }
+
+    /// Restores a simulation previously saved with `to_checkpoint_bytes`, ready to be
+    /// driven further via `resume`.
+    pub fn from_checkpoint_bytes(bytes: &[u8]) -> Result<Self, String> {
+        ciborium::from_reader(bytes).map_err(|e| format!("checkpoint deserialization failed: {e}"))
+    }
+
+    /// Shared event-draining main loop used by both a fresh `run_cancellable` (after
+    /// it seeds the initial events) and `resume` (which reuses an already-populated
+    /// queue). See `run_cancellable`'s doc comment for `cancel` semantics.
+    fn drain_loop(mut self, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> (Self, SimResult) {
         let mut events_since_cancel_check: u32 = 0;
         while let Some(ev) = self.events.pop() {
             if let Some(flag) = &cancel {
@@ -150,7 +224,8 @@ impl Simulation {
 
         self.result.actual_session_seconds = self.now;
         self.finalize_agent_states();
-        self.result
+        let result = std::mem::take(&mut self.result);
+        (self, result)
     }
 
     fn handle_agent_wake(&mut self, agent_id: AgentId) {

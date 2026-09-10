@@ -24,7 +24,7 @@ use crate::types::{OrderId, SimTime, VenueId};
 
 /// Small fixed-capacity rolling buffer of samples, used by every indicator-based bot
 /// (moving averages, RSI, Bollinger, Donchian, z-score, VPIN buckets, ...).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct RollingWindow {
     pub buf: VecDeque<f64>,
     pub capacity: usize,
@@ -68,6 +68,7 @@ impl RollingWindow {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum BotStrategy {
     MarketMaker(market_maker::State),
     Arbitrage(arbitrage::State),

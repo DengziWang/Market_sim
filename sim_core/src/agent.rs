@@ -9,7 +9,7 @@ use crate::types::{AgentId, AssetId, OrderId, OrderType, PriceTicks, Side, SimTi
 
 /// A leveraged position, held by the configurable sub-population of agents that
 /// trade on margin (Phase 1 simplified model: see sim_core::liquidation).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MarginPosition {
     pub asset_id: AssetId,
     pub side: Side,
@@ -51,20 +51,20 @@ impl MarginPosition {
 /// Present only for the configurable fraction of agents (of any bot type -- see spec
 /// 5.7) that additionally carry a leveraged directional side-bet alongside their
 /// primary strategy.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct LeverageCfg {
     pub leverage_range: (f64, f64),
     pub position_frac_of_cash: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LiquidationExecStyle {
     Full,
     /// Staggered/partial execution over several slices (TWAP-like), to reduce impact.
     StaggeredTwap { slices: u32 },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentCommon {
     pub id: AgentId,
     pub cash: f64,
@@ -117,7 +117,7 @@ impl AgentCommon {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NewOrderRequest {
     pub asset_id: AssetId,
     pub side: Side,

@@ -14,7 +14,7 @@ use crate::order::{Order, OrderEvent};
 use crate::orderbook::{OrderBook, SubmitResult};
 use crate::types::{AgentId, AssetId, OrderId, OrderType, PriceTicks, Side, SimTime, TimeInForce, VenueId};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingMempoolOrder {
     pub payload_id: u64,
     pub venue_id: VenueId,
@@ -30,6 +30,7 @@ pub struct PendingMempoolOrder {
     pub consumed: bool,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Market {
     pub assets: Vec<AssetConfig>,
     pub venues: Vec<VenueConfig>,

@@ -12,14 +12,14 @@ use crate::agent::{Action, AgentCommon, NewOrderRequest, StepResult};
 use crate::params;
 use crate::types::{AssetId, OrderType, Side, SimTime, TimeInForce};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Variant {
     Sandwich,
     Frontrun,
     Backrun,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingSandwich {
     pub payload_id: u64,
     pub close_side: Side,
@@ -27,6 +27,7 @@ pub struct PendingSandwich {
     pub close_at: SimTime,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct State {
     pub variant: Variant,
     pub asset_id: AssetId,

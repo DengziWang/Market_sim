@@ -13,7 +13,7 @@ use crate::agent::{Action, AgentCommon, NewOrderRequest, StepResult};
 use crate::params;
 use crate::types::{AssetId, OrderType, Side, SimTime, TimeInForce, VenueId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Variant {
     CrossVenue,
     Triangular,
@@ -21,6 +21,7 @@ pub enum Variant {
     LatencyArb,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct State {
     pub variant: Variant,
     pub wake_interval: SimTime,

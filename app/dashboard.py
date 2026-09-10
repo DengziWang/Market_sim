@@ -27,9 +27,10 @@ import streamlit as st
 import toml
 from plotly.subplots import make_subplots
 
-from market_sim import CancelToken, run_simulation_cancellable
+from market_sim import CancelToken, continue_simulation_cancellable, run_simulation_cancellable
 from market_sim import config as cfgmod
 from market_sim.export import export_run, load_run
+from market_sim.runner import combine_results
 import market_health
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -68,28 +69,57 @@ def _default_cfg() -> dict:
     return cfgmod.load_config_dict(SCENARIOS["Realistic mix"])
 
 
-def _run_worker(config_toml: str, token: CancelToken, holder: dict) -> None:
+def _run_worker(run_fn, holder: dict) -> None:
     """Runs on a background thread -- must never call any `st.*` function (Streamlit
     widget calls are only valid on the main script-running thread); it only talks to
-    the Rust engine and writes to a plain dict the main thread polls."""
+    the Rust engine (via `run_fn`, a zero-arg closure -- either a fresh
+    `run_simulation_cancellable(...)` or a `continue_simulation_cancellable(...)` on
+    an existing checkpoint) and writes to a plain dict the main thread polls."""
     try:
-        holder["result"] = run_simulation_cancellable(config_toml, token)
+        holder["result"] = run_fn()
     except Exception as e:  # noqa: BLE001
         holder["error"] = f"{type(e).__name__}: {e}"
+
+
+def _start_sim_thread(make_run_fn, config_toml: str, *, is_continue: bool, base_result: dict | None) -> None:
+    """Shared by the sidebar's "Run simulation" button and the Results tab's
+    "Continue simulation" button: spins up the background thread and the session
+    state `_poll_sim_status` (sidebar) watches regardless of which UI section
+    started it. `make_run_fn(token)` builds the zero-arg closure the thread calls --
+    takes the freshly-created `CancelToken` as a plain argument (not read back from
+    `st.session_state` inside the thread, which only the main script-running thread
+    should touch)."""
+    st.session_state.run_error = None
+    token = CancelToken()
+    holder = {"result": None, "error": None}
+    thread = threading.Thread(target=_run_worker, args=(make_run_fn(token), holder), daemon=True)
+    st.session_state.sim_token = token
+    st.session_state.sim_holder = holder
+    st.session_state.sim_config_toml = config_toml
+    st.session_state.sim_start_time = time.time()
+    st.session_state.sim_is_continue = is_continue
+    st.session_state.sim_base_result = base_result
+    st.session_state.sim_thread = thread
+    thread.start()
 
 
 def _loaded_run_to_result(loaded: dict) -> dict:
     """market_sim.load_run(...)'s DataFrame-keyed shape -> the same columnar
     dict[str, list] shape run_simulation(...)/active_result use everywhere else, so
     the Results tab renders a freshly-run, stopped-early, or reloaded-from-disk
-    result identically."""
-    return {
+    result identically. Carries over `checkpoint` (present when the saved run has
+    one -- see `market_sim.has_checkpoint`) so a loaded run can still be continued,
+    not just viewed."""
+    result = {
         "trades": loaded["trades"].to_dict("list"),
         "order_events": loaded["order_events"].to_dict("list"),
         "snapshots": loaded["orderbook_snapshots"].to_dict("list"),
         "agent_states": loaded["agent_state"].to_dict("list"),
         "meta": loaded["meta"],
     }
+    if "checkpoint" in loaded:
+        result["checkpoint"] = loaded["checkpoint"]
+    return result
 
 
 def _discover_saved_runs() -> list:
@@ -156,6 +186,7 @@ for _key, _default in [
     ("metrics", None), ("last_save_path", None), ("run_error", None),
     ("sim_thread", None), ("sim_token", None), ("sim_holder", None),
     ("sim_config_toml", None), ("sim_start_time", None),
+    ("sim_is_continue", False), ("sim_base_result", None),
 ]:
     if _key not in st.session_state:
         st.session_state[_key] = _default
@@ -203,17 +234,8 @@ with st.sidebar:
 
     if not sim_running:
         if st.button("Run simulation", type="primary", width="stretch", key="run_sim_btn"):
-            st.session_state.run_error = None
             config_toml = cfgmod.dump_config_str(st.session_state.cfg)
-            token = CancelToken()
-            holder = {"result": None, "error": None}
-            thread = threading.Thread(target=_run_worker, args=(config_toml, token, holder), daemon=True)
-            st.session_state.sim_token = token
-            st.session_state.sim_holder = holder
-            st.session_state.sim_config_toml = config_toml
-            st.session_state.sim_start_time = time.time()
-            st.session_state.sim_thread = thread
-            thread.start()
+            _start_sim_thread(lambda token: (lambda: run_simulation_cancellable(config_toml, token)), config_toml, is_continue=False, base_result=None)
             st.rerun()
 
     @st.fragment(run_every=1)
@@ -236,12 +258,22 @@ with st.sidebar:
         # tab (esp. Results) pick up the newly active result.
         holder = st.session_state.sim_holder
         config_toml = st.session_state.sim_config_toml
+        is_continue = st.session_state.sim_is_continue
+        base_result = st.session_state.sim_base_result
         st.session_state.sim_thread = None
         st.session_state.sim_token = None
+        st.session_state.sim_is_continue = False
+        st.session_state.sim_base_result = None
         if holder.get("error"):
             st.session_state.run_error = holder["error"]
         else:
             result = holder["result"]
+            # continue_simulation_cancellable returns only the newly-simulated
+            # segment (see sim_core::sim::Simulation::resume's doc comment); combine
+            # it with what came before so the Results tab shows one continuous
+            # history, not just the latest extension.
+            if is_continue and base_result is not None:
+                result = combine_results(base_result, result)
             if result["meta"]["cancelled"]:
                 # "add function to break current simulation (which is going to be
                 # saved)": a stopped run is auto-exported immediately, not just left
@@ -253,7 +285,8 @@ with st.sidebar:
                 export_run(result, config_toml, save_dir, scenario_name="dashboard (stopped)", extra_meta={"stopped_via_dashboard": True})
                 _activate_result(result, config_toml, "Stopped early (auto-saved below)", save_path=save_dir)
             else:
-                _activate_result(result, config_toml, "Fresh run", save_path=None)
+                source = "Continued run" if is_continue else "Fresh run"
+                _activate_result(result, config_toml, source, save_path=None)
         st.rerun()
 
     _poll_sim_status()
@@ -511,6 +544,35 @@ def _render_results_tab():
         st.success(f"Saved to {os.path.relpath(out_dir, REPO_ROOT)}/ -- reload it later from the sidebar's \"Load a saved run\".")
     if st.session_state.last_save_path:
         st.caption(f"Last saved to: {os.path.relpath(st.session_state.last_save_path, REPO_ROOT)}/")
+
+    st.subheader("Continue this simulation")
+    checkpoint = result.get("checkpoint")
+    if checkpoint is None:
+        st.caption(
+            "No checkpoint available for this run (it was saved before checkpoint/resume existed, or the "
+            "source didn't capture one), so it can't be continued -- re-run it to get one."
+        )
+    else:
+        st.caption(
+            "Loads the full internal engine state this run ended with -- every order book, every agent's "
+            "cash/inventory/indicators, both RNG streams, and everything still pending -- and keeps "
+            "simulating from exactly there. Not a restart: this is the same as if the session had simply "
+            "been configured to run longer in the first place."
+        )
+        c1, c2 = st.columns([3, 1])
+        extra_seconds = c1.number_input("Additional simulated seconds", value=1800.0, min_value=1.0, step=60.0, key="continue_extra_seconds")
+        sim_running_now = st.session_state.sim_thread is not None
+        if c2.button("▶ Continue", width="stretch", key="continue_sim_btn", disabled=sim_running_now):
+            base_config_toml = st.session_state.active_config_toml or ""
+            _start_sim_thread(
+                lambda token: (lambda: continue_simulation_cancellable(checkpoint, extra_seconds, token)),
+                base_config_toml,
+                is_continue=True,
+                base_result=result,
+            )
+            st.rerun()
+        elif sim_running_now:
+            st.caption("A simulation is already running (see the sidebar) -- wait for it to finish before continuing this one.")
 
     trades = _trades_df_cached(version)
     snapshots = pd.DataFrame(result.get("snapshots", {}))
