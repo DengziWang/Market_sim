@@ -462,6 +462,14 @@ with tab_results:
         if trades.empty:
             st.warning("No trades occurred in this run.")
         else:
+            c1, c2 = st.columns(2)
+            show_fundamental = c1.checkbox(
+                "Show fundamental value",
+                value=False,
+                key="show_fundamental",
+                help="Off by default: the fundamental process is often far more volatile than the traded price, and including it in the chart drags the y-axis scale out so the actual price line looks flat.",
+            )
+            show_book = c2.checkbox("Show best bid/ask", value=True, key="show_book")
             for aid in sorted(trades["asset_id"].unique()):
                 sub = trades[trades["asset_id"] == aid].sort_values("time")
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.04)
@@ -469,13 +477,15 @@ with tab_results:
 
                 if not snapshots.empty:
                     snap = snapshots[(snapshots["asset_id"] == aid) & (snapshots["level"] == 0)]
-                    for side, color in [("bid", "rgba(0,150,0,0.6)"), ("ask", "rgba(200,0,0,0.6)")]:
-                        s = snap[snap["side"] == side].sort_values("time")
-                        if not s.empty:
-                            fig.add_trace(go.Scattergl(x=s["time"], y=s["price"], mode="lines", name=f"best {side}", line=dict(width=0.6, color=color)), row=1, col=1)
-                    fair = snap[snap["side"] == "fundamental"].sort_values("time")
-                    if not fair.empty:
-                        fig.add_trace(go.Scattergl(x=fair["time"], y=fair["price"], mode="lines", name="fundamental value", line=dict(width=1, dash="dot", color="grey")), row=1, col=1)
+                    if show_book:
+                        for side, color in [("bid", "rgba(0,150,0,0.6)"), ("ask", "rgba(200,0,0,0.6)")]:
+                            s = snap[snap["side"] == side].sort_values("time")
+                            if not s.empty:
+                                fig.add_trace(go.Scattergl(x=s["time"], y=s["price"], mode="lines", name=f"best {side}", line=dict(width=0.6, color=color)), row=1, col=1)
+                    if show_fundamental:
+                        fair = snap[snap["side"] == "fundamental"].sort_values("time")
+                        if not fair.empty:
+                            fig.add_trace(go.Scattergl(x=fair["time"], y=fair["price"], mode="lines", name="fundamental value", line=dict(width=1, dash="dot", color="grey")), row=1, col=1)
 
                 notional = sub["price"] * sub["qty"]
                 n_buckets = 300
