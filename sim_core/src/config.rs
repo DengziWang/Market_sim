@@ -39,8 +39,8 @@ pub struct AssetConfig {
     /// Same Ornstein-Uhlenbeck shape as the fundamental-value process, but modeling
     /// something psychologically different: collective market *mood* (bullish <-> 0
     /// <-> bearish, normalized to roughly [-1, 1]), not the asset's true value.
-    /// `human`/`sentiment_herder` bots read this instead of (or alongside) price
-    /// trend. Independent of fundamental_value -- its own random draw, mean-reverts
+    /// `human` bots read this alongside price trend (see bots/human.rs). Independent
+    /// of fundamental_value -- its own random draw, mean-reverts
     /// to neutral (0) rather than to any price level, and its vol/theta are
     /// deliberately named/defaulted differently since mood realistically swings more
     /// and persists longer than a well-anchored fundamental value would.

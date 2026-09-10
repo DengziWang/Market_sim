@@ -67,13 +67,8 @@ leverage_range = [3.0, 12.0]
 
 [[population.groups]]
 bot_type = "human"
-variant = "disposition_chaser"
-count = 5
-
-[[population.groups]]
-bot_type = "human"
-variant = "sentiment_herder"
-count = 5
+variant = "retail"
+count = 10
 "#;
 
 #[test]

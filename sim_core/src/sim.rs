@@ -805,6 +805,5 @@ variant_parser!(parse_noise_variant, noise::Variant, {
     "herding" => noise::Variant::Herding,
 });
 variant_parser!(parse_human_variant, human::Variant, {
-    "disposition_chaser" => human::Variant::DispositionChaser,
-    "sentiment_herder" => human::Variant::SentimentHerder,
+    "retail" => human::Variant::Retail,
 });

@@ -1,13 +1,14 @@
 # =============================================================================
 # Scenario (b): "Reiner Bot-Markt ohne Noise-Trader" -- the actual research question
 # from the prompt's title. Same total headcount (~500) as realistic_mix.toml, with
-# the noise/retail group's share (56.8%) redistributed proportionally across every
-# other bot type, so this is a like-for-like comparison of "same size market, humans
-# replaced by more bots" rather than "smaller market". Same TODO as realistic_mix.toml
-# applies: exact weighting still pending your review.
+# the retail group's share (56.8% -- realistic_mix.toml's noise + human bots
+# combined) redistributed proportionally across every other bot type, so this is a
+# like-for-like comparison of "same size market, humans replaced by more bots"
+# rather than "smaller market". No `noise` *or* `human` bots here at all -- both are
+# retail/human representations, so a "pure bot market" excludes both, not just one.
 #
 # Compare market_health scores between this file and realistic_mix.toml (same seeds)
-# to see the effect of removing the noise/retail control group entirely -- that
+# to see the effect of removing the retail/human population entirely -- that
 # comparison is the core of the research question in prompt section 1.
 # =============================================================================
 

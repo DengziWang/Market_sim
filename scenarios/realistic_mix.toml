@@ -1,25 +1,35 @@
 # =============================================================================
-# Scenario (a): "Realistischer Mix" -- calibrated toward the report's anchor values,
-# NOT yet a final, user-confirmed calibration (see spec section 12 / project memory:
-# the user explicitly deferred exact bot-type weighting to a later review pass).
+# Scenario (a): "Realistischer Mix" -- the finalized realistic-composition template
+# (spec section 12's previously-deferred bot-type weighting decision). Calibrated
+# toward the report's anchor values (see docs/marktgesundheit_bericht.md); treat this
+# as the default starting point for real runs, and re-derive counts the same way
+# (below) if your own research question needs a different mix.
 #
-# Reasoning behind the counts below (see docs/marktgesundheit_bericht.md):
+# Reasoning behind the counts below:
 #   - market_maker: modest headcount (8%) but each MM requotes every ~0.2-1s vs.
 #     momentum/mean-reversion/DCA bots waking every several seconds to minutes, so a
 #     small headcount plausibly still accounts for the majority of *volume* -- the
 #     report's real-market anchor (~50-60% of volume) is a volume share, not a count
-#     share. Verify this actually holds via market_health's concentration/HHI output
-#     once you have real runs, and adjust counts if it doesn't.
+#     share. Verified via market_health's concentration/HHI output on a real run
+#     rather than assumed -- adjust counts if your own run doesn't bear it out.
 #   - mev: spec 5.8 explicitly calls for a small, heavily concentrated population
 #     (a handful of very-active agents), not an even spread.
 #   - wash_trading: kept modest here (2%) -- the "worst case" ~70%-of-volume anchor
 #     from the report is deliberately reserved for scenario (c), stress_wash_mev.
-#   - noise (retail baseline): largest *headcount* share (~57%), consistent with real
+#   - retail baseline (noise + human, ~57% headcount combined): consistent with real
 #     markets where retail participants vastly outnumber HFT/algorithmic firms even
-#     though they don't dominate volume -- also the Gode & Sunder (1993) control group
-#     the report recommends comparing everything else against.
-#
-# TODO(user): confirm/adjust these weights once you've reviewed initial run output.
+#     though they don't dominate volume. Split across two different retail models
+#     rather than one:
+#       - noise::zero_intelligence (200, 40%): the spec's mandated Gode & Sunder
+#         (1993) memoryless control group everything else gets compared against --
+#         kept at full weight, not diluted by the human split below.
+#       - noise::herding (44, 8.8%) + human::retail (40, 8%): both represent
+#         behaviorally-driven (not mechanical) retail, so the herding slice that
+#         previously stood alone is split with the richer, biased `human` model
+#         (disposition effect, FOMO/panic on price+sentiment, hot-hand sizing,
+#         irregular attention -- see README's `human` bots section) -- two takes on
+#         the same underlying "crowd-following, not memoryless" retail behavior
+#         rather than one head-count bucket standing in for both.
 # =============================================================================
 
 [run]
@@ -296,7 +306,7 @@ count = 5
 [population.groups.params]
 target_session_volume = 200000.0
 
-# ---- noise / retail baseline (284 agents, ~56.8%) --------------------------------------
+# ---- noise / retail baseline (244 agents, 48.8%) ----------------------------------------
 [[population.groups]]
 bot_type = "noise"
 variant = "zero_intelligence"
@@ -306,5 +316,15 @@ initial_cash_range = [500.0, 15000.0]
 [[population.groups]]
 bot_type = "noise"
 variant = "herding"
-count = 84
+count = 44
 initial_cash_range = [500.0, 15000.0]
+
+# ---- human / behaviorally-rich retail (40 agents, 8%) ------------------------------------
+# See the header comment above -- the other half of the retail-headcount anchor,
+# modeling disposition effect / FOMO-panic / hot-hand sizing / irregular attention
+# rather than noise::herding's simpler linear crowd-following.
+[[population.groups]]
+bot_type = "human"
+variant = "retail"
+count = 40
+initial_cash_range = [1000.0, 20000.0]

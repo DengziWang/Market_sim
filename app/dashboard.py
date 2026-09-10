@@ -54,10 +54,11 @@ VARIANTS_BY_TYPE = {
     "mev": ["sandwich", "frontrun", "backrun"],
     "wash_trading": ["self_ring", "volume_ranking"],
     "noise": ["zero_intelligence", "herding"],
-    # Not spec-mandated -- behavioral-finance-motivated bots (disposition effect,
-    # FOMO/panic, "hot hand" sizing, irregular attention, round-number bias) rather
-    # than a rational/mechanical strategy. See sim_core/src/bots/human.rs.
-    "human": ["disposition_chaser", "sentiment_herder"],
+    # Not spec-mandated -- a behavioral-finance-motivated bot (disposition effect,
+    # FOMO/panic on both price trend AND sentiment, "hot hand" sizing, irregular
+    # attention, round-number bias) rather than a rational/mechanical strategy. One
+    # unified variant carries every bias at once. See sim_core/src/bots/human.rs.
+    "human": ["retail"],
 }
 
 RUNS_ROOT = os.path.join(REPO_ROOT, "runs")

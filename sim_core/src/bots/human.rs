@@ -1,11 +1,18 @@
-//! Human-behavior bots: not a spec-mandated category, added to model actual
+//! Human-behavior bot: not a spec-mandated category, added to model actual
 //! behavioral-finance biases rather than a rational (even if simplified) strategy.
 //! `noise` (bots/noise.rs) is the spec's "baseline control group" and deliberately
-//! stays simple/memoryless (Gode & Sunder zero-intelligence); these bots are the
-//! opposite -- they remember their own trades and react in ways a rational or
+//! stays simple/memoryless (Gode & Sunder zero-intelligence); this bot is the
+//! opposite -- it remembers its own trades and reacts in ways a rational or
 //! mechanical bot wouldn't.
 //!
-//! Modeled biases, each with real behavioral-finance backing:
+//! A single variant carries every modeled bias at once (this used to be split across
+//! two variants -- `disposition_chaser` reacting only to price trend,
+//! `sentiment_herder` only to mood -- merged into one bot that does both, since a
+//! real retail trader isn't cleanly one or the other):
+//!   - **Reacts to both price trend and sentiment**: the directional signal blends a
+//!     recent-price-return component with the latent, price-independent
+//!     `Market::sentiment` process (see market.rs), each normalized by its own
+//!     threshold and perceived with individual noise -- see `raw_signal` in `step()`.
 //!   - **Disposition effect**: hold losers too long, sell winners too early --
 //!     probably the most robust documented bias in retail trading. Needs the bot's
 //!     own average entry price, which nothing elsewhere in the engine tracks; see
@@ -25,12 +32,6 @@
 //!     P&L, not just its cash budget.
 //!   - **Round-number bias**: trade notional is rounded to a "nice" number (1/2/5 x
 //!     10^k), not a raw computed float.
-//!
-//! Two variants differ only in what drives the directional signal:
-//!   - `disposition_chaser`: recent price return (FOMO/panic on price moves).
-//!   - `sentiment_herder`: the latent, price-independent `Market::sentiment`
-//!     process (see market.rs), read with individual perception noise -- "mood"-
-//!     driven herding, not just price-driven.
 
 use rand::Rng;
 
@@ -41,8 +42,11 @@ use crate::types::{AssetId, OrderType, Side, SimTime, TimeInForce};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Variant {
-    DispositionChaser,
-    SentimentHerder,
+    /// The only variant: an ordinary retail trader carrying every bias listed in the
+    /// module doc comment at once. Kept as a one-value enum (rather than dropping
+    /// `Variant` entirely) so `human` still fits the same `bot_type`/`variant`
+    /// dispatch pattern every other bot type uses.
+    Retail,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -52,7 +56,15 @@ pub struct State {
     pub background_wake_min: SimTime,
     pub background_wake_max: SimTime,
     pub alert_wake_interval: SimTime,
-    pub signal_threshold: f64,
+    /// Return (fraction) since this agent's own last check-in that counts as a full
+    /// "one unit" price signal -- see `raw_signal`'s normalization in `step()`.
+    pub price_signal_threshold: f64,
+    /// Perceived sentiment reading (already normalized to roughly [-1, 1]) that
+    /// counts as a full "one unit" mood signal.
+    pub sentiment_signal_threshold: f64,
+    /// Blend weight for the two normalized signal components: 1.0 = price trend
+    /// only, 0.0 = sentiment only, 0.5 (default) = equal weight to both.
+    pub price_weight: f64,
     pub fomo_exponent: f64,
     pub perception_noise: f64,
     pub order_notional: f64,
@@ -72,8 +84,7 @@ pub struct State {
 impl State {
     pub fn variant_name(&self) -> &'static str {
         match self.variant {
-            Variant::DispositionChaser => "disposition_chaser",
-            Variant::SentimentHerder => "sentiment_herder",
+            Variant::Retail => "retail",
         }
     }
 
@@ -86,25 +97,16 @@ impl State {
             asset_id,
             // Real people don't watch a chart continuously -- most check in a few
             // times an hour at most, and even less on a quiet asset. 3-40 min
-            // (average ~22 min) between voluntary check-ins, vs. the earlier
-            // 1-15 min default.
+            // (average ~22 min) between voluntary check-ins, vs. an earlier,
+            // unrealistically chatty 1-15 min default.
             background_wake_min: params::get_f64(p, "background_wake_min_secs", 180.0),
             background_wake_max: params::get_f64(p, "background_wake_max_secs", 2400.0),
             // And even having noticed something (an alert wake), "check back again
             // in a couple of minutes" is more human than refreshing every 20s.
             alert_wake_interval: params::get_f64(p, "alert_wake_interval_secs", 120.0),
-            // Default threshold means "a return since last check" for
-            // disposition_chaser (a fraction) but "a mood reading" for
-            // sentiment_herder (already normalized to [-1,1]) -- from_params picks
-            // the right default per variant since the two scales aren't comparable.
-            signal_threshold: params::get_f64(
-                p,
-                "signal_threshold",
-                match variant {
-                    Variant::DispositionChaser => 0.02,
-                    Variant::SentimentHerder => 0.15,
-                },
-            ),
+            price_signal_threshold: params::get_f64(p, "price_signal_threshold", 0.02),
+            sentiment_signal_threshold: params::get_f64(p, "sentiment_signal_threshold", 0.15),
+            price_weight: params::get_f64(p, "price_weight", 0.5).clamp(0.0, 1.0),
             fomo_exponent: params::get_f64(p, "fomo_exponent", 1.1),
             perception_noise: params::get_f64(p, "perception_noise", 0.25),
             order_notional: params::get_f64(p, "order_notional", 800.0),
@@ -182,47 +184,53 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     }
     s.last_seen_inventory = inventory;
 
-    let raw_signal = match s.variant {
-        Variant::DispositionChaser => {
-            let prev = s.last_price.unwrap_or(mid);
-            let raw_return = (mid - prev) / prev.max(1e-9);
-            // Irregular attention means the gap since this agent's own last wake
-            // varies a lot (60-900s by default) -- comparing raw return straight to a
-            // fixed threshold makes an agent that happened to sleep longer see an
-            // artificially bigger "move" for the same underlying drift rate, not a
-            // real signal. Normalize by sqrt(elapsed / reference), consistent with
-            // how return volatility scales with time in a random walk, so a return
-            // observed after the *typical* gap keeps a ~1x multiplier while a return
-            // spanning an unusually long gap is scaled back down. Without this, a
-            // large population sharing a wide range of check-in intervals could
-            // produce a feedback loop: bots with longer gaps overreact, push price
-            // further, and *other* bots' next (possibly also-long) gap then spans an
-            // even bigger apparent move -- this happened in testing (see git history).
-            let reference_interval = (s.background_wake_min + s.background_wake_max) / 2.0;
-            let elapsed = ctx.now - s.last_wake_time.unwrap_or(ctx.now);
-            let time_norm = (elapsed / reference_interval.max(1e-9)).sqrt().max(0.3);
-            raw_return / time_norm
-        }
-        Variant::SentimentHerder => {
-            let true_sentiment = *ctx.market.sentiment.get(&s.asset_id).unwrap_or(&0.0);
-            let noise = agent.rng.gen_range(-s.perception_noise..s.perception_noise);
-            (true_sentiment + noise).clamp(-1.0, 1.0)
-        }
-    };
+    // Price-trend component: recent return, normalized for elapsed-time-since-last-
+    // check (irregular attention means that gap varies a lot -- comparing raw return
+    // straight to a fixed threshold makes an agent that happened to sleep longer see
+    // an artificially bigger "move" for the same underlying drift rate, not a real
+    // signal). Normalize by sqrt(elapsed / reference), consistent with how return
+    // volatility scales with time in a random walk, so a return observed after the
+    // *typical* gap keeps a ~1x multiplier while a return spanning an unusually long
+    // gap is scaled back down. Without this, a large population sharing a wide range
+    // of check-in intervals could produce a feedback loop: bots with longer gaps
+    // overreact, push price further, and *other* bots' next (possibly also-long) gap
+    // then spans an even bigger apparent move -- this happened in testing (see git
+    // history). Then normalized by `price_signal_threshold` so it's on the same
+    // "1 unit = alert-worthy" scale as the sentiment component below.
+    let prev_price = s.last_price.unwrap_or(mid);
+    let raw_return = (mid - prev_price) / prev_price.max(1e-9);
+    let reference_interval = (s.background_wake_min + s.background_wake_max) / 2.0;
+    let elapsed = ctx.now - s.last_wake_time.unwrap_or(ctx.now);
+    let time_norm = (elapsed / reference_interval.max(1e-9)).sqrt().max(0.3);
+    let price_component = (raw_return / time_norm) / s.price_signal_threshold.max(1e-9);
+
+    // Mood component: the latent, price-independent sentiment process, read with
+    // individual perception noise (no two people read "the mood" identically) and
+    // likewise normalized by its own threshold.
+    let true_sentiment = *ctx.market.sentiment.get(&s.asset_id).unwrap_or(&0.0);
+    let perceived_sentiment = (true_sentiment + agent.rng.gen_range(-s.perception_noise..s.perception_noise)).clamp(-1.0, 1.0);
+    let sentiment_component = perceived_sentiment / s.sentiment_signal_threshold.max(1e-9);
+
+    // Blended, normalized signal: both components are already on a "1.0 = as strong
+    // as this agent's own alert threshold" scale, so `magnitude > 1.0` below is the
+    // combined alert condition regardless of which component (or mix of both) drove
+    // it there -- a real trader doesn't cleanly separate "the price moved" from
+    // "everyone's talking about it", they reinforce each other.
+    let raw_signal = s.price_weight * price_component + (1.0 - s.price_weight) * sentiment_component;
     s.last_price = Some(mid);
     s.last_wake_time = Some(ctx.now);
 
-    // Convex (not linear) response with a dead zone: no reaction to small moves,
-    // then intensity grows faster than the signal itself past the threshold --
+    // Convex (not linear) response with a dead zone: no reaction below the combined
+    // threshold, then intensity grows faster than the signal itself past it --
     // FOMO/panic, not measured trend-following.
     let magnitude = raw_signal.abs();
-    let alert = magnitude > s.signal_threshold;
-    let excess = (magnitude / s.signal_threshold.max(1e-9) - 1.0).max(0.0);
-    // Capped well below the earlier 4.0: at intensity=4 a single agent's notional
-    // could reach (1+4)*2.5 = 12.5x its own base size, which combined with a large,
-    // synchronized population (many agents reading the same shared sentiment/price
-    // signal) was enough to overwhelm book depth on thinner assets in testing --
-    // see git history.
+    let alert = magnitude > 1.0;
+    let excess = (magnitude - 1.0).max(0.0);
+    // Capped well below an earlier, higher cap: at intensity=4 a single agent's
+    // notional could reach (1+4)*2.5 = 12.5x its own base size, which combined with a
+    // large, synchronized population (many agents reading the same shared sentiment/
+    // price signal) was enough to overwhelm book depth on thinner assets in testing
+    // -- see git history.
     let intensity = excess.powf(s.fomo_exponent).min(1.2);
     // Inertia: noticing a signal doesn't mean acting on it -- rolled once per wake,
     // not per potential trade, so it's a real "decided not to today", not a size cut.

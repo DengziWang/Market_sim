@@ -241,13 +241,8 @@ wake_interval_secs = 1.0
 
 [[population.groups]]
 bot_type = "human"
-variant = "disposition_chaser"
-count = 6
-
-[[population.groups]]
-bot_type = "human"
-variant = "sentiment_herder"
-count = 6
+variant = "retail"
+count = 12
 "#;
 
 #[test]
@@ -374,14 +369,8 @@ wake_interval_secs = 0.3
 
 [[population.groups]]
 bot_type = "human"
-variant = "disposition_chaser"
-count = 15
-initial_cash_range = [1000.0, 8000.0]
-
-[[population.groups]]
-bot_type = "human"
-variant = "sentiment_herder"
-count = 15
+variant = "retail"
+count = 30
 initial_cash_range = [1000.0, 8000.0]
 "#;
     let parsed = ScenarioConfig::from_toml_str(cfg).expect("config must parse");
