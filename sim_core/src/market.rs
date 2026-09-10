@@ -39,6 +39,9 @@ pub struct Market {
     books: HashMap<(VenueId, AssetId), OrderBook>,
     pub mark_price_ema: HashMap<AssetId, f64>,
     pub fundamental_value: HashMap<AssetId, f64>,
+    /// Collective market mood per asset, roughly in [-1, 1]. See
+    /// `AssetConfig::sentiment_vol`/`sentiment_theta`'s doc comment.
+    pub sentiment: HashMap<AssetId, f64>,
     pub last_trade_price: HashMap<(VenueId, AssetId), f64>,
     pub pending_mempool: Vec<PendingMempoolOrder>,
     next_order_id: OrderId,
@@ -50,6 +53,7 @@ impl Market {
         let mut books = HashMap::new();
         let mut mark_price_ema = HashMap::new();
         let mut fundamental_value = HashMap::new();
+        let mut sentiment = HashMap::new();
         for (vid, _venue) in venues.iter().enumerate() {
             for (aid, asset) in assets.iter().enumerate() {
                 books.insert((vid as VenueId, aid as AssetId), OrderBook::new(aid as AssetId, asset.tick_size, cfg.max_price_move_frac));
@@ -58,6 +62,7 @@ impl Market {
         for (aid, asset) in assets.iter().enumerate() {
             mark_price_ema.insert(aid as AssetId, asset.initial_price);
             fundamental_value.insert(aid as AssetId, asset.initial_price);
+            sentiment.insert(aid as AssetId, 0.0);
         }
         Self {
             assets,
@@ -68,6 +73,7 @@ impl Market {
             books,
             mark_price_ema,
             fundamental_value,
+            sentiment,
             last_trade_price: HashMap::new(),
             pending_mempool: Vec::new(),
             next_order_id: 1,
@@ -192,9 +198,9 @@ impl Market {
         self.book(venue, asset).depth(side, levels)
     }
 
-    /// Advance the EMA mark price and the latent fundamental value process for every
-    /// asset (primary venue only feeds the mark price -- see module docs). `dt` is the
-    /// time elapsed since the previous tick.
+    /// Advance the EMA mark price, the latent fundamental value process, and the
+    /// latent sentiment process for every asset (primary venue only feeds the mark
+    /// price -- see module docs). `dt` is the time elapsed since the previous tick.
     pub fn tick_mark_and_fundamental(&mut self, dt: SimTime, rng: &mut ChaCha8Rng) {
         let halflife = self.cfg.mark_price_ema_halflife_secs.max(1e-6);
         let alpha = 1.0 - 0.5f64.powf(dt / halflife);
@@ -215,6 +221,14 @@ impl Market {
                 + asset.fundamental_theta * (asset.initial_price - f_prev) * dt
                 + asset.fundamental_vol * f_prev * dt.sqrt() * z;
             self.fundamental_value.insert(aid, f_next.max(asset.tick_size));
+
+            // Independent draw and independent process from fundamental value above:
+            // mean-reverts to neutral (0), not to any price level, and is deliberately
+            // not clamped to a price-derived floor (it's a normalized mood, not a price).
+            let s_prev = *self.sentiment.get(&aid).unwrap();
+            let z2: f64 = rng.sample(StandardNormal);
+            let s_next = s_prev + asset.sentiment_theta * (0.0 - s_prev) * dt + asset.sentiment_vol * dt.sqrt() * z2;
+            self.sentiment.insert(aid, s_next.clamp(-1.0, 1.0));
         }
     }
 

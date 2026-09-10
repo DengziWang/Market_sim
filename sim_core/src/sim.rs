@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use rand::Rng;
 
 use crate::agent::{Action, AgentCommon, LeverageCfg, LiquidationExecStyle, NewOrderRequest, StepResult};
-use crate::bots::{self, arbitrage, dca, grid, liquidation_trader, market_maker, mean_reversion, mev, momentum, noise, wash_trading, BotStrategy, StepCtx};
+use crate::bots::{self, arbitrage, dca, grid, human, liquidation_trader, market_maker, mean_reversion, mev, momentum, noise, wash_trading, BotStrategy, StepCtx};
 use crate::config::ScenarioConfig;
 use crate::event::{EventKind, EventQueue};
 use crate::export::{AgentStateRow, OrderEventRow, SimResult, SnapshotRow, TradeRow};
@@ -490,8 +490,13 @@ impl Simulation {
             // level=0) rather than a separate export file.
             let fair = *self.market.fundamental_value.get(&aid).unwrap_or(&0.0);
             let mark = *self.market.mark_price_ema.get(&aid).unwrap_or(&0.0);
+            let sentiment = *self.market.sentiment.get(&aid).unwrap_or(&0.0);
             self.result.snapshots.push(SnapshotRow { time: self.now, asset_id: aid, venue_id: PRIMARY_VENUE, side: "fundamental", level: 0, price: fair, qty: 0.0 });
             self.result.snapshots.push(SnapshotRow { time: self.now, asset_id: aid, venue_id: PRIMARY_VENUE, side: "mark", level: 0, price: mark, qty: 0.0 });
+            // Reuses `price` as a plain numeric carrier (not an actual price) for the
+            // sentiment value, same trick as fundamental/mark above -- long-format,
+            // no new export file needed.
+            self.result.snapshots.push(SnapshotRow { time: self.now, asset_id: aid, venue_id: PRIMARY_VENUE, side: "sentiment", level: 0, price: sentiment, qty: 0.0 });
         }
     }
 
@@ -601,6 +606,7 @@ fn build_population(cfg: &ScenarioConfig) -> Result<(Vec<AgentCommon>, Vec<BotSt
                     &params,
                 )),
                 "noise" => BotStrategy::Noise(noise::State::from_params(parse_noise_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
+                "human" => BotStrategy::Human(human::State::from_params(parse_human_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
                 other => return Err(format!("unknown bot_type '{other}' in population config")),
             };
 
@@ -722,4 +728,8 @@ variant_parser!(parse_wash_variant, wash_trading::Variant, {
 variant_parser!(parse_noise_variant, noise::Variant, {
     "zero_intelligence" => noise::Variant::ZeroIntelligence,
     "herding" => noise::Variant::Herding,
+});
+variant_parser!(parse_human_variant, human::Variant, {
+    "disposition_chaser" => human::Variant::DispositionChaser,
+    "sentiment_herder" => human::Variant::SentimentHerder,
 });

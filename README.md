@@ -195,13 +195,39 @@ Everything is a TOML file matching `sim_core::config::ScenarioConfig` (see
 ```
 
 `bot_type` is one of `market_maker`, `arbitrage`, `momentum`, `mean_reversion`,
-`grid`, `dca`, `liquidation_trader`, `mev`, `wash_trading`, `noise` -- see
+`grid`, `dca`, `liquidation_trader`, `mev`, `wash_trading`, `noise`, `human` -- see
 `sim_core/src/bots/` for each type's variants and their `params` keys/defaults
 (every module has them in a doc comment at the top of its `State::from_params`).
 
 **Bot-type weighting**: the three example scenarios use a documented-but-provisional
 weighting (see the comments at the top of each file) -- confirm/adjust it before
-treating results as a real finding, not just a smoke test.
+treating results as a real finding, not just a smoke test. None of them include
+`human` bots yet (added after they were written) -- add some via the dashboard's
+Bot Population tab, or a `[[population.groups]]` block, to try them.
+
+### `human` bots (not spec-mandated)
+
+Added on request to model actual behavioral-finance biases -- disposition effect
+(hold losers, sell winners early), convex FOMO/panic response with a dead zone
+(not linear trend-following), "hot hand" position sizing off the bot's own recent
+realized P&L, irregular bursty attention (long jittery background check-ins, much
+shorter ones right after noticing a big move), and round-number trade sizes --
+rather than a rational or mechanical strategy. `noise` remains the spec's
+deliberately-simple memoryless baseline; `human` is the opposite: it remembers its
+own trades and reacts the way research says people actually do, not randomly.
+
+Two variants differ only in what drives the directional signal: `disposition_chaser`
+reacts to recent price return (time-normalized, so an agent that happened to sleep
+longer doesn't see an artificially bigger "move" for the same underlying drift);
+`sentiment_herder` reacts to a new latent, price-independent `Market::sentiment`
+process (same Ornstein-Uhlenbeck shape as the fundamental-value process, but
+mean-reverting to neutral mood rather than to a price) with individual perception
+noise -- mood-driven herding, not just price-driven. Both are capped fairly
+conservatively by default (see `sim_core/src/bots/human.rs`'s `from_params`) after
+testing showed a large, synchronized population of these bots reading a shared
+signal can otherwise overwhelm book depth on thin assets -- tune `fomo_exponent`,
+`max_cash_frac_per_trade` up if you deliberately want more extreme herding/bubble
+dynamics to study.
 
 ## Performance
 

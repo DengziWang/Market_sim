@@ -7,6 +7,7 @@
 pub mod arbitrage;
 pub mod dca;
 pub mod grid;
+pub mod human;
 pub mod liquidation_trader;
 pub mod market_maker;
 pub mod mean_reversion;
@@ -78,6 +79,7 @@ pub enum BotStrategy {
     Mev(mev::State),
     WashTrading(wash_trading::State),
     Noise(noise::State),
+    Human(human::State),
 }
 
 impl BotStrategy {
@@ -93,6 +95,7 @@ impl BotStrategy {
             BotStrategy::Mev(s) => ("mev", s.variant_name()),
             BotStrategy::WashTrading(s) => ("wash_trading", s.variant_name()),
             BotStrategy::Noise(s) => ("noise", s.variant_name()),
+            BotStrategy::Human(s) => ("human", s.variant_name()),
         }
     }
 }
@@ -118,6 +121,7 @@ pub fn step(agent: &mut AgentCommon, strat: &mut BotStrategy, ctx: &StepCtx) -> 
         BotStrategy::Mev(s) => mev::step(agent, s, ctx),
         BotStrategy::WashTrading(s) => wash_trading::step(agent, s, ctx),
         BotStrategy::Noise(s) => noise::step(agent, s, ctx),
+        BotStrategy::Human(s) => human::step(agent, s, ctx),
     }
 }
 
@@ -136,6 +140,7 @@ pub fn primary_asset(strat: &BotStrategy) -> crate::types::AssetId {
         BotStrategy::Mev(s) => s.asset_id,
         BotStrategy::WashTrading(s) => s.asset_id,
         BotStrategy::Noise(s) => s.asset_id,
+        BotStrategy::Human(s) => s.asset_id,
     }
 }
 

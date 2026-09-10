@@ -36,12 +36,30 @@ pub struct AssetConfig {
     pub fundamental_vol: f64,
     #[serde(default = "default_fundamental_theta")]
     pub fundamental_theta: f64,
+    /// Same Ornstein-Uhlenbeck shape as the fundamental-value process, but modeling
+    /// something psychologically different: collective market *mood* (bullish <-> 0
+    /// <-> bearish, normalized to roughly [-1, 1]), not the asset's true value.
+    /// `human`/`sentiment_herder` bots read this instead of (or alongside) price
+    /// trend. Independent of fundamental_value -- its own random draw, mean-reverts
+    /// to neutral (0) rather than to any price level, and its vol/theta are
+    /// deliberately named/defaulted differently since mood realistically swings more
+    /// and persists longer than a well-anchored fundamental value would.
+    #[serde(default = "default_sentiment_vol")]
+    pub sentiment_vol: f64,
+    #[serde(default = "default_sentiment_theta")]
+    pub sentiment_theta: f64,
 }
 fn default_fundamental_vol() -> f64 {
     0.02
 }
 fn default_fundamental_theta() -> f64 {
     0.1
+}
+fn default_sentiment_vol() -> f64 {
+    0.4
+}
+fn default_sentiment_theta() -> f64 {
+    0.05
 }
 
 #[derive(Debug, Clone, Deserialize)]

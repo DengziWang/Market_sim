@@ -40,7 +40,7 @@ SCENARIOS = {
 }
 BOT_TYPES = [
     "market_maker", "arbitrage", "momentum", "mean_reversion", "grid", "dca",
-    "liquidation_trader", "mev", "wash_trading", "noise",
+    "liquidation_trader", "mev", "wash_trading", "noise", "human",
 ]
 VARIANTS_BY_TYPE = {
     "market_maker": ["avellaneda_stoikov", "fixed_offset", "inventory_skew", "adaptive_spread"],
@@ -53,6 +53,10 @@ VARIANTS_BY_TYPE = {
     "mev": ["sandwich", "frontrun", "backrun"],
     "wash_trading": ["self_ring", "volume_ranking"],
     "noise": ["zero_intelligence", "herding"],
+    # Not spec-mandated -- behavioral-finance-motivated bots (disposition effect,
+    # FOMO/panic, "hot hand" sizing, irregular attention, round-number bias) rather
+    # than a rational/mechanical strategy. See sim_core/src/bots/human.rs.
+    "human": ["disposition_chaser", "sentiment_herder"],
 }
 
 RUNS_ROOT = os.path.join(REPO_ROOT, "runs")

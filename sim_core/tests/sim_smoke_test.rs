@@ -238,6 +238,16 @@ leveraged_fraction = 0.2
 leverage_range = [2.0, 5.0]
 [population.groups.params]
 wake_interval_secs = 1.0
+
+[[population.groups]]
+bot_type = "human"
+variant = "disposition_chaser"
+count = 6
+
+[[population.groups]]
+bot_type = "human"
+variant = "sentiment_herder"
+count = 6
 "#;
 
 #[test]
@@ -330,4 +340,61 @@ wake_interval_secs = 0.5
     let result = sim.run_cancellable(None);
     assert!(!result.cancelled);
     assert!((result.actual_session_seconds - 20.0).abs() < 1e-6);
+}
+
+#[test]
+fn human_bots_trade_never_short_and_stay_solvent() {
+    let cfg = r#"
+[run]
+seed = 11
+session_seconds = 1200.0
+
+[[assets]]
+symbol = "A"
+tick_size = 0.01
+initial_price = 200.0
+fundamental_vol = 0.02
+fundamental_theta = 0.1
+sentiment_vol = 0.4
+sentiment_theta = 0.05
+
+[export]
+out_dir = "/tmp/does_not_matter"
+
+[[population.groups]]
+bot_type = "market_maker"
+variant = "fixed_offset"
+count = 3
+[population.groups.params]
+wake_interval_secs = 0.3
+
+[[population.groups]]
+bot_type = "human"
+variant = "disposition_chaser"
+count = 15
+initial_cash_range = [1000.0, 8000.0]
+
+[[population.groups]]
+bot_type = "human"
+variant = "sentiment_herder"
+count = 15
+initial_cash_range = [1000.0, 8000.0]
+"#;
+    let parsed = ScenarioConfig::from_toml_str(cfg).expect("config must parse");
+    let sim = Simulation::build(parsed).expect("population must build");
+    let result = sim.run();
+
+    assert!(!result.trades.is_empty(), "human bots (plus MM liquidity) must produce some trades");
+    for t in &result.trades {
+        assert!(t.price.is_finite() && t.price > 0.0);
+        assert!(t.qty.is_finite() && t.qty > 0.0);
+    }
+
+    let human_states: Vec<_> = result.agent_states.iter().filter(|a| a.bot_type == "human").collect();
+    assert_eq!(human_states.len(), 30, "every human agent must appear in the final state export");
+    for a in human_states {
+        assert!(a.inventory >= -1e-6, "human bots must never hold a short (negative) position: agent {} has {}", a.agent_id, a.inventory);
+        assert!(a.cash.is_finite() && a.equity.is_finite());
+        assert!(!a.bankrupt || a.equity <= 0.0, "a bankrupt flag should correspond to non-positive equity");
+    }
 }
