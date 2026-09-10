@@ -580,6 +580,31 @@ def _render_results_tab():
         metrics_df = pd.DataFrame(sorted(st.session_state.metrics.items()), columns=["metric", "value"])
         st.dataframe(metrics_df, width="stretch", height=300)
 
+    st.subheader("Human involvement by asset")
+    if trades.empty:
+        st.caption("No trades to break down.")
+    else:
+        # Vectorized (column-wise boolean ops + groupby), not a per-row loop -- same
+        # reasoning as the trade-search free-text fix: stays fast at hundreds of
+        # thousands of trades.
+        maker_human = trades["maker_type"] == "human"
+        taker_human = trades["taker_type"] == "human"
+        breakdown = pd.DataFrame(
+            {
+                "asset_id": trades["asset_id"],
+                "fully_human": maker_human & taker_human,
+                "partially_human": maker_human ^ taker_human,
+                "no_human": ~maker_human & ~taker_human,
+            }
+        )
+        by_asset = breakdown.groupby("asset_id").sum()
+        by_asset["total_trades"] = by_asset[["fully_human", "partially_human", "no_human"]].sum(axis=1)
+        by_asset["human_involved_pct"] = (100 * (by_asset["fully_human"] + by_asset["partially_human"]) / by_asset["total_trades"]).round(2)
+        by_asset = by_asset.rename(index=asset_names).rename_axis("asset")
+        by_asset = by_asset[["total_trades", "fully_human", "partially_human", "no_human", "human_involved_pct"]]
+        st.caption("`fully_human`: both sides of the trade were human bots. `partially_human`: exactly one side was. `human_involved_pct`: share of that asset's trades touching a human bot at all.")
+        st.dataframe(by_asset, width="stretch")
+
     st.subheader("Trade search")
     if trades.empty:
         st.caption("No trades to search.")

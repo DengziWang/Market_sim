@@ -347,7 +347,11 @@ fn human_bots_trade_never_short_and_stay_solvent() {
     let cfg = r#"
 [run]
 seed = 11
-session_seconds = 1200.0
+# Human bots now check in every ~3-40 min (avg ~22 min) and only act on ~35% of
+# qualifying check-ins by design (see human.rs) -- much longer than the engine's
+# other bot types, so this needs a longer session than most tests to reliably
+# produce trades rather than being flaky.
+session_seconds = 10800.0
 
 [[assets]]
 symbol = "A"

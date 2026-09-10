@@ -60,6 +60,7 @@ pub struct State {
     pub disposition_gain_eagerness: f64,
     pub pnl_sizing_sensitivity: f64,
     pub max_cash_frac_per_trade: f64,
+    pub p_act_given_signal: f64,
     pub last_price: Option<f64>,
     pub last_wake_time: Option<SimTime>,
     pub last_seen_inventory: f64,
@@ -82,9 +83,15 @@ impl State {
         Self {
             variant,
             asset_id,
-            background_wake_min: params::get_f64(p, "background_wake_min_secs", 60.0),
-            background_wake_max: params::get_f64(p, "background_wake_max_secs", 900.0),
-            alert_wake_interval: params::get_f64(p, "alert_wake_interval_secs", 20.0),
+            // Real people don't watch a chart continuously -- most check in a few
+            // times an hour at most, and even less on a quiet asset. 3-40 min
+            // (average ~22 min) between voluntary check-ins, vs. the earlier
+            // 1-15 min default.
+            background_wake_min: params::get_f64(p, "background_wake_min_secs", 180.0),
+            background_wake_max: params::get_f64(p, "background_wake_max_secs", 2400.0),
+            // And even having noticed something (an alert wake), "check back again
+            // in a couple of minutes" is more human than refreshing every 20s.
+            alert_wake_interval: params::get_f64(p, "alert_wake_interval_secs", 120.0),
             // Default threshold means "a return since last check" for
             // disposition_chaser (a fraction) but "a mood reading" for
             // sentiment_herder (already normalized to [-1,1]) -- from_params picks
@@ -109,6 +116,11 @@ impl State {
             // one agent's single order can contribute to a cascade, regardless of how
             // extreme the computed intensity is.
             max_cash_frac_per_trade: params::get_f64(p, "max_cash_frac_per_trade", 0.15),
+            // Status-quo bias / inertia: even noticing a signal worth reacting to
+            // (intensity > 0), a real person often just... doesn't act on it. Without
+            // this, every single qualifying wake traded, which is a lot more active
+            // than an actual retail investor -- most check-ins end in "nah, I'll hold".
+            p_act_given_signal: params::get_f64(p, "p_act_given_signal", 0.35),
             last_price: None,
             last_wake_time: None,
             last_seen_inventory: 0.0,
@@ -211,8 +223,11 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     // signal) was enough to overwhelm book depth on thinner assets in testing --
     // see git history.
     let intensity = excess.powf(s.fomo_exponent).min(1.2);
+    // Inertia: noticing a signal doesn't mean acting on it -- rolled once per wake,
+    // not per potential trade, so it's a real "decided not to today", not a size cut.
+    let acts_this_time = intensity > 0.0 && agent.rng.gen_bool(s.p_act_given_signal);
 
-    if intensity > 0.0 {
+    if acts_this_time {
         let side = if raw_signal > 0.0 { Side::Buy } else { Side::Sell };
         // "Hot hand": bigger bets after recent wins, smaller/timider after losses.
         let pnl_size_mult = (1.0 + s.pnl_sizing_sensitivity * s.recent_pnl_frac).clamp(0.2, 2.5);

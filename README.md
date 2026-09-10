@@ -229,6 +229,19 @@ signal can otherwise overwhelm book depth on thin assets -- tune `fomo_exponent`
 `max_cash_frac_per_trade` up if you deliberately want more extreme herding/bubble
 dynamics to study.
 
+Trades noticeably less often than every other bot type by design: real retail
+traders don't watch a chart continuously. Check-ins are spaced 3-40 min apart on
+average (`background_wake_min_secs`/`background_wake_max_secs`) rather than the
+seconds-to-low-minutes every mechanical bot uses, and even a qualifying signal only
+triggers an actual trade `p_act_given_signal` of the time (default 0.35) -- noticing
+something isn't the same as acting on it. In practice this comes out to roughly one
+trade per human agent per half-hour session; tune both up if you want a more active
+population.
+
+The dashboard's Results tab has a **"Human involvement by asset"** table breaking
+down, per asset, how many trades had a human bot on *both* sides
+(`fully_human`), on *exactly one* side (`partially_human`), or on neither.
+
 ## Performance
 
 Measured with `scripts/benchmark.py --release` on the machine this was built on --
