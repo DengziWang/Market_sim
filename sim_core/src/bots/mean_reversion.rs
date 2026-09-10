@@ -35,13 +35,16 @@ impl State {
         }
     }
 
-    pub fn from_params(variant: Variant, asset_id: AssetId, p: &toml::Value) -> Self {
+    /// `initial_price`: see momentum.rs's from_params doc comment -- converts a
+    /// dollar-notional default position size into asset units per-asset.
+    pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value) -> Self {
         let window_n = params::get_u32(p, "window", 20) as usize;
+        let order_qty = params::get_f64(p, "order_notional", 3000.0) / initial_price.max(1e-9);
         Self {
             variant,
             asset_id,
             wake_interval: params::get_f64(p, "wake_interval_secs", 3.0),
-            order_qty: params::get_f64(p, "order_qty", 0.05),
+            order_qty,
             allow_short: params::get_bool(p, "allow_short", true),
             window: RollingWindow::new(window_n),
             num_std: params::get_f64(p, "num_std", 2.0),

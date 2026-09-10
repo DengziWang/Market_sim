@@ -52,7 +52,7 @@ impl Market {
         let mut fundamental_value = HashMap::new();
         for (vid, _venue) in venues.iter().enumerate() {
             for (aid, asset) in assets.iter().enumerate() {
-                books.insert((vid as VenueId, aid as AssetId), OrderBook::new(aid as AssetId, asset.tick_size));
+                books.insert((vid as VenueId, aid as AssetId), OrderBook::new(aid as AssetId, asset.tick_size, cfg.max_price_move_frac));
             }
         }
         for (aid, asset) in assets.iter().enumerate() {
@@ -129,10 +129,24 @@ impl Market {
         let id = self.alloc_order_id();
         let tick_size = self.assets[asset_id as usize].tick_size;
         let mut price_ticks: Option<PriceTicks> = price.map(|p| (p / tick_size).round() as PriceTicks);
-        // Last-line-of-defense sanity guard: no strategy bug (bad vol estimate, stale
-        // reference price, etc.) should ever be able to push a non-positive or
-        // non-finite price onto the book. Reject rather than let it corrupt the book.
+        // Last-line-of-defense sanity guards: no strategy bug (bad vol estimate, stale
+        // reference price, dimensional/units mistake, etc.) should ever be able to
+        // push a non-positive, non-finite, or wildly-off-market price onto the book.
+        // Reject rather than let it corrupt the book -- this matters even beyond the
+        // matching-time circuit breaker (`OrderBook::max_price_move_frac`), which only
+        // guards *crossing* trades: a bad price that doesn't cross anything just rests
+        // quietly and becomes the new best bid/ask, corrupting the reference every
+        // subsequent order (including well-behaved ones) sees. The band is checked
+        // against the latent fundamental value, not the traded mid price, specifically
+        // because it's a ground-truth process immune to being corrupted by trading
+        // activity itself (unlike mid price, which a bad order could already be in the
+        // middle of throwing off).
         let invalid_price = matches!(order_type, OrderType::Limit) && price_ticks.map_or(true, |t| t <= 0);
+        let far_from_fundamental = matches!(order_type, OrderType::Limit)
+            && price.map_or(false, |p| {
+                self.fundamental_value.get(&asset_id).map_or(false, |&fv| fv > 0.0 && (p < fv * 0.02 || p > fv * 50.0))
+            });
+        let invalid_price = invalid_price || far_from_fundamental;
         let invalid_qty = !qty.is_finite() || qty <= 0.0;
         if invalid_price || invalid_qty {
             price_ticks = price_ticks.filter(|t| *t > 0);

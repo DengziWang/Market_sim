@@ -55,16 +55,24 @@ impl State {
         }
     }
 
-    pub fn from_params(variant: Variant, asset_id: AssetId, p: &toml::Value) -> Self {
+    /// `initial_price`: converts the dollar-notional `order_notional` param into
+    /// asset units, so a single default position size means comparable *dollar*
+    /// exposure across assets of very different price scales -- see
+    /// market_maker.rs's from_params doc comment for why a fixed unit-quantity
+    /// default doesn't (same issue, this bot type just doesn't provide resting
+    /// liquidity so it didn't show up as a price-stability bug -- it still skewed
+    /// reported per-asset volume by orders of magnitude).
+    pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value) -> Self {
         let short_p = params::get_f64(p, "ema_short_period", 5.0);
         let long_p = params::get_f64(p, "ema_long_period", 20.0);
         let donchian_n = params::get_u32(p, "donchian_window", 20) as usize;
         let rsi_n = params::get_u32(p, "rsi_window", 14) as usize;
+        let order_qty = params::get_f64(p, "order_notional", 3000.0) / initial_price.max(1e-9);
         Self {
             variant,
             asset_id,
             wake_interval: params::get_f64(p, "wake_interval_secs", 5.0),
-            order_qty: params::get_f64(p, "order_qty", 0.05),
+            order_qty,
             allow_short: params::get_bool(p, "allow_short", true),
             alpha_short: 2.0 / (short_p + 1.0),
             alpha_long: 2.0 / (long_p + 1.0),

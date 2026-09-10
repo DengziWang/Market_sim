@@ -271,6 +271,24 @@ Documented in more detail at each site in the code; the significant ones:
 - **Kyle's Lambda / order-flow-imbalance / VPIN** use the trade table's `taker_side`
   directly (this simulation actually knows it); `Amihud` and `variance_ratio` use a
   fixed time-bucket/resample rather than a tick-imbalance clock.
+- **Order sizing is dollar-notional, not unit-based**, for every bot type (`order_notional`
+  params, converted to units per-asset at population-build time; DCA and liquidation
+  traders already sized this way naturally). Without this, the *same* configured
+  size meant $3,000 of BTC and $0.0075 of DOGE -- comparable trade counts across
+  assets but wildly skewed reported volume, and for market-makers specifically, thin
+  enough resting depth on cheap assets to destabilize price. See git history
+  (2026-09-10) for the debugging trail, which also found and fixed a real dimensional
+  bug in the Avellaneda-Stoikov market-maker (mixing a fractional log-return
+  volatility with an absolute-price spread term) and an unstable arbitrage sizing
+  formula (dividing a dollar target by a live, potentially-crashing price).
+- **Matching-time circuit breaker** (`market.max_price_move_frac`, default 15%): a
+  single order's matching won't cross more than that fraction away from the best
+  opposing price it started against, and a resting limit order more than 50x (or
+  under 2%) of the latent fundamental value is rejected outright -- real exchanges
+  have an equivalent (price bands / fat-finger protection). Without either of these,
+  one bot's bug (or, legitimately, a large order hitting a thin book) could move a
+  printed price by orders of magnitude in a single fill. `max_price_move_frac` is
+  itself a research variable -- set it very large to study an unprotected market.
 
 ## Tests
 

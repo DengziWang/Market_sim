@@ -573,15 +573,26 @@ fn build_population(cfg: &ScenarioConfig) -> Result<(Vec<AgentCommon>, Vec<BotSt
 
             let strat = match group.bot_type.as_str() {
                 "market_maker" => BotStrategy::MarketMaker(market_maker::State::from_params(parse_mm_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
-                "arbitrage" => BotStrategy::Arbitrage(arbitrage::State::from_params(parse_arb_variant(&group.variant)?, asset_a, asset_b, asset_c, PRIMARY_VENUE, venue_b, &params)),
-                "momentum" => BotStrategy::Momentum(momentum::State::from_params(parse_momentum_variant(&group.variant)?, asset_a, &params)),
-                "mean_reversion" => BotStrategy::MeanReversion(mean_reversion::State::from_params(parse_mr_variant(&group.variant)?, asset_a, &params)),
+                "arbitrage" => BotStrategy::Arbitrage(arbitrage::State::from_params(
+                    parse_arb_variant(&group.variant)?,
+                    asset_a,
+                    asset_b,
+                    asset_c,
+                    PRIMARY_VENUE,
+                    venue_b,
+                    cfg.assets[asset_a as usize].initial_price,
+                    cfg.assets[asset_b as usize].initial_price,
+                    cfg.assets[asset_c as usize].initial_price,
+                    &params,
+                )),
+                "momentum" => BotStrategy::Momentum(momentum::State::from_params(parse_momentum_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
+                "mean_reversion" => BotStrategy::MeanReversion(mean_reversion::State::from_params(parse_mr_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
                 "grid" => BotStrategy::Grid(grid::State::from_params(parse_grid_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
                 "dca" => BotStrategy::Dca(dca::State::from_params(parse_dca_variant(&group.variant)?, asset_a, &params)),
                 "liquidation_trader" => {
                     BotStrategy::LiquidationTrader(liquidation_trader::State::from_params(parse_liq_variant(&group.variant)?, asset_a, cfg.liquidation.maintenance_margin_buffer, &params))
                 }
-                "mev" => BotStrategy::Mev(mev::State::from_params(parse_mev_variant(&group.variant)?, asset_a, &params)),
+                "mev" => BotStrategy::Mev(mev::State::from_params(parse_mev_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
                 "wash_trading" => BotStrategy::WashTrading(wash_trading::State::from_params(
                     parse_wash_variant(&group.variant)?,
                     asset_a,
@@ -589,7 +600,7 @@ fn build_population(cfg: &ScenarioConfig) -> Result<(Vec<AgentCommon>, Vec<BotSt
                     cfg.assets[asset_a as usize].initial_price,
                     &params,
                 )),
-                "noise" => BotStrategy::Noise(noise::State::from_params(parse_noise_variant(&group.variant)?, asset_a, &params)),
+                "noise" => BotStrategy::Noise(noise::State::from_params(parse_noise_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
                 other => return Err(format!("unknown bot_type '{other}' in population config")),
             };
 

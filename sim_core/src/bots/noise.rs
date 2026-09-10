@@ -39,15 +39,24 @@ impl State {
         }
     }
 
-    pub fn from_params(variant: Variant, asset_id: AssetId, p: &toml::Value) -> Self {
+    /// `initial_price`: converts the dollar-notional `notional_range`/
+    /// `max_position_notional` params into asset units -- see market_maker.rs's
+    /// from_params doc comment. A fixed unit qty_range (e.g. 0.01-0.2) is trivial
+    /// pocket change on a cheap asset but a large stake on an expensive one; per-trade
+    /// notional is what a retail-sized trader's order actually scales with.
+    pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value) -> Self {
+        let price = initial_price.max(1e-9);
+        let notional_range = params::get_range(p, "notional_range", (50.0, 500.0));
+        let qty_range = (notional_range.0 / price, notional_range.1 / price);
+        let max_position = params::get_f64(p, "max_position_notional", 3000.0) / price;
         Self {
             variant,
             asset_id,
             wake_interval: params::get_f64(p, "wake_interval_secs", 8.0),
             price_band_frac: params::get_f64(p, "price_band_frac", 0.01),
-            qty_range: params::get_range(p, "qty_range", (0.01, 0.2)),
+            qty_range,
             herd_strength: params::get_f64(p, "herd_strength", 0.7),
-            max_position: params::get_f64(p, "max_position", 20.0),
+            max_position,
             recent_prices: RollingWindow::new(5),
         }
     }

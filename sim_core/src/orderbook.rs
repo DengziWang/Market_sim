@@ -22,6 +22,8 @@ pub struct OrderBook {
     pub bids: BTreeMap<PriceTicks, VecDeque<OrderId>>,
     pub asks: BTreeMap<PriceTicks, VecDeque<OrderId>>,
     pub orders: HashMap<OrderId, Order>,
+    /// See `MarketConfig::max_price_move_frac`.
+    pub max_price_move_frac: f64,
     next_seq: u64,
 }
 
@@ -31,13 +33,14 @@ pub struct SubmitResult {
 }
 
 impl OrderBook {
-    pub fn new(asset_id: AssetId, tick_size: f64) -> Self {
+    pub fn new(asset_id: AssetId, tick_size: f64, max_price_move_frac: f64) -> Self {
         Self {
             asset_id,
             tick_size: TickSize(tick_size),
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             orders: HashMap::new(),
+            max_price_move_frac: max_price_move_frac.max(0.0),
             next_seq: 0,
         }
     }
@@ -171,6 +174,28 @@ impl OrderBook {
             Side::Buy => &self.asks,
             Side::Sell => &self.bids,
         };
+        // Must agree with submit()'s circuit-breaker band, or a FOK order's pre-check
+        // could see liquidity here that actual matching would then refuse to cross,
+        // breaking FOK's all-or-nothing guarantee.
+        let reference_ticks = match side {
+            Side::Buy => self.best_ask_ticks(),
+            Side::Sell => self.best_bid_ticks(),
+        };
+        let limit_ticks = match reference_ticks {
+            Some(reference) => {
+                let ref_f = reference as f64;
+                let band_limit = match side {
+                    Side::Buy => (ref_f * (1.0 + self.max_price_move_frac)).floor() as PriceTicks,
+                    Side::Sell => (ref_f * (1.0 - self.max_price_move_frac)).ceil() as PriceTicks,
+                };
+                Some(match (limit_ticks, side) {
+                    (Some(l), Side::Buy) => l.min(band_limit),
+                    (Some(l), Side::Sell) => l.max(band_limit),
+                    (None, _) => band_limit,
+                })
+            }
+            None => limit_ticks,
+        };
         let mut total = 0.0;
         match side {
             Side::Buy => {
@@ -259,6 +284,14 @@ impl OrderBook {
         }
 
         let opposite_side = order.side.opposite();
+        // Circuit breaker reference: the best opposing price this order started
+        // matching against (not the book's best at each step of its own sweep, which
+        // would let the band "walk" outward with the order itself and defeat the
+        // point). See `MarketConfig::max_price_move_frac`.
+        let reference_ticks: Option<PriceTicks> = match order.side {
+            Side::Buy => self.best_ask_ticks(),
+            Side::Sell => self.best_bid_ticks(),
+        };
 
         loop {
             if order.remaining() <= 1e-12 {
@@ -269,6 +302,21 @@ impl OrderBook {
                 Side::Sell => self.best_bid_ticks(),
             };
             let Some(opp_price) = best_opp else { break };
+
+            if let Some(reference) = reference_ticks {
+                let ref_f = reference as f64;
+                let too_far = match order.side {
+                    Side::Buy => (opp_price as f64) > ref_f * (1.0 + self.max_price_move_frac),
+                    Side::Sell => (opp_price as f64) < ref_f * (1.0 - self.max_price_move_frac),
+                };
+                if too_far {
+                    // No further liquidity within the allowed band -- stop here, same
+                    // as if the book were empty from this point on. The remainder is
+                    // handled by the normal post-match TIF logic below (discarded for
+                    // IOC/market, rests for GTC).
+                    break;
+                }
+            }
 
             let marketable = match order.order_type {
                 OrderType::Market => true,

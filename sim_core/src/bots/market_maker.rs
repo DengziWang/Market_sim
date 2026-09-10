@@ -111,9 +111,30 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             // Rolling-horizon approximation of Avellaneda-Stoikov (2008): the terminal
             // horizon T-t is replaced by a fixed rolling horizon, standard practice for
             // an always-on (non-terminating) market.
-            let reservation = mid - inventory * s.gamma * sigma.powi(2) * s.horizon_secs;
-            let spread = s.gamma * sigma.powi(2) * s.horizon_secs + (2.0 / s.gamma) * (1.0 + s.gamma / s.k).ln();
-            (reservation, (spread / 2.0).max(mid * 1e-5))
+            //
+            // Dimensional fix: the textbook formula's sigma is an *absolute* price
+            // volatility (dS, dollars/sqrt(time)), and its inventory term uses q in
+            // raw units against that same absolute scale. `sigma` here is a fractional
+            // (log-return) volatility instead, and inventory is in raw asset units
+            // whose *scale* (via max_inventory, itself now dollar-notional-derived --
+            // see from_params) varies enormously by asset price. Naively mixing these
+            // treats a price-scale-independent quantity as if it were already in price
+            // units, adding e.g. a fixed ~1.3 absolute-price spread term regardless of
+            // whether the asset is worth $60,000 or $0.15 -- negligible for the former,
+            // many times the entire price for the latter (this produced actual
+            // sub-half-price/over-double-price quotes in testing; see git history).
+            // Fixed by working entirely in *fractional* terms (inventory normalized by
+            // max_inventory, to [-1, 1]-ish) and converting to a price only once, at
+            // the end, by multiplying by mid.
+            let inventory_norm = inventory / s.max_inventory.max(1e-9);
+            let reservation = mid * (1.0 - inventory_norm * s.gamma * sigma.powi(2) * s.horizon_secs);
+            // The order-arrival-intensity term (2/gamma)*ln(1+gamma/k) is dimensionless
+            // by construction (a pure function of gamma/k), not a price or even a
+            // fraction of one -- rescaled so the module's own defaults land in the same
+            // ballpark as fixed_offset's default 0.0008 base half-spread fraction.
+            const K_TERM_SCALE: f64 = 800.0;
+            let spread_frac = s.gamma * sigma.powi(2) * s.horizon_secs + (2.0 / s.gamma) * (1.0 + s.gamma / s.k).ln() / K_TERM_SCALE;
+            (reservation, (spread_frac * mid / 2.0).max(mid * 1e-5))
         }
         Variant::FixedOffset => (mid, mid * s.base_half_spread_frac),
         Variant::InventorySkew => {
@@ -139,8 +160,12 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     // Defensive clamps: an extreme (e.g. early-session, thin-sample) volatility or
     // toxicity estimate must never be able to produce a non-positive or absurdly wide
     // quote. Without this, adaptive_spread in particular could occasionally emit a
-    // negative bid price.
-    let half_spread = half_spread.max(mid * 1e-6).min(mid * 0.5);
+    // negative bid price. 10% half-spread (20% total) is already a very wide, stressed
+    // quote for any real market maker -- a tighter belt-and-braces bound than the
+    // 50% this used before the Avellaneda-Stoikov dimensional fix above, which was
+    // wide enough to let a formula bug still produce a barely-clamped, badly wrong
+    // quote rather than actually catching it.
+    let half_spread = half_spread.max(mid * 1e-6).min(mid * 0.1);
     let bid_price = (reservation - half_spread).max(mid * 1e-4);
     let ask_price = (reservation + half_spread).max(mid * 1e-4);
 

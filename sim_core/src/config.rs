@@ -64,6 +64,18 @@ pub struct MarketConfig {
     pub snapshot_depth_levels: usize,
     #[serde(default = "default_mark_halflife")]
     pub mark_price_ema_halflife_secs: f64,
+    /// Circuit breaker: the largest fraction a single order's matching is allowed to
+    /// move price away from the best opposing price it started against. Once matching
+    /// would cross that band, the order stops taking further liquidity there (an IOC/
+    /// market order's unfilled remainder is discarded as usual; a limit order's
+    /// remainder rests per its TIF) rather than sweeping arbitrarily deep into a thin
+    /// book. Real exchanges have an equivalent (price bands / fat-finger protection);
+    /// without one here, a single large order hitting a thinly-quoted asset could
+    /// move its printed price by 10-1000x in one fill regardless of how reasonably
+    /// any individual bot's order size was chosen. Set very large (e.g. 1e9) to
+    /// effectively disable this as its own research variable.
+    #[serde(default = "default_max_price_move_frac")]
+    pub max_price_move_frac: f64,
 }
 fn default_snapshot_interval() -> f64 {
     1.0
@@ -74,12 +86,16 @@ fn default_snapshot_depth() -> usize {
 fn default_mark_halflife() -> f64 {
     30.0
 }
+fn default_max_price_move_frac() -> f64 {
+    0.15
+}
 impl Default for MarketConfig {
     fn default() -> Self {
         Self {
             snapshot_interval_secs: default_snapshot_interval(),
             snapshot_depth_levels: default_snapshot_depth(),
             mark_price_ema_halflife_secs: default_mark_halflife(),
+            max_price_move_frac: default_max_price_move_frac(),
         }
     }
 }

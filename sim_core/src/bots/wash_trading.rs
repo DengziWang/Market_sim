@@ -53,7 +53,11 @@ impl State {
         let wake_interval = params::get_f64(p, "wake_interval_secs", 2.0);
         let target_session_volume = params::get_f64(p, "target_session_volume", 5000.0);
         let planned_wakes = (session_end / wake_interval.max(1e-6)).max(1.0);
-        let qty_round = params::get_f64(p, "qty_round", 1.0);
+        // qty_round (self_ring's own per-round-trip size, and the base the
+        // volume_ranking cap below scales from) is also dollar-notional now, for the
+        // same reason as every other bot type's sizing -- a fixed unit count is wildly
+        // inconsistent in dollar terms across assets of different price scales.
+        let qty_round = params::get_f64(p, "notional_round", 200.0) / initial_price.max(1e-9);
         // A dollar target applied blindly to a cheap asset implies an enormous *unit*
         // quantity (e.g. $200k / $0.15 DOGE = ~1.3M units) -- wildly disproportionate
         // to realistic resting liquidity (market-maker quotes are ~0.05-0.6 units in

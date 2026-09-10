@@ -50,12 +50,18 @@ impl State {
         }
     }
 
-    pub fn from_params(variant: Variant, asset_id: AssetId, p: &toml::Value) -> Self {
+    /// `initial_price`: converts the dollar-notional `min_victim_notional` param
+    /// into asset units -- see market_maker.rs's from_params doc comment. A fixed
+    /// unit threshold is trivially satisfied by any order on a cheap asset (and
+    /// unreasonably strict on an expensive one), independent of whether that order
+    /// is actually "large" in the dollar-value sense that makes it worth attacking.
+    pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value) -> Self {
+        let min_victim_qty = params::get_f64(p, "min_victim_notional", 20_000.0) / initial_price.max(1e-9);
         Self {
             variant,
             asset_id,
             wake_interval: params::get_f64(p, "wake_interval_secs", 0.05),
-            min_victim_qty: params::get_f64(p, "min_victim_qty", 1.0),
+            min_victim_qty,
             size_frac_of_victim: params::get_f64(p, "size_frac_of_victim", 0.5),
             frontrun_hold_secs: params::get_f64(p, "frontrun_hold_secs", 2.0),
             pending_sandwich: None,
