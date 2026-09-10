@@ -218,6 +218,54 @@ A couple of things worth knowing:
   simulation" already auto-saves, and that saved run's checkpoint can be continued
   the same way as any other.
 
+### Splitting a long run into legs
+
+For a run long/large enough that holding its full history in memory at once is the
+problem (see "Memory: the actual scaling limit" above), `market_sim.run_scenario_in_legs`
+runs a scenario as several shorter sessions instead of one huge one, saving each to
+its own directory as it finishes and discarding it from memory before starting the
+next -- built on checkpoint/resume above, not a new engine capability.
+
+```python
+import market_sim as ms
+
+cfg = ms.config.load_config_dict("scenarios/realistic_mix.toml")
+legs = ms.run_scenario_in_legs(cfg, leg_seconds=1800.0, n_legs=12, out_dir="runs/realistic_mix_legs")
+# -> runs/realistic_mix_legs/leg_0001/, leg_0002/, ..., leg_0012/, each a normal
+#    export_run() directory (trades.parquet, ..., checkpoint.bin)
+
+combined = ms.load_run_legs("runs/realistic_mix_legs")   # full history, for analysis
+legs = ms.discover_legs("runs/realistic_mix_legs")        # just the directory list
+```
+
+Or from the command line: `python scripts/run_in_legs.py scenarios/realistic_mix.toml --leg-seconds 1800 --n-legs 12 --out-dir runs/realistic_mix_legs`.
+
+Measured (see project memory): across 8 legs of a real scenario, peak process memory
+stayed flat (~200MB) rather than growing with leg count -- each leg's large result is
+exported and dropped (Python reference-counting frees it immediately) before the next
+one starts, so only ~one leg's data plus the small checkpoint (a few MB, bounded by
+population size, not session length) exists in memory at a time. `load_run_legs`
+loads everything back for analysis, same as loading any single large saved run would
+-- appropriate once you're ready to look at the combined result, not during the run.
+
+Only leg 1 runs `min_trades`/`max_session_seconds`-free at exactly `leg_seconds` --
+those two `[run]` fields are dropped from the input config if set (a warning is
+raised) since open-ended per-leg extension would defeat having a predictable,
+bounded-size chunk; add more legs instead if you need a trade-count floor across the
+whole sequence.
+
+**Bonus finding**: only leg 1 shows the cold-start burst every fresh simulation has
+(every agent's very first wake is jittered into the first simulated second, so
+essentially the whole population acts at once against a still-empty order book --
+measured on a real run: ~9-10x the steady-state trade rate in the first second, back
+to normal within ~5s). Legs 2+ are genuine continuations (checkpoint/resume, not
+independent restarts), so they pick up an already-warmed, already-trading market and
+don't reproduce it -- verified directly: a continued leg's first-second trade rate
+sits within its own normal range, no spike. If you're analyzing a `run_scenario_in_legs`
+sequence and want to exclude the cold start entirely, drop leg 1's data specifically
+(or start your analysis window a few seconds into it) rather than treating every leg
+the same way.
+
 ## Configuration format
 
 Everything is a TOML file matching `sim_core::config::ScenarioConfig` (see

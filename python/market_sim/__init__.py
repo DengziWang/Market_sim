@@ -13,7 +13,17 @@ from market_sim.sim_pyo3 import (
     run_simulation_from_file,
     validate_config,
 )
-from market_sim.runner import SimulationRun, run_scenario_file, run_scenario_dict, continue_run, simulate_and_plot
+from market_sim.runner import (
+    LegResult,
+    SimulationRun,
+    continue_run,
+    discover_legs,
+    load_run_legs,
+    run_scenario_dict,
+    run_scenario_file,
+    run_scenario_in_legs,
+    simulate_and_plot,
+)
 from market_sim.export import export_run, load_run, has_checkpoint, to_dataframes
 from market_sim.experiment import ExperimentPlan, ExperimentPoint, build_plan_from_compositions, build_stress_test_plan, run_experiment
 
@@ -30,6 +40,10 @@ __all__ = [
     "run_scenario_file",
     "run_scenario_dict",
     "continue_run",
+    "run_scenario_in_legs",
+    "LegResult",
+    "discover_legs",
+    "load_run_legs",
     "simulate_and_plot",
     "export_run",
     "load_run",
