@@ -72,4 +72,8 @@ pub struct SimResult {
     pub liquidation_events: u64,
     pub bankruptcies: u64,
     pub actual_session_seconds: SimTime,
+    /// True if the run was interrupted (see `Simulation::run_cancellable`) before it
+    /// reached its natural end -- every field above still reflects whatever was
+    /// produced up to that point, not a failed/empty run.
+    pub cancelled: bool,
 }

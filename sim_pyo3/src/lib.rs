@@ -87,6 +87,7 @@ fn result_to_pyobject(py: Python<'_>, result: SimResult, n_agents: u32) -> PyRes
     meta.set_item("n_agents", n_agents)?;
     meta.set_item("n_trades", result.trades.len())?;
     meta.set_item("n_order_events", result.order_events.len())?;
+    meta.set_item("cancelled", result.cancelled)?;
     out.set_item("meta", meta)?;
     Ok(out.into())
 }
@@ -101,6 +102,50 @@ fn run_simulation(py: Python<'_>, config_toml: &str) -> PyResult<PyObject> {
     let n_agents = cfg.total_agents();
     let sim = Simulation::build(cfg).map_err(PyValueError::new_err)?;
     let result = py.allow_threads(|| sim.run());
+    result_to_pyobject(py, result, n_agents)
+}
+
+/// A cancellation flag shared between Python threads (not tied to any one
+/// simulation run): create one, pass it to `run_simulation_cancellable` running in a
+/// background thread, and call `.cancel()` from the main thread at any time -- the
+/// run stops at its next periodic check point and still returns whatever it had
+/// produced so far (`meta["cancelled"]` is `True`), rather than raising or returning
+/// nothing. Checking `.is_cancelled()` does not require the run to have started or
+/// finished.
+#[pyclass]
+struct CancelToken {
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[pymethods]
+impl CancelToken {
+    #[new]
+    fn new() -> Self {
+        Self { flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)) }
+    }
+
+    fn cancel(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Same as `run_simulation`, but accepts a `CancelToken` and checks it periodically
+/// while running; if `.cancel()` is called (from another thread -- this function
+/// itself blocks the calling thread until the run stops one way or another, same as
+/// `run_simulation`) the run stops early and returns its partial result rather than
+/// running to completion. Intended to be called from a Python `threading.Thread` so
+/// the caller's own thread stays responsive; see `app/dashboard.py`.
+#[pyfunction]
+fn run_simulation_cancellable(py: Python<'_>, config_toml: &str, token: &CancelToken) -> PyResult<PyObject> {
+    let cfg = ScenarioConfig::from_toml_str(config_toml).map_err(|e| PyValueError::new_err(format!("config parse error: {e}")))?;
+    let n_agents = cfg.total_agents();
+    let sim = Simulation::build(cfg).map_err(PyValueError::new_err)?;
+    let flag = token.flag.clone();
+    let result = py.allow_threads(|| sim.run_cancellable(Some(flag)));
     result_to_pyobject(py, result, n_agents)
 }
 
@@ -123,6 +168,8 @@ fn validate_config(config_toml: &str) -> PyResult<(usize, usize, u32)> {
 fn sim_pyo3(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_simulation, m)?)?;
     m.add_function(wrap_pyfunction!(run_simulation_from_file, m)?)?;
+    m.add_function(wrap_pyfunction!(run_simulation_cancellable, m)?)?;
     m.add_function(wrap_pyfunction!(validate_config, m)?)?;
+    m.add_class::<CancelToken>()?;
     Ok(())
 }

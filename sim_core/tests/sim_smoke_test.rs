@@ -268,3 +268,66 @@ fn full_population_runs_to_completion_and_produces_trades() {
     let distinct_agents_in_states: std::collections::HashSet<_> = result.agent_states.iter().map(|a| a.agent_id).collect();
     assert_eq!(distinct_agents_in_states.len() as u32, n_agents, "every agent must appear in the final agent_state export");
 }
+
+#[test]
+fn cancellation_stops_early_and_still_returns_a_valid_partial_result() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let cfg = ScenarioConfig::from_toml_str(CONFIG).expect("config must parse");
+    let n_agents = cfg.total_agents();
+    let session_seconds = cfg.run.session_seconds;
+    let sim = Simulation::build(cfg).expect("population must build");
+
+    // Pre-set the flag so cancellation is deterministic (takes effect at the very
+    // first periodic check, well before the 120s+ session would naturally end) --
+    // not a race against a timer, so this can't be flaky.
+    let cancel = Arc::new(AtomicBool::new(true));
+    let result = sim.run_cancellable(Some(cancel));
+
+    assert!(result.cancelled, "SimResult::cancelled must be set");
+    assert!(
+        result.actual_session_seconds < session_seconds,
+        "a cancelled run must stop before its configured session length ({} < {})",
+        result.actual_session_seconds,
+        session_seconds
+    );
+    // finalize_agent_states() must still run on the early-exit path: every agent
+    // should be present even though the session was cut short.
+    let distinct_agents: std::collections::HashSet<_> = result.agent_states.iter().map(|a| a.agent_id).collect();
+    assert_eq!(distinct_agents.len() as u32, n_agents);
+    for a in &result.agent_states {
+        assert!(a.cash.is_finite() && a.equity.is_finite());
+    }
+}
+
+#[test]
+fn uncancelled_run_behaves_identically_via_run_and_run_cancellable() {
+    // run() is documented as equivalent to run_cancellable(None); a smaller/faster
+    // config than CONFIG keeps this test itself quick.
+    let small_cfg = r#"
+[run]
+seed = 7
+session_seconds = 20.0
+
+[[assets]]
+symbol = "A"
+tick_size = 0.01
+initial_price = 100.0
+
+[export]
+out_dir = "/tmp/does_not_matter"
+
+[[population.groups]]
+bot_type = "noise"
+variant = "zero_intelligence"
+count = 20
+[population.groups.params]
+wake_interval_secs = 0.5
+"#;
+    let cfg = ScenarioConfig::from_toml_str(small_cfg).unwrap();
+    let sim = Simulation::build(cfg).unwrap();
+    let result = sim.run_cancellable(None);
+    assert!(!result.cancelled);
+    assert!((result.actual_session_seconds - 20.0).abs() < 1e-6);
+}

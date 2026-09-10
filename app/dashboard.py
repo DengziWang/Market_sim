@@ -14,8 +14,11 @@ market_sim/market_health packages the Python API guide uses directly.
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
+import threading
+import time
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -23,8 +26,9 @@ import streamlit as st
 import toml
 from plotly.subplots import make_subplots
 
+from market_sim import CancelToken, run_simulation_cancellable
 from market_sim import config as cfgmod
-from market_sim import run_scenario_dict
+from market_sim.export import export_run, load_run
 import market_health
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -50,6 +54,8 @@ VARIANTS_BY_TYPE = {
     "noise": ["zero_intelligence", "herding"],
 }
 
+RUNS_ROOT = os.path.join(REPO_ROOT, "runs")
+
 st.set_page_config(page_title="Bot Market Sim", layout="wide")
 
 
@@ -57,12 +63,52 @@ def _default_cfg() -> dict:
     return cfgmod.load_config_dict(SCENARIOS["Realistic mix"])
 
 
+def _run_worker(config_toml: str, token: CancelToken, holder: dict) -> None:
+    """Runs on a background thread -- must never call any `st.*` function (Streamlit
+    widget calls are only valid on the main script-running thread); it only talks to
+    the Rust engine and writes to a plain dict the main thread polls."""
+    try:
+        holder["result"] = run_simulation_cancellable(config_toml, token)
+    except Exception as e:  # noqa: BLE001
+        holder["error"] = f"{type(e).__name__}: {e}"
+
+
+def _loaded_run_to_result(loaded: dict) -> dict:
+    """market_sim.load_run(...)'s DataFrame-keyed shape -> the same columnar
+    dict[str, list] shape run_simulation(...)/active_result use everywhere else, so
+    the Results tab renders a freshly-run, stopped-early, or reloaded-from-disk
+    result identically."""
+    return {
+        "trades": loaded["trades"].to_dict("list"),
+        "order_events": loaded["order_events"].to_dict("list"),
+        "snapshots": loaded["orderbook_snapshots"].to_dict("list"),
+        "agent_states": loaded["agent_state"].to_dict("list"),
+        "meta": loaded["meta"],
+    }
+
+
+def _discover_saved_runs() -> list:
+    return sorted(os.path.dirname(p) for p in glob.glob(os.path.join(RUNS_ROOT, "**", "run_metadata.json"), recursive=True))
+
+
+def _activate_result(result: dict, config_toml: str, source: str, save_path: str | None = None) -> None:
+    st.session_state.active_result = result
+    st.session_state.active_config_toml = config_toml
+    st.session_state.active_source = source
+    st.session_state.metrics = market_health.compute_run_metrics(result)
+    st.session_state.last_save_path = save_path
+
+
 if "cfg" not in st.session_state:
     st.session_state.cfg = _default_cfg()
-if "run" not in st.session_state:
-    st.session_state.run = None
-    st.session_state.metrics = None
-    st.session_state.run_error = None
+for _key, _default in [
+    ("active_result", None), ("active_config_toml", None), ("active_source", None),
+    ("metrics", None), ("last_save_path", None), ("run_error", None),
+    ("sim_thread", None), ("sim_token", None), ("sim_holder", None),
+    ("sim_config_toml", None), ("sim_start_time", None),
+]:
+    if _key not in st.session_state:
+        st.session_state[_key] = _default
 
 cfg = st.session_state.cfg
 cfg.setdefault("venues", [])
@@ -103,24 +149,83 @@ with st.sidebar:
     st.metric("Assets configured", n_assets)
 
     st.divider()
-    run_clicked = st.button("Run simulation", type="primary", width="stretch", key="run_sim_btn")
-    if run_clicked:
-        st.session_state.run_error = None
-        try:
-            with st.spinner("Running simulation..."):
-                run = run_scenario_dict(st.session_state.cfg)
-                st.session_state.run = run
-                with st.spinner("Computing market-health metrics..."):
-                    st.session_state.metrics = market_health.compute_run_metrics(run.result)
-        except Exception as e:  # noqa: BLE001
-            st.session_state.run_error = f"{type(e).__name__}: {e}"
-            st.session_state.run = None
+    sim_running = st.session_state.sim_thread is not None
+
+    if not sim_running:
+        if st.button("Run simulation", type="primary", width="stretch", key="run_sim_btn"):
+            st.session_state.run_error = None
+            config_toml = cfgmod.dump_config_str(st.session_state.cfg)
+            token = CancelToken()
+            holder = {"result": None, "error": None}
+            thread = threading.Thread(target=_run_worker, args=(config_toml, token, holder), daemon=True)
+            st.session_state.sim_token = token
+            st.session_state.sim_holder = holder
+            st.session_state.sim_config_toml = config_toml
+            st.session_state.sim_start_time = time.time()
+            st.session_state.sim_thread = thread
+            thread.start()
+            st.rerun()
+
+    @st.fragment(run_every=1)
+    def _poll_sim_status():
+        thread = st.session_state.sim_thread
+        if thread is None:
+            return
+        if thread.is_alive():
+            elapsed = time.time() - st.session_state.sim_start_time
+            stopping = st.session_state.sim_token.is_cancelled()
+            st.info(f"⏳ {'Stopping...' if stopping else 'Running...'} ({elapsed:.1f}s elapsed)")
+            if not stopping:
+                if st.button("⏹ Stop simulation", width="stretch", key="stop_sim_btn"):
+                    st.session_state.sim_token.cancel()
+                    st.rerun(scope="fragment")
+            return
+
+        # Thread just finished (this is the first poll to notice) -- pull its result
+        # out and clear the running state; a full-app rerun below lets every other
+        # tab (esp. Results) pick up the newly active result.
+        holder = st.session_state.sim_holder
+        config_toml = st.session_state.sim_config_toml
+        st.session_state.sim_thread = None
+        st.session_state.sim_token = None
+        if holder.get("error"):
+            st.session_state.run_error = holder["error"]
+        else:
+            result = holder["result"]
+            if result["meta"]["cancelled"]:
+                # "add function to break current simulation (which is going to be
+                # saved)": a stopped run is auto-exported immediately, not just left
+                # in memory, since the whole point of stopping is usually that you
+                # don't trust it'll finish in reasonable time and still want what it
+                # produced.
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                save_dir = os.path.join(RUNS_ROOT, "dashboard_stopped", f"run_{ts}")
+                export_run(result, config_toml, save_dir, scenario_name="dashboard (stopped)", extra_meta={"stopped_via_dashboard": True})
+                _activate_result(result, config_toml, "Stopped early (auto-saved below)", save_path=save_dir)
+            else:
+                _activate_result(result, config_toml, "Fresh run", save_path=None)
         st.rerun()
 
-    if st.session_state.run is not None:
-        st.success(f"Last run: {st.session_state.run.meta['n_trades']:,} trades")
+    _poll_sim_status()
+
     if st.session_state.run_error:
         st.error(st.session_state.run_error)
+    if st.session_state.active_result is not None and not sim_running:
+        meta = st.session_state.active_result["meta"]
+        cancelled_note = " (stopped early)" if meta.get("cancelled") else ""
+        st.success(f"{st.session_state.active_source}: {meta['n_trades']:,} trades{cancelled_note}")
+
+    with st.expander("📂 Load a saved run"):
+        saved = _discover_saved_runs()
+        if not saved:
+            st.caption(f"No saved runs found under {os.path.relpath(RUNS_ROOT, REPO_ROOT)}/ yet.")
+        else:
+            pick = st.selectbox("Saved run", saved, format_func=lambda p: os.path.relpath(p, RUNS_ROOT), key="load_run_choice")
+            if st.button("Load", key="load_run_btn"):
+                loaded = load_run(pick)
+                result = _loaded_run_to_result(loaded)
+                _activate_result(result, loaded["meta"].get("config_toml", ""), f"Loaded from {os.path.relpath(pick, REPO_ROOT)}", save_path=pick)
+                st.rerun()
 
 tab_setup, tab_pop, tab_advanced, tab_results = st.tabs(["Run & Market Setup", "Bot Population", "Advanced (raw TOML)", "Results"])
 
@@ -321,11 +426,14 @@ with tab_advanced:
 # Tab: Results
 # ---------------------------------------------------------------------------------
 with tab_results:
-    run = st.session_state.run
-    if run is None:
-        st.info("Configure a scenario in the other tabs, then click **Run simulation** in the sidebar.")
+    result = st.session_state.active_result
+    if result is None:
+        st.info("Configure a scenario in the other tabs, then click **Run simulation** in the sidebar -- or load a previously saved run from the sidebar expander.")
     else:
-        meta = run.meta
+        meta = result["meta"]
+        st.caption(f"Source: {st.session_state.active_source}")
+        if meta.get("cancelled"):
+            st.warning(f"⚠️ This run was stopped early -- only {meta['actual_session_seconds']:,.0f}s of simulated time was reached before stopping.")
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Trades", f"{meta['n_trades']:,}")
         m2.metric("Order events", f"{meta['n_order_events']:,}")
@@ -333,9 +441,21 @@ with tab_results:
         m4.metric("Bankruptcies", f"{meta['bankruptcies']:,}")
         m5.metric("Simulated session", f"{meta['actual_session_seconds']:,.0f}s")
 
-        trades = pd.DataFrame(run.result["trades"])
-        snapshots = pd.DataFrame(run.result.get("snapshots", {}))
-        agent_state = pd.DataFrame(run.result.get("agent_states", {}))
+        st.subheader("Save this run")
+        s1, s2 = st.columns([3, 1])
+        default_name = f"dashboard_run_{time.strftime('%Y%m%d_%H%M%S')}"
+        save_name = s1.text_input("Save as (under runs/)", value=st.session_state.last_save_path or os.path.join("runs", default_name), key="save_run_path")
+        if s2.button("💾 Save", width="stretch", key="save_run_btn"):
+            out_dir = save_name if os.path.isabs(save_name) else os.path.join(REPO_ROOT, save_name)
+            export_run(result, st.session_state.active_config_toml or "", out_dir, scenario_name="dashboard")
+            st.session_state.last_save_path = out_dir
+            st.success(f"Saved to {os.path.relpath(out_dir, REPO_ROOT)}/ -- reload it later from the sidebar's \"Load a saved run\".")
+        if st.session_state.last_save_path:
+            st.caption(f"Last saved to: {os.path.relpath(st.session_state.last_save_path, REPO_ROOT)}/")
+
+        trades = pd.DataFrame(result["trades"])
+        snapshots = pd.DataFrame(result.get("snapshots", {}))
+        agent_state = pd.DataFrame(result.get("agent_states", {}))
         asset_names = {i: a.get("symbol", f"asset {i}") for i, a in enumerate(cfg.get("assets", []))}
 
         st.subheader("Price & volume (zoom: drag to select, double-click to reset, scroll to zoom)")

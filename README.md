@@ -154,6 +154,16 @@ packages above -- no separate backend, nothing leaves your machine. It gives you
 - The full `market_health` metric set for the run.
 - A searchable/filterable trade table (asset, bot type, agent id, time range, min
   quantity, free-text) with CSV export of the filtered rows.
+- **Run in the background + stop early**: clicking Run starts the simulation on a
+  background thread (the Rust engine supports cooperative cancellation --
+  `Simulation::run_cancellable`/PyO3 `CancelToken`) so the UI stays responsive; a
+  **Stop simulation** button appears while it's running. Stopping doesn't discard
+  anything -- the partial result is auto-exported to `runs/dashboard_stopped/` the
+  moment it stops, and immediately usable in the Results tab.
+- **Save / load runs**: the Results tab has a Save button (writes the spec-section-7
+  export set to a directory you name), and the sidebar's "Load a saved run" expander
+  reloads any previously exported run (from the dashboard, `run.export(...)`, or a
+  batch experiment) back into the Results tab without re-running anything.
 
 ```bash
 python3 -m pip install --user streamlit plotly   # once

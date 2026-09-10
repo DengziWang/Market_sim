@@ -69,7 +69,20 @@ impl Simulation {
         })
     }
 
-    pub fn run(mut self) -> SimResult {
+    /// Runs to completion (natural end-of-session, or `min_trades`-driven extension
+    /// up to `max_session_seconds`). Equivalent to `run_cancellable(None)`.
+    pub fn run(self) -> SimResult {
+        self.run_cancellable(None)
+    }
+
+    /// Same as `run`, but checks `cancel` periodically and stops early (returning
+    /// whatever was produced so far, with `SimResult::cancelled = true`) once it's
+    /// set. `cancel` is a plain `Arc<AtomicBool>` rather than anything PyO3-specific
+    /// so `sim_core` stays usable standalone -- the pyo3 layer's `CancelToken` is
+    /// just a thin wrapper around one, set from another thread (or another Python
+    /// thread, via `py.allow_threads` releasing the GIL for the duration of this
+    /// call) while this runs.
+    pub fn run_cancellable(mut self, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> SimResult {
         let seed = self.cfg.run.seed;
         self.market_rng = rng::market_rng(seed);
 
@@ -81,7 +94,23 @@ impl Simulation {
         self.events.push(self.cfg.liquidation.sweep_interval_secs, EventKind::LiquidationSweep);
         self.events.push(self.session_end, EventKind::EndOfSession);
 
+        let mut events_since_cancel_check: u32 = 0;
         while let Some(ev) = self.events.pop() {
+            if let Some(flag) = &cancel {
+                events_since_cancel_check += 1;
+                // Checked periodically, not every iteration: a relaxed atomic load is
+                // cheap but this loop can run millions of times/sec, and cancellation
+                // being noticed a few hundred events late makes no practical
+                // difference (still sub-millisecond of simulated... er, wall-clock
+                // time at these rates).
+                if events_since_cancel_check >= 512 {
+                    events_since_cancel_check = 0;
+                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.result.cancelled = true;
+                        break;
+                    }
+                }
+            }
             self.now = ev.time;
             match ev.kind {
                 EventKind::AgentWake { agent_id } => self.handle_agent_wake(agent_id),
