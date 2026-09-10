@@ -112,7 +112,7 @@ fn run_simulation(py: Python<'_>, config_toml: &str) -> PyResult<PyObject> {
     let cfg = ScenarioConfig::from_toml_str(config_toml).map_err(|e| PyValueError::new_err(format!("config parse error: {e}")))?;
     let n_agents = cfg.total_agents();
     let sim = Simulation::build(cfg).map_err(PyValueError::new_err)?;
-    let (sim, result) = py.allow_threads(|| sim.run_cancellable_keep_state(None));
+    let (sim, result) = py.allow_threads(|| sim.run_cancellable_keep_state(None, None));
     result_to_pyobject(py, sim, result, n_agents)
 }
 
@@ -144,19 +144,57 @@ impl CancelToken {
     }
 }
 
+/// A shared "how far along is this run" cell, independent of any one simulation
+/// (like `CancelToken`): create one, pass it to `run_simulation_cancellable`/
+/// `continue_simulation_cancellable` running on a background thread, and poll
+/// `.current_seconds()` from the main thread at any time -- returns the simulated
+/// time (not wall-clock) the run has reached so far, updated from inside the engine
+/// at most a few times a second (see `sim_core::sim::Simulation::drain_loop`'s doc
+/// comment), not on every event. Meant for a "currently at Xs simulated" progress
+/// display on a long run, not fine-grained instrumentation. `.current_seconds()`
+/// returns `None` before the run has processed its first periodic checkpoint.
+#[pyclass]
+struct ProgressHandle {
+    time_bits: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[pymethods]
+impl ProgressHandle {
+    #[new]
+    fn new() -> Self {
+        // f64::NAN's bit pattern is the "no reading yet" sentinel -- current_seconds()
+        // maps it back to None rather than showing a misleading 0.0 before the engine
+        // has written anything.
+        Self { time_bits: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(f64::NAN.to_bits())) }
+    }
+
+    fn current_seconds(&self) -> Option<f64> {
+        let v = f64::from_bits(self.time_bits.load(std::sync::atomic::Ordering::Relaxed));
+        if v.is_nan() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+}
+
 /// Same as `run_simulation`, but accepts a `CancelToken` and checks it periodically
 /// while running; if `.cancel()` is called (from another thread -- this function
 /// itself blocks the calling thread until the run stops one way or another, same as
 /// `run_simulation`) the run stops early and returns its partial result rather than
 /// running to completion. Intended to be called from a Python `threading.Thread` so
-/// the caller's own thread stays responsive; see `app/dashboard.py`.
+/// the caller's own thread stays responsive; see `app/dashboard.py`. `progress` is
+/// optional -- pass a `ProgressHandle` to be able to poll how far along the run is
+/// while it's still going.
 #[pyfunction]
-fn run_simulation_cancellable(py: Python<'_>, config_toml: &str, token: &CancelToken) -> PyResult<PyObject> {
+#[pyo3(signature = (config_toml, token, progress=None))]
+fn run_simulation_cancellable(py: Python<'_>, config_toml: &str, token: &CancelToken, progress: Option<&ProgressHandle>) -> PyResult<PyObject> {
     let cfg = ScenarioConfig::from_toml_str(config_toml).map_err(|e| PyValueError::new_err(format!("config parse error: {e}")))?;
     let n_agents = cfg.total_agents();
     let sim = Simulation::build(cfg).map_err(PyValueError::new_err)?;
     let flag = token.flag.clone();
-    let (sim, result) = py.allow_threads(|| sim.run_cancellable_keep_state(Some(flag)));
+    let progress_handle = progress.map(|p| p.time_bits.clone());
+    let (sim, result) = py.allow_threads(|| sim.run_cancellable_keep_state(Some(flag), progress_handle));
     result_to_pyobject(py, sim, result, n_agents)
 }
 
@@ -172,19 +210,21 @@ fn run_simulation_cancellable(py: Python<'_>, config_toml: &str, token: &CancelT
 fn continue_simulation(py: Python<'_>, checkpoint: &[u8], additional_seconds: f64) -> PyResult<PyObject> {
     let sim = Simulation::from_checkpoint_bytes(checkpoint).map_err(PyValueError::new_err)?;
     let n_agents = sim.agents.len() as u32;
-    let (sim, result) = py.allow_threads(|| sim.resume_keep_state(additional_seconds, None));
+    let (sim, result) = py.allow_threads(|| sim.resume_keep_state(additional_seconds, None, None));
     result_to_pyobject(py, sim, result, n_agents)
 }
 
 /// Same as `continue_simulation`, but accepts a `CancelToken` (see
 /// `run_simulation_cancellable`) so a long continuation can also be stopped early
-/// from another thread.
+/// from another thread, and an optional `ProgressHandle`.
 #[pyfunction]
-fn continue_simulation_cancellable(py: Python<'_>, checkpoint: &[u8], additional_seconds: f64, token: &CancelToken) -> PyResult<PyObject> {
+#[pyo3(signature = (checkpoint, additional_seconds, token, progress=None))]
+fn continue_simulation_cancellable(py: Python<'_>, checkpoint: &[u8], additional_seconds: f64, token: &CancelToken, progress: Option<&ProgressHandle>) -> PyResult<PyObject> {
     let sim = Simulation::from_checkpoint_bytes(checkpoint).map_err(PyValueError::new_err)?;
     let n_agents = sim.agents.len() as u32;
     let flag = token.flag.clone();
-    let (sim, result) = py.allow_threads(|| sim.resume_keep_state(additional_seconds, Some(flag)));
+    let progress_handle = progress.map(|p| p.time_bits.clone());
+    let (sim, result) = py.allow_threads(|| sim.resume_keep_state(additional_seconds, Some(flag), progress_handle));
     result_to_pyobject(py, sim, result, n_agents)
 }
 
@@ -212,5 +252,6 @@ fn sim_pyo3(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(continue_simulation_cancellable, m)?)?;
     m.add_function(wrap_pyfunction!(validate_config, m)?)?;
     m.add_class::<CancelToken>()?;
+    m.add_class::<ProgressHandle>()?;
     Ok(())
 }

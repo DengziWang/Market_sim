@@ -3,7 +3,7 @@
 //! like continuing the original (never-serialized) instance would have -- i.e. the
 //! round trip through bincode loses nothing that affects future evolution.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use sim_core::config::ScenarioConfig;
@@ -85,7 +85,7 @@ fn checkpoint_round_trip_preserves_deterministic_continuation() {
     // come out of deserialization.
     let cfg = ScenarioConfig::from_toml_str(CONFIG).expect("config must parse");
     let sim = Simulation::build(cfg).expect("population must build");
-    let (sim, _result) = sim.run_cancellable_keep_state(None);
+    let (sim, _result) = sim.run_cancellable_keep_state(None, None);
     let bytes = sim.to_checkpoint_bytes().expect("checkpoint must serialize");
 
     let restored_a = Simulation::from_checkpoint_bytes(&bytes).expect("checkpoint must deserialize");
@@ -108,7 +108,7 @@ fn checkpoint_round_trip_preserves_deterministic_continuation() {
 fn resuming_a_checkpoint_continues_producing_valid_trades() {
     let cfg = ScenarioConfig::from_toml_str(CONFIG).expect("config must parse");
     let sim = Simulation::build(cfg).expect("population must build");
-    let (sim, first_result) = sim.run_cancellable_keep_state(None);
+    let (sim, first_result) = sim.run_cancellable_keep_state(None, None);
     assert!(!first_result.trades.is_empty(), "first leg must have produced trades");
     let n_agents_before = first_result.agent_states.iter().map(|a| a.agent_id).collect::<std::collections::HashSet<_>>().len();
 
@@ -136,7 +136,7 @@ fn zero_second_resume_on_a_completed_run_is_a_pure_no_op() {
     // reused (not re-seeded) event queue behaves correctly at this boundary.
     let cfg = ScenarioConfig::from_toml_str(CONFIG).expect("config must parse");
     let sim = Simulation::build(cfg).expect("population must build");
-    let (sim, first) = sim.run_cancellable_keep_state(None);
+    let (sim, first) = sim.run_cancellable_keep_state(None, None);
 
     let bytes = sim.to_checkpoint_bytes().unwrap();
     let restored = Simulation::from_checkpoint_bytes(&bytes).unwrap();
@@ -152,7 +152,7 @@ fn cancelled_run_can_still_be_checkpointed_and_resumed() {
     let sim = Simulation::build(cfg).expect("population must build");
 
     let cancel = Arc::new(AtomicBool::new(true));
-    let (sim, cancelled_result) = sim.run_cancellable_keep_state(Some(cancel));
+    let (sim, cancelled_result) = sim.run_cancellable_keep_state(Some(cancel), None);
     assert!(cancelled_result.cancelled);
     assert!(cancelled_result.actual_session_seconds < 300.0);
 
@@ -163,4 +163,70 @@ fn cancelled_run_can_still_be_checkpointed_and_resumed() {
     assert!(
         (resumed.actual_session_seconds - (cancelled_result.actual_session_seconds + 60.0)).abs() < 1e-6
     );
+}
+
+#[test]
+fn progress_handle_reaches_the_final_simulated_time() {
+    // A plain, non-flaky check that doesn't depend on wall-clock timing: whatever
+    // the progress handle last saw by the time the run returns must be exactly the
+    // final `actual_session_seconds` -- drain_loop's doc comment promises a final
+    // write after the loop specifically so a caller doesn't see a stale value up to
+    // ~500ms behind the true end.
+    let cfg = ScenarioConfig::from_toml_str(CONFIG).expect("config must parse");
+    let sim = Simulation::build(cfg).expect("population must build");
+    let progress = Arc::new(AtomicU64::new(f64::to_bits(-1.0)));
+    let (_sim, result) = sim.run_cancellable_keep_state(None, Some(progress.clone()));
+
+    let seen = f64::from_bits(progress.load(Ordering::Relaxed));
+    assert!((seen - result.actual_session_seconds).abs() < 1e-6, "progress handle must end exactly at the final simulated time");
+}
+
+#[test]
+fn progress_handle_advances_monotonically_during_a_run() {
+    // Best-effort timing check (run on a background thread, sampled from the main
+    // thread every 50ms): a large-enough population/session that the run takes
+    // measurable wall-clock time should produce a strictly-increasing sequence of
+    // intermediate progress reads, never exceeding the eventual final value.
+    let cfg = r#"
+[run]
+seed = 77
+session_seconds = 1800.0
+
+[[assets]]
+symbol = "A"
+tick_size = 0.01
+initial_price = 100.0
+
+[export]
+out_dir = "/tmp/does_not_matter"
+
+[[population.groups]]
+bot_type = "noise"
+variant = "zero_intelligence"
+count = 300
+[population.groups.params]
+wake_interval_secs = 0.2
+"#;
+    let parsed = ScenarioConfig::from_toml_str(cfg).expect("config must parse");
+    let sim = Simulation::build(parsed).expect("population must build");
+    let progress = Arc::new(AtomicU64::new(f64::to_bits(0.0)));
+
+    let progress_for_thread = progress.clone();
+    let handle = std::thread::spawn(move || sim.run_cancellable_keep_state(None, Some(progress_for_thread)));
+
+    let mut samples = Vec::new();
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        samples.push(f64::from_bits(progress.load(Ordering::Relaxed)));
+        if handle.is_finished() {
+            break;
+        }
+    }
+    let (_sim, result) = handle.join().expect("worker thread must not panic");
+
+    for w in samples.windows(2) {
+        assert!(w[1] >= w[0], "progress must never go backwards: {:?}", samples);
+    }
+    assert!(samples.iter().any(|&s| s > 0.0), "expected at least one nonzero intermediate progress read; samples={:?}", samples);
+    assert!(samples.iter().all(|&s| s <= result.actual_session_seconds + 1e-6), "no intermediate read should exceed the final time");
 }

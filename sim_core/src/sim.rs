@@ -3,6 +3,9 @@
 //! liquidation sweep, and produces a `SimResult`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
 use rand::Rng;
 
@@ -91,14 +94,15 @@ impl Simulation {
     /// just a thin wrapper around one, set from another thread (or another Python
     /// thread, via `py.allow_threads` releasing the GIL for the duration of this
     /// call) while this runs.
-    pub fn run_cancellable(self, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> SimResult {
-        self.run_cancellable_keep_state(cancel).1
+    pub fn run_cancellable(self, cancel: Option<Arc<std::sync::atomic::AtomicBool>>) -> SimResult {
+        self.run_cancellable_keep_state(cancel, None).1
     }
 
     /// Same as `run_cancellable`, but also returns the `Simulation` in its final
     /// state (order books, agents, RNG streams, pending event queue), for callers
-    /// that want to checkpoint it (`to_checkpoint_bytes`) rather than discard it.
-    pub fn run_cancellable_keep_state(mut self, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> (Self, SimResult) {
+    /// that want to checkpoint it (`to_checkpoint_bytes`) rather than discard it, and
+    /// accepts an optional `progress` handle -- see `drain_loop`'s doc comment.
+    pub fn run_cancellable_keep_state(mut self, cancel: Option<Arc<std::sync::atomic::AtomicBool>>, progress: Option<Arc<AtomicU64>>) -> (Self, SimResult) {
         let seed = self.cfg.run.seed;
         self.market_rng = rng::market_rng(seed);
 
@@ -110,7 +114,7 @@ impl Simulation {
         self.events.push(self.cfg.liquidation.sweep_interval_secs, EventKind::LiquidationSweep);
         self.events.push(self.session_end, EventKind::EndOfSession);
 
-        self.drain_loop(cancel)
+        self.drain_loop(cancel, progress)
     }
 
     /// Continues a previously-checkpointed simulation (see `to_checkpoint_bytes` /
@@ -134,17 +138,18 @@ impl Simulation {
     /// here. A caller wanting one combined history should concatenate the original
     /// run's `SimResult` with this one (e.g. the dashboard does this when showing a
     /// continued run).
-    pub fn resume(self, additional_seconds: SimTime, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> SimResult {
-        self.resume_keep_state(additional_seconds, cancel).1
+    pub fn resume(self, additional_seconds: SimTime, cancel: Option<Arc<std::sync::atomic::AtomicBool>>) -> SimResult {
+        self.resume_keep_state(additional_seconds, cancel, None).1
     }
 
     /// Same as `resume`, but also returns the `Simulation` in its final state, for
-    /// callers that want to checkpoint it again (e.g. to continue a second time).
-    pub fn resume_keep_state(mut self, additional_seconds: SimTime, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> (Self, SimResult) {
+    /// callers that want to checkpoint it again (e.g. to continue a second time), and
+    /// accepts an optional `progress` handle -- see `drain_loop`'s doc comment.
+    pub fn resume_keep_state(mut self, additional_seconds: SimTime, cancel: Option<Arc<std::sync::atomic::AtomicBool>>, progress: Option<Arc<AtomicU64>>) -> (Self, SimResult) {
         self.result = SimResult::default();
         self.session_end = self.now + additional_seconds.max(0.0);
         self.events.push(self.session_end, EventKind::EndOfSession);
-        self.drain_loop(cancel)
+        self.drain_loop(cancel, progress)
     }
 
     /// Serializes the full simulation state (order books, agents, RNG streams,
@@ -167,21 +172,43 @@ impl Simulation {
     /// Shared event-draining main loop used by both a fresh `run_cancellable` (after
     /// it seeds the initial events) and `resume` (which reuses an already-populated
     /// queue). See `run_cancellable`'s doc comment for `cancel` semantics.
-    fn drain_loop(mut self, cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> (Self, SimResult) {
-        let mut events_since_cancel_check: u32 = 0;
+    ///
+    /// `progress`, if given, is written with the current simulated time (`self.now`,
+    /// as `f64::to_bits`) at most a few times a second -- a way for another thread
+    /// (the PyO3 layer's `ProgressHandle`, backing the dashboard's "current
+    /// simulated second" display while a long run is in progress) to see how far
+    /// along a run is without needing it to actually finish. A plain `Arc<AtomicU64>`
+    /// rather than anything PyO3-specific, same reasoning as `cancel`.
+    fn drain_loop(mut self, cancel: Option<Arc<std::sync::atomic::AtomicBool>>, progress: Option<Arc<AtomicU64>>) -> (Self, SimResult) {
+        let mut events_since_check: u32 = 0;
+        let mut last_progress_write = Instant::now();
         while let Some(ev) = self.events.pop() {
-            if let Some(flag) = &cancel {
-                events_since_cancel_check += 1;
-                // Checked periodically, not every iteration: a relaxed atomic load is
-                // cheap but this loop can run millions of times/sec, and cancellation
-                // being noticed a few hundred events late makes no practical
-                // difference (still sub-millisecond of simulated... er, wall-clock
-                // time at these rates).
-                if events_since_cancel_check >= 512 {
-                    events_since_cancel_check = 0;
-                    if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                        self.result.cancelled = true;
-                        break;
+            if cancel.is_some() || progress.is_some() {
+                events_since_check += 1;
+                // Checked periodically, not every iteration: cheap individually, but
+                // this loop can run millions of times/sec, so even a relaxed atomic
+                // load/store adds up if done every single iteration. Cancellation (or
+                // a progress update) being noticed a few hundred events late makes no
+                // practical difference at these rates.
+                if events_since_check >= 512 {
+                    events_since_check = 0;
+                    if let Some(flag) = &cancel {
+                        if flag.load(Ordering::Relaxed) {
+                            self.result.cancelled = true;
+                            break;
+                        }
+                    }
+                    if let Some(p) = &progress {
+                        // Further throttled to wall-clock time, not just event count:
+                        // event throughput varies a lot with population size/session
+                        // length, and the UI polls this at most once a second anyway
+                        // (see app/dashboard.py) -- no need to pay for an atomic store
+                        // more often than that regardless of how fast events drain.
+                        let now_wall = Instant::now();
+                        if now_wall.duration_since(last_progress_write).as_millis() >= 500 {
+                            last_progress_write = now_wall;
+                            p.store(self.now.to_bits(), Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -222,6 +249,11 @@ impl Simulation {
             }
         }
 
+        // Final write so the UI promptly sees the true end time rather than being up
+        // to ~500ms stale from the last periodic update above.
+        if let Some(p) = &progress {
+            p.store(self.now.to_bits(), Ordering::Relaxed);
+        }
         self.result.actual_session_seconds = self.now;
         self.finalize_agent_states();
         let result = std::mem::take(&mut self.result);

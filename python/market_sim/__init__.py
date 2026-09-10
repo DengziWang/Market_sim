@@ -5,6 +5,7 @@ compiled Rust extension `market_sim.sim_pyo3` (see ../../sim_core, ../../sim_pyo
 
 from market_sim.sim_pyo3 import (
     CancelToken,
+    ProgressHandle,
     continue_simulation,
     continue_simulation_cancellable,
     run_simulation,
@@ -22,6 +23,7 @@ __all__ = [
     "continue_simulation",
     "continue_simulation_cancellable",
     "CancelToken",
+    "ProgressHandle",
     "run_simulation_from_file",
     "validate_config",
     "SimulationRun",

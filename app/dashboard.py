@@ -27,7 +27,7 @@ import streamlit as st
 import toml
 from plotly.subplots import make_subplots
 
-from market_sim import CancelToken, continue_simulation_cancellable, run_simulation_cancellable
+from market_sim import CancelToken, ProgressHandle, continue_simulation_cancellable, run_simulation_cancellable
 from market_sim import config as cfgmod
 from market_sim.export import export_run, load_run
 from market_sim.runner import combine_results
@@ -82,19 +82,26 @@ def _run_worker(run_fn, holder: dict) -> None:
         holder["error"] = f"{type(e).__name__}: {e}"
 
 
-def _start_sim_thread(make_run_fn, config_toml: str, *, is_continue: bool, base_result: dict | None) -> None:
+def _start_sim_thread(make_run_fn, config_toml: str, *, is_continue: bool, base_result: dict | None, target_seconds: float | None) -> None:
     """Shared by the sidebar's "Run simulation" button and the Results tab's
     "Continue simulation" button: spins up the background thread and the session
     state `_poll_sim_status` (sidebar) watches regardless of which UI section
-    started it. `make_run_fn(token)` builds the zero-arg closure the thread calls --
-    takes the freshly-created `CancelToken` as a plain argument (not read back from
-    `st.session_state` inside the thread, which only the main script-running thread
-    should touch)."""
+    started it. `make_run_fn(token, progress)` builds the zero-arg closure the thread
+    calls -- takes the freshly-created `CancelToken`/`ProgressHandle` as plain
+    arguments (not read back from `st.session_state` inside the thread, which only
+    the main script-running thread should touch). `target_seconds` (the nominal
+    simulated-time length of this run -- `session_seconds` for a fresh run, or
+    however-far-along-already + `additional_seconds` for a continuation) is what the
+    "currently at Xs" display below measures progress against; pass `None` if it
+    can't be known upfront."""
     st.session_state.run_error = None
     token = CancelToken()
+    progress = ProgressHandle()
     holder = {"result": None, "error": None}
-    thread = threading.Thread(target=_run_worker, args=(make_run_fn(token), holder), daemon=True)
+    thread = threading.Thread(target=_run_worker, args=(make_run_fn(token, progress), holder), daemon=True)
     st.session_state.sim_token = token
+    st.session_state.sim_progress = progress
+    st.session_state.sim_target_seconds = target_seconds
     st.session_state.sim_holder = holder
     st.session_state.sim_config_toml = config_toml
     st.session_state.sim_start_time = time.time()
@@ -188,6 +195,7 @@ for _key, _default in [
     ("sim_thread", None), ("sim_token", None), ("sim_holder", None),
     ("sim_config_toml", None), ("sim_start_time", None),
     ("sim_is_continue", False), ("sim_base_result", None),
+    ("sim_progress", None), ("sim_target_seconds", None),
 ]:
     if _key not in st.session_state:
         st.session_state[_key] = _default
@@ -236,7 +244,14 @@ with st.sidebar:
     if not sim_running:
         if st.button("Run simulation", type="primary", width="stretch", key="run_sim_btn"):
             config_toml = cfgmod.dump_config_str(st.session_state.cfg)
-            _start_sim_thread(lambda token: (lambda: run_simulation_cancellable(config_toml, token)), config_toml, is_continue=False, base_result=None)
+            target_seconds = float(st.session_state.cfg.get("run", {}).get("session_seconds", 0.0) or 0.0) or None
+            _start_sim_thread(
+                lambda token, progress: (lambda: run_simulation_cancellable(config_toml, token, progress)),
+                config_toml,
+                is_continue=False,
+                base_result=None,
+                target_seconds=target_seconds,
+            )
             st.rerun()
 
     @st.fragment(run_every=1)
@@ -247,7 +262,21 @@ with st.sidebar:
         if thread.is_alive():
             elapsed = time.time() - st.session_state.sim_start_time
             stopping = st.session_state.sim_token.is_cancelled()
-            st.info(f"⏳ {'Stopping...' if stopping else 'Running...'} ({elapsed:.1f}s elapsed)")
+            current_sim_time = st.session_state.sim_progress.current_seconds() if st.session_state.sim_progress else None
+            target = st.session_state.sim_target_seconds
+            if current_sim_time is None:
+                sim_progress_note = ""
+            elif target:
+                # The engine's own event queue is what actually decides how far a run
+                # goes (e.g. min_trades-driven extension can push it past the nominal
+                # session length), so this fraction can occasionally read >100% --
+                # clamped for the progress bar, shown uncapped in the text either way.
+                sim_progress_note = f" -- simulated {current_sim_time:,.0f}s / {target:,.0f}s ({100 * current_sim_time / target:,.0f}%)"
+            else:
+                sim_progress_note = f" -- simulated {current_sim_time:,.0f}s so far"
+            st.info(f"⏳ {'Stopping...' if stopping else 'Running...'} ({elapsed:.1f}s elapsed{sim_progress_note})")
+            if current_sim_time is not None and target:
+                st.progress(min(1.0, max(0.0, current_sim_time / target)))
             if not stopping:
                 if st.button("⏹ Stop simulation", width="stretch", key="stop_sim_btn"):
                     st.session_state.sim_token.cancel()
@@ -263,6 +292,8 @@ with st.sidebar:
         base_result = st.session_state.sim_base_result
         st.session_state.sim_thread = None
         st.session_state.sim_token = None
+        st.session_state.sim_progress = None
+        st.session_state.sim_target_seconds = None
         st.session_state.sim_is_continue = False
         st.session_state.sim_base_result = None
         if holder.get("error"):
@@ -566,10 +597,11 @@ def _render_results_tab():
         if c2.button("▶ Continue", width="stretch", key="continue_sim_btn", disabled=sim_running_now):
             base_config_toml = st.session_state.active_config_toml or ""
             _start_sim_thread(
-                lambda token: (lambda: continue_simulation_cancellable(checkpoint, extra_seconds, token)),
+                lambda token, progress: (lambda: continue_simulation_cancellable(checkpoint, extra_seconds, token, progress)),
                 base_config_toml,
                 is_continue=True,
                 base_result=result,
+                target_seconds=meta["actual_session_seconds"] + extra_seconds,
             )
             st.rerun()
         elif sim_running_now:
