@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from market_sim import config as cfgmod
 from market_sim.export import ExportPaths, df_to_columnar, export_paths, export_run, load_run
-from market_sim.sim_pyo3 import CancelToken, continue_simulation, continue_simulation_cancellable, run_simulation, run_simulation_cancellable
+from market_sim.sim_pyo3 import CancelToken, ProgressHandle, continue_simulation, continue_simulation_cancellable, run_simulation, run_simulation_cancellable
 
 
 @dataclass
@@ -148,6 +148,7 @@ def run_scenario_in_legs(
     *,
     scenario_name: Optional[str] = None,
     cancel_token: Optional[CancelToken] = None,
+    progress: Optional[ProgressHandle] = None,
     on_leg_saved: Optional[Callable[[LegResult], None]] = None,
     resume: bool = True,
 ) -> List[LegResult]:
@@ -197,7 +198,18 @@ def run_scenario_in_legs(
     this again with the same arguments after an interruption just finishes the rest.
     Set `resume=False` to always start fresh from leg 1 (this overwrites any
     existing `leg_0001`, `leg_0002`, ... in `out_dir` as it goes).
+
+    `progress`, if given, is shared across every leg's own run/continue call --
+    `Simulation::resume` reports *absolute* simulated time (not leg-relative), so a
+    continuation's first progress write already starts at wherever the previous leg
+    left off, meaning `progress.current_seconds()` reads as one continuously
+    advancing number across leg boundaries, the same as it would for a single
+    unsplit run of the same total length. Using this requires a `CancelToken`
+    internally (the underlying `*_cancellable` calls take one together with
+    `progress`) -- one is created automatically if `cancel_token` wasn't given.
     """
+    if progress is not None and cancel_token is None:
+        cancel_token = CancelToken()
     cfg = copy.deepcopy(cfg)
     run_cfg = cfg.setdefault("run", {})
     ignored = [k for k in ("min_trades", "max_session_seconds") if run_cfg.get(k)]
@@ -233,10 +245,10 @@ def run_scenario_in_legs(
 
     for leg_idx in range(start_idx, n_legs + 1):
         if leg_idx == 1:
-            result = run_simulation_cancellable(config_toml, cancel_token) if cancel_token is not None else run_simulation(config_toml)
+            result = run_simulation_cancellable(config_toml, cancel_token, progress) if cancel_token is not None else run_simulation(config_toml)
         else:
             result = (
-                continue_simulation_cancellable(checkpoint, leg_seconds, cancel_token)
+                continue_simulation_cancellable(checkpoint, leg_seconds, cancel_token, progress)
                 if cancel_token is not None
                 else continue_simulation(checkpoint, leg_seconds)
             )

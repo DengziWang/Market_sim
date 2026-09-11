@@ -245,6 +245,21 @@ legs = ms.discover_legs("runs/realistic_mix_legs")        # just the directory l
 
 Or from the command line: `python scripts/run_in_legs.py scenarios/realistic_mix.toml --leg-seconds 1800 --n-legs 12 --out-dir runs/realistic_mix_legs`.
 
+**The dashboard does this automatically** -- clicking "Run simulation" on a config
+estimated at or above ~15% of the machine's total RAM (well under the ~35% line that
+used to require an explicit "run it anyway" confirmation) transparently runs it as an
+auto-sized leg sequence instead of asking you to reach for a different function: leg
+length is picked so each leg's own estimate lands around ~8% of total RAM, saved to
+`runs/dashboard_legs/<timestamp>/`. The existing "current simulated second" progress
+display keeps working seamlessly across leg boundaries (`ProgressHandle` reports
+*absolute* simulated time, so a leg continuation's first reading already starts where
+the previous leg left off) with a "leg N/M" counter alongside it. When it finishes,
+the last leg loads into the Results tab immediately (full detail on that specific
+leg) and the Multi-leg overview tab auto-selects the new run and builds its overview
+with no extra click. `min_trades` being set disables auto-split (a trade-count floor
+across an unknown final split doesn't have a sensible meaning) and falls back to the
+manual single-run confirmation instead.
+
 Measured (see project memory): across 8 legs of a real scenario, peak process memory
 stayed flat (~200MB) rather than growing with leg count -- each leg's large result is
 exported and dropped (Python reference-counting frees it immediately) before the next
@@ -295,18 +310,35 @@ exchange chart showing a quiet period.
 
 **Multi-leg overview** (its own tab): view an entire `run_scenario_in_legs`
 sequence (e.g. all 300,000s of a 200-leg run) as one candlestick chart without
-loading every leg's full trade data at once. Each leg contributes a small, cached
-OHLC summary (300 candles, computed from just the `time`/`price`/`qty` columns of
-that leg's `trades.parquet` -- `market_sim.load_trades_columns`, not the full
-table); these compose into one series via `market_sim.candles.resample_candles`,
-which works because OHLC composes correctly across resolutions -- the same math
-real charting software uses to build 1-hour candles from 1-minute ones. Once
-you've zoomed the overview to within a single leg's span, a "Load this leg" button
-loads that leg's actual trade data for genuine single-trade-resolution drill-down
-via the same chart. Building the overview for a many-legs run takes a few/several
+loading every leg's full trade data at once. Builds automatically -- no button --
+as soon as you pick a multi-leg run (or right after an auto-split run finishes, see
+above, which selects it for you too); each leg contributes a small, cached OHLC
+summary (300 candles, computed from just the `time`/`price`/`qty` columns of that
+leg's `trades.parquet` -- `market_sim.load_trades_columns`, not the full table);
+these compose into one series via `market_sim.candles.resample_candles`, which
+works because OHLC composes correctly across resolutions -- the same math real
+charting software uses to build 1-hour candles from 1-minute ones. Once you've
+zoomed the overview to within a single leg's span, a "Load this leg" button loads
+that leg's actual trade data for genuine single-trade-resolution drill-down via the
+same chart -- full `market_health` metrics and the trade-search table are available
+for that specific leg this way (not for the whole multi-leg run at once -- see the
+note on whole-run metrics below). Summarizing a many-legs run takes a few/several
 seconds the first time per session (parallelized across legs with a thread pool;
 measured ~15-20s for 200 legs) -- cached per leg afterward, so re-viewing or
 re-zooming is instant.
+
+**Whole-run `market_health` metrics across every leg of a multi-leg run**: not
+implemented yet -- an open design question, not just an engineering one. Most of
+the report's metrics (means, ratios, HHI/concentration, Benford/round-number wash
+tests) *can* be computed exactly across an arbitrary number of legs without ever
+holding more than one leg's data at a time, by accumulating the right sufficient
+statistics per leg (sums, sums-of-squares, per-agent volume totals, digit
+histograms) and combining them once at the end -- not by naively averaging each
+leg's already-computed metric value, which is the wrong combination for a ratio or
+an index. A few (autocorrelation-based efficiency measures, resilience/recovery
+timing right at a leg boundary) need extra boundary handling to stay exactly
+correct. This hasn't been built -- ask before assuming which metrics are worth it
+and how "whole-run" should be defined.
 
 ## Configuration format
 

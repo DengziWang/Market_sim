@@ -14,8 +14,10 @@ market_sim/market_health packages the Python API guide uses directly.
 """
 from __future__ import annotations
 
+import copy
 import glob
 import json
+import math
 import os
 import re
 import threading
@@ -32,7 +34,7 @@ from market_sim import CancelToken, ProgressHandle, continue_simulation_cancella
 from market_sim import config as cfgmod
 from market_sim.candles import candles_from_trades, resample_candles
 from market_sim.export import df_to_columnar, export_run, load_run, load_trades_columns
-from market_sim.runner import combine_results, discover_legs
+from market_sim.runner import combine_results, discover_legs, run_scenario_in_legs
 import market_health
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -94,6 +96,37 @@ def _estimate_run_cost(n_agents: float, session_seconds: float) -> dict:
     }
 
 
+# Below this fraction of total RAM, run as a single session as before. At or above
+# it, auto-split into legs (market_sim.run_scenario_in_legs) rather than either
+# running one huge session or making the user manually reach for a different
+# function -- discussed and confirmed with the user directly, see project memory.
+# Deliberately well below _RISKY_RUN_THRESHOLD (0.35, the "confirm before running
+# anyway" line further down) -- with auto-splitting in place, a plain "Run
+# simulation" click should essentially never need to hit that warning anymore; it
+# stays as a safety net for the one case auto-split doesn't cover (`min_trades`
+# set -- see _AUTO_SPLIT_TARGET_FRACTION's doc comment) or a population so large
+# even a floor-sized leg would still be risky.
+_AUTO_SPLIT_THRESHOLD_FRACTION = 0.15
+# Each auto-picked leg targets this fraction of total RAM -- comfortably under
+# _AUTO_SPLIT_THRESHOLD_FRACTION itself, so a many-leg run doesn't produce legs
+# that are *themselves* borderline risky.
+_AUTO_SPLIT_TARGET_FRACTION = 0.08
+_AUTO_SPLIT_MIN_LEG_SECONDS = 10.0
+
+
+def _pick_auto_split_leg_seconds(n_agents: float, available_mb: float) -> float:
+    """Solves `_estimate_run_cost(n_agents, leg_seconds)["peak_mb"] ==
+    _AUTO_SPLIT_TARGET_FRACTION * available_mb` for `leg_seconds` -- the linear
+    inverse of `_estimate_run_cost`'s `peak_mb` formula. Floored at
+    `_AUTO_SPLIT_MIN_LEG_SECONDS` so an extreme population doesn't produce
+    sub-10-second, mostly-overhead legs; a population so large even that floor is
+    risky falls through to the existing manual confirm-and-run-anyway warning
+    instead (this function doesn't guarantee safety by itself, just picks a
+    reasonable size for the common case)."""
+    per_second_mb = max(1e-9, n_agents * _EST_ORDER_EVENTS_PER_AGENT_SECOND * _EST_MB_PER_ORDER_EVENT)
+    return max(_AUTO_SPLIT_MIN_LEG_SECONDS, (_AUTO_SPLIT_TARGET_FRACTION * available_mb) / per_second_mb)
+
+
 def _available_ram_mb() -> float:
     try:
         import psutil
@@ -122,7 +155,16 @@ def _run_worker(run_fn, holder: dict) -> None:
         holder["error"] = f"{type(e).__name__}: {e}"
 
 
-def _start_sim_thread(make_run_fn, config_toml: str, *, is_continue: bool, base_result: dict | None, target_seconds: float | None) -> None:
+def _start_sim_thread(
+    make_run_fn,
+    config_toml: str,
+    *,
+    is_continue: bool,
+    base_result: dict | None,
+    target_seconds: float | None,
+    is_leg_run: bool = False,
+    leg_progress: dict | None = None,
+) -> None:
     """Shared by the sidebar's "Run simulation" button and the Results tab's
     "Continue simulation" button: spins up the background thread and the session
     state `_poll_sim_status` (sidebar) watches regardless of which UI section
@@ -133,7 +175,17 @@ def _start_sim_thread(make_run_fn, config_toml: str, *, is_continue: bool, base_
     simulated-time length of this run -- `session_seconds` for a fresh run, or
     however-far-along-already + `additional_seconds` for a continuation) is what the
     "currently at Xs" display below measures progress against; pass `None` if it
-    can't be known upfront."""
+    can't be known upfront.
+
+    `is_leg_run`/`leg_progress`: set when `make_run_fn`'s closure calls
+    `run_scenario_in_legs` (auto-split) rather than a single `run_simulation*` --
+    `holder["result"]` will be a `list[LegResult]`, not a single result dict, and
+    `_poll_sim_status` branches on `sim_is_leg_run` to handle that. `leg_progress`
+    is a plain dict the caller's own `on_leg_saved` callback (baked into
+    `make_run_fn`'s closure already) writes `leg_index`/`n_legs`/`last_meta` into
+    from the background thread -- stored here only so the polling fragment can read
+    it; this function doesn't write to it itself.
+    """
     st.session_state.run_error = None
     token = CancelToken()
     progress = ProgressHandle()
@@ -147,6 +199,8 @@ def _start_sim_thread(make_run_fn, config_toml: str, *, is_continue: bool, base_
     st.session_state.sim_start_time = time.time()
     st.session_state.sim_is_continue = is_continue
     st.session_state.sim_base_result = base_result
+    st.session_state.sim_is_leg_run = is_leg_run
+    st.session_state.sim_leg_progress = leg_progress
     st.session_state.sim_thread = thread
     thread.start()
 
@@ -502,6 +556,8 @@ for _key, _default in [
     ("sim_config_toml", None), ("sim_start_time", None),
     ("sim_is_continue", False), ("sim_base_result", None),
     ("sim_progress", None), ("sim_target_seconds", None),
+    ("sim_is_leg_run", False), ("sim_leg_progress", None),
+    ("active_leg_group", None),
 ]:
     if _key not in st.session_state:
         st.session_state[_key] = _default
@@ -550,41 +606,102 @@ with st.sidebar:
     if not sim_running:
         session_seconds = float(cfg.get("run", {}).get("session_seconds", 0.0) or 0.0)
         max_session_seconds = float(cfg.get("run", {}).get("max_session_seconds") or session_seconds)
+        has_min_trades = bool(cfg.get("run", {}).get("min_trades"))
         est = _estimate_run_cost(n_agents, session_seconds)
         est_worst = _estimate_run_cost(n_agents, max_session_seconds)
         available_mb = _available_ram_mb()
-        # Threshold: this run's estimated peak memory relative to *total* machine
-        # RAM, not just what's free right now -- other things (browser, OS) need
-        # headroom too, and this same number is what wrecked the whole desktop last
-        # time (see project memory), not just the simulation.
-        risky = est_worst["peak_mb"] > 0.35 * available_mb
-        st.caption(
-            f"Estimated for this config: ~{est['order_events']:,.0f} order events, "
-            f"~{est['peak_mb']:,.0f} MB peak, ~{est['wall_seconds']:,.0f}s wall time"
-            + (f" (up to ~{est_worst['peak_mb']:,.0f} MB / ~{est_worst['wall_seconds']:,.0f}s if `min_trades` extends to the {max_session_seconds:,.0f}s cap)" if max_session_seconds > session_seconds else "")
-            + ". Rough approximation, not a guarantee -- see README's Performance section."
-        )
-        confirmed_large = True
-        if risky:
-            st.warning(
-                f"⚠️ This could use ~{est_worst['peak_mb']/1000:,.1f} GB at peak on a machine with "
-                f"~{available_mb/1000:,.1f} GB total RAM -- likely to make the whole system (not just "
-                f"this tab) unresponsive, or get killed outright, the same way a 5,000-agent/300,000s "
-                f"run did before. Consider a shorter session, fewer agents, or exporting via "
-                f"`market_sim`/`scripts/benchmark.py` directly instead of through the browser."
+
+        # Auto-split: below _AUTO_SPLIT_THRESHOLD_FRACTION, run as a single session
+        # as before; at or above it, run as an auto-sized leg sequence instead --
+        # discussed and confirmed with the user directly (see project memory), so a
+        # plain "Run simulation" click on an oversized config no longer needs to hit
+        # the risky-confirm warning below at all, it just transparently becomes a
+        # multi-leg run. Doesn't apply when `min_trades` is set: run_scenario_in_legs
+        # has no notion of a trade-count floor across an unknown final length (each
+        # leg runs for exactly leg_seconds, see its own docstring), so that case
+        # keeps going through the single-run path and its own warning.
+        auto_split = (not has_min_trades) and est["peak_mb"] > _AUTO_SPLIT_THRESHOLD_FRACTION * available_mb
+
+        if auto_split:
+            leg_seconds_raw = _pick_auto_split_leg_seconds(n_agents, available_mb)
+            n_legs = max(1, math.ceil(session_seconds / leg_seconds_raw))
+            leg_seconds = session_seconds / n_legs  # even legs summing exactly to session_seconds
+            est_leg = _estimate_run_cost(n_agents, leg_seconds)
+            st.caption(
+                f"This session ({session_seconds:,.0f}s, ~{est['peak_mb']:,.0f} MB if run as one) will "
+                f"auto-split into **{n_legs} legs** of ~{leg_seconds:,.0f}s each (~{est_leg['peak_mb']:,.0f} MB "
+                f"peak per leg) -- see README's \"Splitting a long run into legs\". The Multi-leg overview tab "
+                f"will build automatically once it's done."
             )
-            confirmed_large = st.checkbox("I understand the risk -- run it anyway", key="confirm_large_run")
-        if st.button("Run simulation", type="primary", width="stretch", key="run_sim_btn", disabled=risky and not confirmed_large):
-            config_toml = cfgmod.dump_config_str(st.session_state.cfg)
-            target_seconds = session_seconds or None
-            _start_sim_thread(
-                lambda token, progress: (lambda: run_simulation_cancellable(config_toml, token, progress)),
-                config_toml,
-                is_continue=False,
-                base_result=None,
-                target_seconds=target_seconds,
+            # Safety net: the target per-leg budget is chosen well under the risky
+            # threshold, but a population so large that even the minimum leg length
+            # doesn't fit still needs the same explicit acknowledgement the
+            # single-run path would have required.
+            risky = est_leg["peak_mb"] > 0.35 * available_mb
+            confirmed_large = True
+            if risky:
+                st.warning(
+                    f"⚠️ Even a single auto-split leg is estimated at ~{est_leg['peak_mb']/1000:,.1f} GB -- this "
+                    f"population is large enough that {_AUTO_SPLIT_MIN_LEG_SECONDS:.0f}s-minimum legs aren't "
+                    f"enough headroom on a ~{available_mb/1000:,.1f} GB machine. Consider fewer agents."
+                )
+                confirmed_large = st.checkbox("I understand the risk -- run it anyway", key="confirm_large_run")
+            if st.button("Run simulation (auto-split)", type="primary", width="stretch", key="run_sim_btn", disabled=risky and not confirmed_large):
+                cfg_snapshot = copy.deepcopy(st.session_state.cfg)
+                out_dir = os.path.join(RUNS_ROOT, "dashboard_legs", time.strftime("%Y%m%d_%H%M%S"))
+                leg_progress = {"leg_index": 0, "n_legs": n_legs, "last_meta": None, "out_dir": out_dir}
+
+                def make_run_fn(token, progress, cfg_snapshot=cfg_snapshot, leg_seconds=leg_seconds, n_legs=n_legs, out_dir=out_dir, leg_progress=leg_progress):
+                    def on_leg_saved(leg):
+                        # Background thread -- writes to a plain dict only, same
+                        # rule as _run_worker itself (no st.* calls here).
+                        leg_progress["leg_index"] = leg.index
+                        leg_progress["last_meta"] = leg.meta
+
+                    return lambda: run_scenario_in_legs(
+                        cfg_snapshot, leg_seconds, n_legs, out_dir, scenario_name="dashboard (auto-split)", cancel_token=token, progress=progress, on_leg_saved=on_leg_saved
+                    )
+
+                _start_sim_thread(
+                    make_run_fn,
+                    cfgmod.dump_config_str(cfg_snapshot),
+                    is_continue=False,
+                    base_result=None,
+                    target_seconds=session_seconds or None,
+                    is_leg_run=True,
+                    leg_progress=leg_progress,
+                )
+                st.rerun()
+        else:
+            max_session_seconds_note = max_session_seconds if max_session_seconds > session_seconds else None
+            risky = est_worst["peak_mb"] > 0.35 * available_mb
+            st.caption(
+                f"Estimated for this config: ~{est['order_events']:,.0f} order events, "
+                f"~{est['peak_mb']:,.0f} MB peak, ~{est['wall_seconds']:,.0f}s wall time"
+                + (f" (up to ~{est_worst['peak_mb']:,.0f} MB / ~{est_worst['wall_seconds']:,.0f}s if `min_trades` extends to the {max_session_seconds_note:,.0f}s cap)" if max_session_seconds_note else "")
+                + ". Rough approximation, not a guarantee -- see README's Performance section."
             )
-            st.rerun()
+            confirmed_large = True
+            if risky:
+                st.warning(
+                    f"⚠️ This could use ~{est_worst['peak_mb']/1000:,.1f} GB at peak on a machine with "
+                    f"~{available_mb/1000:,.1f} GB total RAM -- likely to make the whole system (not just "
+                    f"this tab) unresponsive, or get killed outright, the same way a 5,000-agent/300,000s "
+                    f"run did before. Consider a shorter session, fewer agents, or exporting via "
+                    f"`market_sim`/`scripts/benchmark.py` directly instead of through the browser."
+                )
+                confirmed_large = st.checkbox("I understand the risk -- run it anyway", key="confirm_large_run")
+            if st.button("Run simulation", type="primary", width="stretch", key="run_sim_btn", disabled=risky and not confirmed_large):
+                config_toml = cfgmod.dump_config_str(st.session_state.cfg)
+                target_seconds = session_seconds or None
+                _start_sim_thread(
+                    lambda token, progress: (lambda: run_simulation_cancellable(config_toml, token, progress)),
+                    config_toml,
+                    is_continue=False,
+                    base_result=None,
+                    target_seconds=target_seconds,
+                )
+                st.rerun()
 
     @st.fragment(run_every=1)
     def _poll_sim_status():
@@ -606,6 +723,9 @@ with st.sidebar:
                 sim_progress_note = f" -- simulated {current_sim_time:,.0f}s / {target:,.0f}s ({100 * current_sim_time / target:,.0f}%)"
             else:
                 sim_progress_note = f" -- simulated {current_sim_time:,.0f}s so far"
+            if st.session_state.sim_is_leg_run and st.session_state.sim_leg_progress:
+                lp = st.session_state.sim_leg_progress
+                sim_progress_note += f" -- leg {lp['leg_index']}/{lp['n_legs']}"
             st.info(f"⏳ {'Stopping...' if stopping else 'Running...'} ({elapsed:.1f}s elapsed{sim_progress_note})")
             if current_sim_time is not None and target:
                 st.progress(min(1.0, max(0.0, current_sim_time / target)))
@@ -622,14 +742,34 @@ with st.sidebar:
         config_toml = st.session_state.sim_config_toml
         is_continue = st.session_state.sim_is_continue
         base_result = st.session_state.sim_base_result
+        is_leg_run = st.session_state.sim_is_leg_run
+        leg_progress = st.session_state.sim_leg_progress
         st.session_state.sim_thread = None
         st.session_state.sim_token = None
         st.session_state.sim_progress = None
         st.session_state.sim_target_seconds = None
         st.session_state.sim_is_continue = False
         st.session_state.sim_base_result = None
+        st.session_state.sim_is_leg_run = False
+        st.session_state.sim_leg_progress = None
         if holder.get("error"):
             st.session_state.run_error = holder["error"]
+        elif is_leg_run:
+            legs = holder["result"]  # list[LegResult] -- see run_scenario_in_legs
+            out_dir = leg_progress["out_dir"] if leg_progress else (legs[0].out_dir if legs else None)
+            if legs:
+                st.session_state.active_leg_group = out_dir
+                # Also load the last leg into the normal single-run view, so the
+                # Results tab has something immediately too -- not just the
+                # overview -- without an extra click. Full detail on that specific
+                # leg is genuinely correct/complete, unlike a whole-run summary.
+                loaded = load_run(legs[-1].out_dir)
+                result = _loaded_run_to_result(loaded)
+                was_cancelled = legs[-1].meta.get("cancelled", False)
+                source = f"Auto-split run{' (stopped early)' if was_cancelled else ''} -- showing leg {legs[-1].index}/{len(legs)} (see Multi-leg overview for the whole run)"
+                _activate_result(result, loaded["meta"].get("config_toml", ""), source, save_path=legs[-1].out_dir)
+            else:
+                st.session_state.run_error = "Auto-split run produced no legs (cancelled before the first one finished)."
         else:
             result = holder["result"]
             # continue_simulation_cancellable returns only the newly-simulated
@@ -1147,8 +1287,18 @@ with tab_overview:
     groups = _group_saved_runs(_discover_saved_runs())
     multi_leg_groups = {k: v for k, v in groups.items() if len(v) > 1}
     if not multi_leg_groups:
-        st.info("No multi-leg runs found under runs/ yet -- use `market_sim.run_scenario_in_legs` (see README) to create one.")
+        st.info("No multi-leg runs found under runs/ yet -- an auto-split run (see the sidebar) creates one automatically, or use `market_sim.run_scenario_in_legs` (see README).")
     else:
+        # Auto-select the most recently finished auto-split run, exactly once (not
+        # on every rerun -- that would fight a later manual choice of a different
+        # group) -- same "set session_state before the widget instantiates" pattern
+        # as elsewhere in this file, needed because this runs before the selectbox
+        # below. active_leg_group is set by _poll_sim_status right when an
+        # auto-split run completes.
+        if st.session_state.active_leg_group and st.session_state.active_leg_group in multi_leg_groups and st.session_state.get("_last_auto_selected_leg_group") != st.session_state.active_leg_group:
+            st.session_state["overview_group"] = st.session_state.active_leg_group
+            st.session_state["_last_auto_selected_leg_group"] = st.session_state.active_leg_group
+
         group_key = st.selectbox("Multi-leg run", list(multi_leg_groups), format_func=lambda p: os.path.relpath(p, RUNS_ROOT), key="overview_group")
         leg_dirs = tuple(multi_leg_groups[group_key])
         group_label = os.path.relpath(group_key, RUNS_ROOT)
@@ -1169,48 +1319,47 @@ with tab_overview:
             asset_options = {0: "asset 0"}
         asset_id = st.selectbox("Asset", list(asset_options), format_func=lambda a: asset_options.get(a, str(a)), key="overview_asset")
 
-        if st.button("Build overview", key="overview_build_btn"):
-            with st.spinner(f"Summarizing {len(leg_dirs)} legs (cached after first time, ~0.1-0.2s/leg the first time)..."):
-                _warm_leg_summaries(leg_dirs)
-                _multi_leg_candles_for_asset(leg_dirs, asset_id)
-            st.session_state["overview_built"] = (group_key, asset_id)
-
-        built = st.session_state.get("overview_built")
-        if built == (group_key, asset_id):
+        # Builds automatically -- no button. _leg_candle_summary/_warm_leg_summaries
+        # are cached (st.cache_resource), so this only actually costs anything the
+        # first time a given leg is summarized in this session; re-rendering (a
+        # different zoom, a rerun from an unrelated widget elsewhere) is instant.
+        with st.spinner(f"Summarizing {len(leg_dirs)} legs (first time only, ~0.1-0.2s/leg)..."):
+            _warm_leg_summaries(leg_dirs)
             candles_all = _multi_leg_candles_for_asset(leg_dirs, asset_id)
-            if candles_all.empty:
-                st.warning("No trades found for this asset across these legs.")
-            else:
-                full_start, full_end = float(candles_all["bucket_start"].min()), float(candles_all["bucket_end"].max())
 
-                def get_overview_candles(view_start, view_end, target_candles, candles_all=candles_all):
-                    return resample_candles(candles_all, view_start, view_end, target_candles)
+        if candles_all.empty:
+            st.warning("No trades found for this asset across these legs.")
+        else:
+            full_start, full_end = float(candles_all["bucket_start"].min()), float(candles_all["bucket_end"].max())
 
-                chart_key = f"{chart_key_prefix}_{asset_id}"
-                _render_candlestick_chart(
-                    key_prefix=chart_key,
-                    title=f"{asset_options.get(asset_id, asset_id)} -- {group_label} (all {len(leg_dirs)} legs)",
-                    full_start=full_start,
-                    full_end=full_end,
-                    get_candles=get_overview_candles,
-                )
+            def get_overview_candles(view_start, view_end, target_candles, candles_all=candles_all):
+                return resample_candles(candles_all, view_start, view_end, target_candles)
 
-                # Once the view has narrowed to within a single leg's own span,
-                # offer to load that leg's full trade data for genuine
-                # single-trade-resolution drill-down via the Results tab.
-                view_start = st.session_state.get(f"{chart_key}_view_start", full_start)
-                view_end = st.session_state.get(f"{chart_key}_view_end", full_end)
-                containing_legs = []
-                for d in leg_dirs:
-                    leg_summary = _leg_candle_summary(d).get(asset_id)
-                    if leg_summary is not None and not leg_summary.empty and leg_summary["bucket_start"].min() <= view_end and leg_summary["bucket_end"].max() >= view_start:
-                        containing_legs.append(d)
-                if len(containing_legs) == 1:
-                    leg_dir = containing_legs[0]
-                    if st.button(f"📂 Load {os.path.relpath(leg_dir, RUNS_ROOT)} for full detail", key="overview_load_leg_btn"):
-                        loaded = load_run(leg_dir)
-                        result = _loaded_run_to_result(loaded)
-                        _activate_result(result, loaded["meta"].get("config_toml", ""), f"Loaded from {os.path.relpath(leg_dir, REPO_ROOT)}", save_path=leg_dir)
-                        st.success("Loaded -- switch to the Results tab to see it at full single-trade resolution.")
-                elif len(containing_legs) > 1:
-                    st.caption(f"Current view spans {len(containing_legs)} legs -- zoom in further (narrow the view to within one leg's span) to load it for full detail.")
+            chart_key = f"{chart_key_prefix}_{asset_id}"
+            _render_candlestick_chart(
+                key_prefix=chart_key,
+                title=f"{asset_options.get(asset_id, asset_id)} -- {group_label} (all {len(leg_dirs)} legs)",
+                full_start=full_start,
+                full_end=full_end,
+                get_candles=get_overview_candles,
+            )
+
+            # Once the view has narrowed to within a single leg's own span,
+            # offer to load that leg's full trade data for genuine
+            # single-trade-resolution drill-down via the Results tab.
+            view_start = st.session_state.get(f"{chart_key}_view_start", full_start)
+            view_end = st.session_state.get(f"{chart_key}_view_end", full_end)
+            containing_legs = []
+            for d in leg_dirs:
+                leg_summary = _leg_candle_summary(d).get(asset_id)
+                if leg_summary is not None and not leg_summary.empty and leg_summary["bucket_start"].min() <= view_end and leg_summary["bucket_end"].max() >= view_start:
+                    containing_legs.append(d)
+            if len(containing_legs) == 1:
+                leg_dir = containing_legs[0]
+                if st.button(f"📂 Load {os.path.relpath(leg_dir, RUNS_ROOT)} for full detail", key="overview_load_leg_btn"):
+                    loaded = load_run(leg_dir)
+                    result = _loaded_run_to_result(loaded)
+                    _activate_result(result, loaded["meta"].get("config_toml", ""), f"Loaded from {os.path.relpath(leg_dir, REPO_ROOT)}", save_path=leg_dir)
+                    st.success("Loaded -- switch to the Results tab to see it at full single-trade resolution.")
+            elif len(containing_legs) > 1:
+                st.caption(f"Current view spans {len(containing_legs)} legs -- zoom in further (narrow the view to within one leg's span) to load it for full detail.")
