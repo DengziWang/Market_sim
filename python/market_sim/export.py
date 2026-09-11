@@ -99,6 +99,18 @@ def export_run(
     return paths
 
 
+def df_to_columnar(df: pd.DataFrame) -> Dict[str, Any]:
+    """The inverse of building a DataFrame from a `dict[str, list/ndarray]` result
+    (`to_dataframes` above) -- `{col: df[col].to_numpy() for col in df.columns}`,
+    NOT `df.to_dict("list")`. The two look interchangeable but aren't at any real
+    size: `to_dict("list")` boxes every single cell into an individual Python
+    object while building a plain list, which measured ~21s for one 1.4M-row/
+    8M-order-event saved run (loading it in the dashboard, or via
+    `market_sim.load_run_legs`, would hang for that long) -- the column-wise numpy
+    version does the same conversion in under a millisecond."""
+    return {col: df[col].to_numpy() for col in df.columns}
+
+
 def load_run(out_dir: str) -> Dict[str, Any]:
     """Read a previously exported run back in (DataFrames + metadata dict), without
     re-running the simulation -- what `market_health/` operates on. Also loads the

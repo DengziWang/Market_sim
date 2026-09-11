@@ -17,6 +17,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import threading
 import time
 
@@ -29,7 +30,7 @@ from plotly.subplots import make_subplots
 
 from market_sim import CancelToken, ProgressHandle, continue_simulation_cancellable, run_simulation_cancellable
 from market_sim import config as cfgmod
-from market_sim.export import export_run, load_run
+from market_sim.export import df_to_columnar, export_run, load_run
 from market_sim.runner import combine_results
 import market_health
 
@@ -151,16 +152,22 @@ def _start_sim_thread(make_run_fn, config_toml: str, *, is_continue: bool, base_
 
 def _loaded_run_to_result(loaded: dict) -> dict:
     """market_sim.load_run(...)'s DataFrame-keyed shape -> the same columnar
-    dict[str, list] shape run_simulation(...)/active_result use everywhere else, so
-    the Results tab renders a freshly-run, stopped-early, or reloaded-from-disk
-    result identically. Carries over `checkpoint` (present when the saved run has
-    one -- see `market_sim.has_checkpoint`) so a loaded run can still be continued,
-    not just viewed."""
+    dict[str, list/ndarray] shape run_simulation(...)/active_result use everywhere
+    else, so the Results tab renders a freshly-run, stopped-early, or reloaded-
+    from-disk result identically. Carries over `checkpoint` (present when the saved
+    run has one -- see `market_sim.has_checkpoint`) so a loaded run can still be
+    continued, not just viewed.
+
+    Uses `df_to_columnar` (`{col: df[col].to_numpy() ...}`), NOT `df.to_dict("list")`
+    -- measured ~21s for a real 1.4M-row/8M-order-event saved run with the latter
+    (every cell individually boxed into a Python object) vs. under a millisecond for
+    the former; see its docstring in market_sim/export.py.
+    """
     result = {
-        "trades": loaded["trades"].to_dict("list"),
-        "order_events": loaded["order_events"].to_dict("list"),
-        "snapshots": loaded["orderbook_snapshots"].to_dict("list"),
-        "agent_states": loaded["agent_state"].to_dict("list"),
+        "trades": df_to_columnar(loaded["trades"]),
+        "order_events": df_to_columnar(loaded["order_events"]),
+        "snapshots": df_to_columnar(loaded["orderbook_snapshots"]),
+        "agent_states": df_to_columnar(loaded["agent_state"]),
         "meta": loaded["meta"],
     }
     if "checkpoint" in loaded:
@@ -170,6 +177,27 @@ def _loaded_run_to_result(loaded: dict) -> dict:
 
 def _discover_saved_runs() -> list:
     return sorted(os.path.dirname(p) for p in glob.glob(os.path.join(RUNS_ROOT, "**", "run_metadata.json"), recursive=True))
+
+
+_LEG_DIR_RE = re.compile(r"^leg_\d+$")
+
+
+def _group_saved_runs(saved: list) -> dict:
+    """Groups `_discover_saved_runs()`'s flat directory list by run: a
+    `market_sim.run_scenario_in_legs` sequence's `leg_NNNN` directories all group
+    under their shared parent (so a 200-leg run shows as one entry with a leg
+    picker, not 200 separate dropdown rows each showing an indistinguishable,
+    truncated `.../leg_00NN`), everything else is its own single-entry group.
+    Returned dict preserves insertion order (Python 3.7+), sorted so the parent of
+    a leg group sorts by its own name rather than its first leg's."""
+    groups: dict = {}
+    for path in saved:
+        parent, leaf = os.path.dirname(path), os.path.basename(path)
+        key = parent if _LEG_DIR_RE.match(leaf) else path
+        groups.setdefault(key, []).append(path)
+    for legs in groups.values():
+        legs.sort()
+    return dict(sorted(groups.items()))
 
 
 def _activate_result(result: dict, config_toml: str, source: str, save_path: str | None = None) -> None:
@@ -444,7 +472,23 @@ with st.sidebar:
         if not saved:
             st.caption(f"No saved runs found under {os.path.relpath(RUNS_ROOT, REPO_ROOT)}/ yet.")
         else:
-            pick = st.selectbox("Saved run", saved, format_func=lambda p: os.path.relpath(p, RUNS_ROOT), key="load_run_choice")
+            groups = _group_saved_runs(saved)
+            # A `run_scenario_in_legs` sequence groups under one entry here (e.g.
+            # "user_5000agents_300000s", not 200 separate "leg_0001".."leg_0200"
+            # rows each showing an indistinguishable, truncated path) -- a leg
+            # picker appears only for the selected group when it actually has more
+            # than one leg.
+            group_key = st.selectbox("Saved run", list(groups), format_func=lambda p: os.path.relpath(p, RUNS_ROOT), key="load_run_group")
+            legs = groups[group_key]
+            if len(legs) > 1:
+                leg_num = st.number_input(f"Leg (1-{len(legs)})", min_value=1, max_value=len(legs), value=len(legs), step=1, key="load_run_leg_num")
+                pick = legs[leg_num - 1]
+            else:
+                pick = legs[0]
+            # A selectbox/number_input's own rendered label can still get clipped by
+            # a narrow sidebar -- st.caption wraps instead of truncating, so the
+            # full path is always readable regardless of width.
+            st.caption(f"Loading: `{os.path.relpath(pick, RUNS_ROOT)}`")
             if st.button("Load", key="load_run_btn"):
                 loaded = load_run(pick)
                 result = _loaded_run_to_result(loaded)

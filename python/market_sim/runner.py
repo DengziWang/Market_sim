@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from market_sim import config as cfgmod
-from market_sim.export import ExportPaths, export_paths, export_run, load_run
+from market_sim.export import ExportPaths, df_to_columnar, export_paths, export_run, load_run
 from market_sim.sim_pyo3 import CancelToken, continue_simulation, continue_simulation_cancellable, run_simulation, run_simulation_cancellable
 
 
@@ -286,10 +286,10 @@ def load_run_legs(out_dir: str) -> Dict[str, Any]:
     for leg_dir in legs:
         loaded = load_run(leg_dir)
         leg_result = {
-            "trades": loaded["trades"].to_dict("list"),
-            "order_events": loaded["order_events"].to_dict("list"),
-            "snapshots": loaded["orderbook_snapshots"].to_dict("list"),
-            "agent_states": loaded["agent_state"].to_dict("list"),
+            "trades": df_to_columnar(loaded["trades"]),
+            "order_events": df_to_columnar(loaded["order_events"]),
+            "snapshots": df_to_columnar(loaded["orderbook_snapshots"]),
+            "agent_states": df_to_columnar(loaded["agent_state"]),
             "meta": loaded["meta"],
         }
         if "checkpoint" in loaded:
