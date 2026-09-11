@@ -24,7 +24,7 @@ from market_sim.runner import (
     run_scenario_in_legs,
     simulate_and_plot,
 )
-from market_sim.export import df_to_columnar, export_run, load_run, has_checkpoint, to_dataframes
+from market_sim.export import df_to_columnar, export_run, load_run, load_trades_columns, has_checkpoint, to_dataframes
 from market_sim.experiment import ExperimentPlan, ExperimentPoint, build_plan_from_compositions, build_stress_test_plan, run_experiment
 
 __all__ = [
@@ -47,6 +47,7 @@ __all__ = [
     "simulate_and_plot",
     "export_run",
     "load_run",
+    "load_trades_columns",
     "df_to_columnar",
     "has_checkpoint",
     "to_dataframes",

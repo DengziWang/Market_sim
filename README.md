@@ -148,9 +148,14 @@ packages above -- no separate backend, nothing leaves your machine. It gives you
   population as an editable table (bot type, variant, count, cash range, leverage,
   and each variant's own JSON params) -- plus a raw-TOML tab as a full-coverage
   escape hatch for anything the structured widgets don't have a dedicated field for.
-- Zoomable/pannable per-asset price+volume charts (Plotly: drag to zoom, double-click
-  to reset, scroll to zoom) with best bid/ask and the fundamental-value reference
-  overlaid when snapshots are exported.
+- **Candlestick price+volume charts**, one per asset, with adaptive zoom: drag a box
+  on the chart (or set exact start/end numerically) to zoom into a region -- candle
+  width recomputes for whatever time span is in view (`span / target candle count`,
+  ~100-200 candles visible at any zoom level by default), so narrowing the view
+  produces more, thinner candles covering that span, down to genuine single-trade
+  resolution once the window gets that narrow. Best bid/ask and the fundamental-value
+  reference overlay as thin lines when snapshots are exported. See "Multi-leg
+  overview" below for viewing an entire `run_scenario_in_legs` sequence this way too.
 - The full `market_health` metric set for the run.
 - A searchable/filterable trade table (asset, bot type, agent id, time range, min
   quantity, free-text) with CSV export of the filtered rows.
@@ -265,6 +270,43 @@ sits within its own normal range, no spike. If you're analyzing a `run_scenario_
 sequence and want to exclude the cold start entirely, drop leg 1's data specifically
 (or start your analysis window a few seconds into it) rather than treating every leg
 the same way.
+
+### Candlestick chart + multi-leg overview
+
+The dashboard's price chart (Results tab) is a candlestick chart with adaptive,
+time-window-based zoom (`market_sim.candles`): a candle covers a slice of simulated
+time, not a fixed count of trades, so its volume bar means what a volume bar
+normally means -- how much happened in that slice -- rather than being
+near-constant across candles the way trade-count-based bucketing would be (a real
+concern raised and fixed during design: with trade-count buckets, every candle
+holds the same number of trades almost by construction, so the volume chart loses
+the "which period was actually busy" signal).
+
+Bucket width isn't a fixed global grid -- it's recomputed for whatever time range
+is currently in view: `width = view_span / target_candle_count` (default target
+100, so 100-200 candles visible at any zoom level). Dragging a box on the chart (or
+typing exact start/end values -- the always-reliable alternative, since Plotly's
+own scroll/toolbar zoom isn't observable server-side, only a drag-*selection* is)
+narrows the view, which shrinks the bucket width and produces more, thinner
+candles covering that narrower span -- down to genuine single-trade resolution
+once the window is narrow enough. Empty buckets forward-fill from the previous
+close (flat candle, zero volume) rather than leaving a gap, same as a real
+exchange chart showing a quiet period.
+
+**Multi-leg overview** (its own tab): view an entire `run_scenario_in_legs`
+sequence (e.g. all 300,000s of a 200-leg run) as one candlestick chart without
+loading every leg's full trade data at once. Each leg contributes a small, cached
+OHLC summary (300 candles, computed from just the `time`/`price`/`qty` columns of
+that leg's `trades.parquet` -- `market_sim.load_trades_columns`, not the full
+table); these compose into one series via `market_sim.candles.resample_candles`,
+which works because OHLC composes correctly across resolutions -- the same math
+real charting software uses to build 1-hour candles from 1-minute ones. Once
+you've zoomed the overview to within a single leg's span, a "Load this leg" button
+loads that leg's actual trade data for genuine single-trade-resolution drill-down
+via the same chart. Building the overview for a many-legs run takes a few/several
+seconds the first time per session (parallelized across legs with a thread pool;
+measured ~15-20s for 200 legs) -- cached per leg afterward, so re-viewing or
+re-zooming is instant.
 
 ## Configuration format
 

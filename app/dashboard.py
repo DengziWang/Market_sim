@@ -30,8 +30,9 @@ from plotly.subplots import make_subplots
 
 from market_sim import CancelToken, ProgressHandle, continue_simulation_cancellable, run_simulation_cancellable
 from market_sim import config as cfgmod
-from market_sim.export import df_to_columnar, export_run, load_run
-from market_sim.runner import combine_results
+from market_sim.candles import candles_from_trades, resample_candles
+from market_sim.export import df_to_columnar, export_run, load_run, load_trades_columns
+from market_sim.runner import combine_results, discover_legs
 import market_health
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -264,6 +265,78 @@ def _agent_state_df_cached(version: int) -> pd.DataFrame:
     return _to_categorical(pd.DataFrame(st.session_state.active_result.get("agent_states", {})), "agent_states")
 
 
+# How many candles each leg is summarized into for the multi-leg overview -- a
+# fixed, modest resolution computed once per leg (cached) and composed across
+# however many legs are in view. Doesn't need to be large: the overview's whole
+# purpose is a whole-run shape at a glance, with "Load this leg" for full detail.
+_LEG_SUMMARY_CANDLES = 300
+
+
+@st.cache_resource(show_spinner=False, max_entries=2000)
+def _leg_candle_summary(leg_dir: str) -> dict:
+    """Per-asset OHLC summary for one leg, computed from just the trades columns
+    actually needed (`load_trades_columns`, not the full trades table -- skips the
+    bot-type/variant/agent-id columns entirely) at a fixed, modest resolution.
+    Cached per leg directory so re-viewing/re-zooming the overview doesn't re-read
+    parquet or recompute -- only a *new* leg (not seen this session) costs
+    anything; `max_entries` is generously above any realistic leg count (each
+    entry is tiny -- a few hundred candles x however many assets), so nothing
+    gets evicted just from having viewed a lot of legs. Returns `{asset_id:
+    DataFrame}` (each `market_sim.candles.CANDLE_COLUMNS` shape, in that leg's
+    own absolute simulated-time coordinates -- legs already don't need rebasing
+    to concatenate, since `run_scenario_in_legs` never resets the clock between
+    legs). Trades within a leg are already time-sorted per asset (the parent
+    table is written in execution order and filtering preserves that), so no
+    extra sort is needed here.
+    """
+    df = load_trades_columns(leg_dir)
+    out = {}
+    for aid, sub in df.groupby("asset_id", sort=False):
+        t = sub["time"].to_numpy()
+        out[int(aid)] = candles_from_trades(t, sub["price"].to_numpy(), (sub["price"] * sub["qty"]).to_numpy(), float(t.min()), float(t.max()), _LEG_SUMMARY_CANDLES)
+    return out
+
+
+def _warm_leg_summaries(leg_dirs) -> None:
+    """Populates `_leg_candle_summary`'s cache for every leg in `leg_dirs`, in
+    parallel. Reading + aggregating one leg is dominated by pyarrow's parquet
+    read and numpy's `reduceat`-based aggregation (see `candles.py`), both of
+    which release the GIL for their actual work, so a thread pool gives a real
+    (~1.5x measured on this machine) speedup over a plain loop despite Python's
+    GIL -- worth it since this runs synchronously behind a spinner on first
+    view of a many-legs run (measured ~200 legs -> ~13-20s either way; this is
+    a one-time-per-session cost, not a per-rerun one, courtesy of the cache
+    above)."""
+    import concurrent.futures
+
+    # No cache-hit check before dispatching: `_leg_candle_summary` is itself
+    # cached, so re-calling it for an already-warmed leg just returns the cached
+    # value quickly rather than recomputing -- simpler than tracking cache
+    # membership separately, and cheap enough not to matter.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(_leg_candle_summary, leg_dirs))
+
+
+@st.cache_resource(show_spinner=False, max_entries=16)
+def _multi_leg_candles_for_asset(leg_dirs: tuple, asset_id: int) -> pd.DataFrame:
+    """Concatenates every leg's cached per-asset candle summary for one asset into
+    one series spanning the whole multi-leg run -- the raw material
+    `resample_candles` (called per-view, not cached, since it's cheap once the
+    inputs above are) turns into the actual displayed overview at whatever
+    resolution the current view needs. Call `_warm_leg_summaries(leg_dirs)`
+    first if legs might not be cached yet -- this function itself just reads the
+    cache (via `_leg_candle_summary`, which computes-and-caches on a miss, but
+    serially, one leg at a time, if nothing warmed it first)."""
+    frames = []
+    for leg_dir in leg_dirs:
+        summary = _leg_candle_summary(leg_dir).get(asset_id)
+        if summary is not None and not summary.empty:
+            frames.append(summary)
+    if not frames:
+        return pd.DataFrame(columns=["bucket_start", "bucket_end", "open", "high", "low", "close", "volume", "n_trades"])
+    return pd.concat(frames, ignore_index=True).sort_values("bucket_start").reset_index(drop=True)
+
+
 def _downsample_minmax(t: "pd.Series", y: "pd.Series", max_points: int):
     """For a time series with far more points than can usefully be plotted, keep
     only each bucket's min and max (not a naive every-Nth-point decimation), so
@@ -296,6 +369,128 @@ def _downsample_minmax(t: "pd.Series", y: "pd.Series", max_points: int):
     y_out[0::2] = min_vals
     y_out[1::2] = max_vals
     return pd.Series(t_out), pd.Series(y_out)
+
+
+# Discussed with the user directly: candle count target of ~100 (so 100-200 are
+# visible at once), time-window bucketing (not trade-count -- a volume bar under a
+# trade-count-bucketed candle would be near-constant across candles, since every
+# candle would hold the same number of trades almost by construction, losing the
+# "which period was actually busy" signal a volume chart is for).
+DEFAULT_TARGET_CANDLES = 100
+
+
+def _extract_box_x_range(box_list):
+    """Plotly's `plotly_selected` box-select event payload (what Streamlit's
+    `on_select="rerun"` passes through) isn't formally documented down to the exact
+    key names, so this tries the two shapes Plotly.js is known to use rather than
+    assuming one -- returns `None` (leaving the current view alone) if neither
+    matches, rather than raising."""
+    if not box_list:
+        return None
+    b = box_list[0]
+    x = b.get("x")
+    if isinstance(x, (list, tuple)) and len(x) == 2:
+        try:
+            return float(min(x)), float(max(x))
+        except (TypeError, ValueError):
+            return None
+    x0, x1 = b.get("x0"), b.get("x1")
+    if x0 is not None and x1 is not None:
+        try:
+            return float(min(x0, x1)), float(max(x0, x1))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _render_candlestick_chart(key_prefix: str, title: str, full_start: float, full_end: float, get_candles, get_overlays=None):
+    """One candlestick + volume chart with drag-to-zoom and explicit numeric
+    start/end controls (a guaranteed-to-work alternative/fallback to dragging, and
+    a quick way to jump to an exact time -- see `_extract_box_x_range`'s doc
+    comment on why drag alone isn't relied on as the only way in).
+
+    `get_candles(view_start, view_end, target_candles) -> DataFrame` (shape:
+    `market_sim.candles.CANDLE_COLUMNS`) supplies the candle data -- lets the same
+    zoom/render logic serve both the single-run chart (computed directly from
+    in-memory trades) and the multi-leg overview (resampled from cached per-leg
+    summaries) via different callables. `get_overlays(view_start, view_end) ->
+    list[(name, t, v, dash, color)]`, if given, draws thin lines over the candles
+    (best bid/ask, fundamental value).
+
+    `key_prefix` should be unique per chart *and* per loaded result (e.g. include
+    the asset id and `result_version`) so switching to a different run/asset starts
+    at a fresh full-range view rather than keeping a stale zoom from whatever was
+    loaded before.
+    """
+    start_key, end_key, target_key = f"{key_prefix}_view_start", f"{key_prefix}_view_end", f"{key_prefix}_target_candles"
+    pending_key = f"{key_prefix}_pending_view"
+    # A view-range change requested *within* a run (Reset zoom clicked, or a
+    # drag-select resolved below) can't be written to session_state directly --
+    # Streamlit refuses once the start/end number_input widgets below have already
+    # instantiated in this same run. Both request paths instead stage the new
+    # range here and call st.rerun(); this block applies it on the *next* run,
+    # before those widgets (re)instantiate, which is allowed.
+    pending = st.session_state.pop(pending_key, None)
+    if pending is not None:
+        st.session_state[start_key], st.session_state[end_key] = pending
+
+    if start_key not in st.session_state:
+        st.session_state[start_key] = float(full_start)
+    if end_key not in st.session_state:
+        st.session_state[end_key] = float(full_end)
+    if target_key not in st.session_state:
+        st.session_state[target_key] = DEFAULT_TARGET_CANDLES
+    # Clamp to the current full range in case it shifted (e.g. session_state
+    # entries left over at a stale key) -- same reasoning as run_max_session_seconds
+    # elsewhere in this file: fix up the stored value directly, not just `value=`,
+    # since a widget with an explicit key ignores `value=` once its entry exists.
+    st.session_state[start_key] = min(max(st.session_state[start_key], float(full_start)), float(full_end))
+    st.session_state[end_key] = min(max(st.session_state[end_key], st.session_state[start_key] + 1e-9), float(full_end))
+
+    c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
+    step = max((full_end - full_start) / 100, 1.0)
+    view_start = c1.number_input("View start (s)", min_value=float(full_start), max_value=float(full_end), step=step, key=start_key)
+    view_end = c2.number_input("View end (s)", min_value=float(full_start), max_value=float(full_end), step=step, key=end_key)
+    target_candles = c3.number_input("Target candles", min_value=20, max_value=500, step=10, key=target_key, help="Chart aims to show target-2x this many candles for the current view; this is the X in 'X to 2X'.")
+    if c4.button("Reset zoom", key=f"{key_prefix}_reset_zoom"):
+        st.session_state[pending_key] = (float(full_start), float(full_end))
+        st.rerun()
+
+    if view_end <= view_start:
+        st.caption("View end must be after view start.")
+        return
+
+    candles = get_candles(view_start, view_end, int(target_candles))
+    if candles.empty:
+        st.caption("No trades in this range.")
+        return
+
+    mid = (candles["bucket_start"] + candles["bucket_end"]) / 2.0
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.04)
+    fig.add_trace(
+        go.Candlestick(x=mid, open=candles["open"], high=candles["high"], low=candles["low"], close=candles["close"], name="price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350"),
+        row=1,
+        col=1,
+    )
+    for name, ot, ov, dash, color in get_overlays(view_start, view_end) if get_overlays else []:
+        if len(ot):
+            fig.add_trace(go.Scattergl(x=ot, y=ov, mode="lines", name=name, line=dict(width=1, dash=dash, color=color)), row=1, col=1)
+    fig.add_trace(go.Bar(x=mid, y=candles["volume"], name="volume (notional)", marker_color="grey"), row=2, col=1)
+    fig.update_layout(height=440, title=title, legend=dict(orientation="h", y=1.08), margin=dict(t=60, b=20), xaxis_rangeslider_visible=False)
+    fig.update_xaxes(title_text="simulated time (s)", row=2, col=1)
+
+    avg_trades = candles["n_trades"].mean() if len(candles) else 0.0
+    resolution_note = "single-trade resolution" if avg_trades <= 1.5 else f"~{avg_trades:.1f} trades/candle on average"
+    st.caption(f"{len(candles)} candles, {view_end - view_start:,.3g}s span ({resolution_note}). Drag a box on the chart to zoom into a region, or set exact start/end above.")
+
+    event = st.plotly_chart(fig, width="stretch", key=f"{key_prefix}_chart", on_select="rerun", selection_mode="box")
+    if event and event.get("selection"):
+        box_range = _extract_box_x_range(event["selection"].get("box"))
+        if box_range and box_range[1] > box_range[0]:
+            new_start, new_end = box_range
+            if (round(new_start, 6), round(new_end, 6)) != (round(view_start, 6), round(view_end, 6)):
+                st.session_state[pending_key] = (max(float(full_start), new_start), min(float(full_end), new_end))
+                st.rerun()
 
 
 if "cfg" not in st.session_state:
@@ -495,7 +690,7 @@ with st.sidebar:
                 _activate_result(result, loaded["meta"].get("config_toml", ""), f"Loaded from {os.path.relpath(pick, REPO_ROOT)}", save_path=pick)
                 st.rerun()
 
-tab_setup, tab_pop, tab_advanced, tab_results = st.tabs(["Run & Market Setup", "Bot Population", "Advanced (raw TOML)", "Results"])
+tab_setup, tab_pop, tab_advanced, tab_results, tab_overview = st.tabs(["Run & Market Setup", "Bot Population", "Advanced (raw TOML)", "Results", "Multi-leg overview"])
 
 # ---------------------------------------------------------------------------------
 # Tab: Run & Market Setup
@@ -779,69 +974,61 @@ def _render_results_tab():
 
     @st.fragment
     def _render_price_volume():
-        """Its own fragment: rebuilding every asset's Plotly figures (each with
-        several downsampled traces) is the single most expensive thing in this tab,
-        so it should only happen when a chart control changes -- not on every
-        keystroke in the unrelated Trade search box below, which (before this split)
-        forced the *whole* Results tab, charts included, to re-render on every single
-        character typed."""
-        st.subheader("Price & volume (zoom: drag to select, double-click to reset, scroll to zoom)")
+        """Its own fragment: rebuilding every asset's Plotly figures is the single
+        most expensive thing in this tab, so it should only happen when a chart
+        control changes -- not on every keystroke in the unrelated Trade search box
+        below, which (before this split) forced the *whole* Results tab, charts
+        included, to re-render on every single character typed."""
+        st.subheader("Price & volume (candlestick -- drag to zoom in, Reset zoom to back out)")
         if trades.empty:
             st.warning("No trades occurred in this run.")
             return
-        c1, c2, c3 = st.columns(3)
-        show_fundamental = c1.checkbox(
+        show_fundamental = st.checkbox(
             "Show fundamental value",
             value=False,
             key="show_fundamental",
             help="Off by default: the fundamental process is often far more volatile than the traded price, and including it in the chart drags the y-axis scale out so the actual price line looks flat.",
         )
-        show_book = c2.checkbox("Show best bid/ask", value=True, key="show_book")
-        max_points = c3.number_input(
-            "Max points per line",
-            value=3000,
-            min_value=200,
-            max_value=50_000,
-            step=500,
-            key="max_chart_points",
-            help="Long sessions can produce hundreds of thousands of trades per asset -- plotting every single one is what makes charts slow to render and pan/zoom. Each line is downsampled to at most this many points, keeping each bucket's min AND max so spikes (e.g. a liquidation cascade) stay visible instead of being smoothed away.",
-        )
-        total_trades = len(trades)
-        if total_trades > max_points:
-            st.caption(f"{total_trades:,} trades total -- price/book lines below are downsampled to ~{max_points:,} points each for rendering speed. Volume bars are always pre-aggregated (300 buckets), not affected.")
+        show_book = st.checkbox("Show best bid/ask", value=True, key="show_book")
 
         for aid in sorted(trades["asset_id"].unique()):
             sub = trades[trades["asset_id"] == aid].sort_values("time")
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.04)
-            t_ds, y_ds = _downsample_minmax(sub["time"], sub["price"], max_points)
-            fig.add_trace(go.Scattergl(x=t_ds, y=y_ds, mode="lines", name="trade price", line=dict(width=1)), row=1, col=1)
+            t_arr = sub["time"].to_numpy()
+            price_arr = sub["price"].to_numpy()
+            notional_arr = (sub["price"] * sub["qty"]).to_numpy()
+            asset_snap = snapshots[snapshots["asset_id"] == aid] if not snapshots.empty else snapshots
 
-            if not snapshots.empty:
-                snap = snapshots[(snapshots["asset_id"] == aid) & (snapshots["level"] == 0)]
+            def get_candles(view_start, view_end, target_candles, t_arr=t_arr, price_arr=price_arr, notional_arr=notional_arr):
+                return candles_from_trades(t_arr, price_arr, notional_arr, view_start, view_end, target_candles)
+
+            def get_overlays(view_start, view_end, asset_snap=asset_snap):
+                overlays = []
+                if asset_snap.empty:
+                    return overlays
+                snap0 = asset_snap[asset_snap["level"] == 0]
+                in_view = (snap0["time"] >= view_start) & (snap0["time"] <= view_end)
+                snap0 = snap0[in_view]
                 if show_book:
-                    for side, color in [("bid", "rgba(0,150,0,0.6)"), ("ask", "rgba(200,0,0,0.6)")]:
-                        s = snap[snap["side"] == side].sort_values("time")
+                    for side, color in [("bid", "rgba(0,150,0,0.7)"), ("ask", "rgba(200,0,0,0.7)")]:
+                        s = snap0[snap0["side"] == side].sort_values("time")
                         if not s.empty:
-                            t_b, y_b = _downsample_minmax(s["time"], s["price"], max_points)
-                            fig.add_trace(go.Scattergl(x=t_b, y=y_b, mode="lines", name=f"best {side}", line=dict(width=0.6, color=color)), row=1, col=1)
+                            t_b, y_b = _downsample_minmax(s["time"], s["price"], 2000)
+                            overlays.append((f"best {side}", t_b, y_b, "solid", color))
                 if show_fundamental:
-                    fair = snap[snap["side"] == "fundamental"].sort_values("time")
+                    fair = snap0[snap0["side"] == "fundamental"].sort_values("time")
                     if not fair.empty:
-                        t_f, y_f = _downsample_minmax(fair["time"], fair["price"], max_points)
-                        fig.add_trace(go.Scattergl(x=t_f, y=y_f, mode="lines", name="fundamental value", line=dict(width=1, dash="dot", color="grey")), row=1, col=1)
+                        t_f, y_f = _downsample_minmax(fair["time"], fair["price"], 2000)
+                        overlays.append(("fundamental value", t_f, y_f, "dot", "grey"))
+                return overlays
 
-            notional = sub["price"] * sub["qty"]
-            n_buckets = 300
-            t_min, t_max = sub["time"].min(), sub["time"].max()
-            width = max((t_max - t_min) / n_buckets, 1e-9)
-            bucket = ((sub["time"] - t_min) / width).astype(int).clip(upper=n_buckets - 1)
-            vol_by_bucket = notional.groupby(bucket).sum()
-            bucket_t = t_min + (vol_by_bucket.index.values + 0.5) * width
-            fig.add_trace(go.Bar(x=bucket_t, y=vol_by_bucket.values, name="volume (notional)", marker_color="grey"), row=2, col=1)
-
-            fig.update_layout(height=420, title=f"{asset_names.get(aid, f'asset {aid}')}", legend=dict(orientation="h", y=1.08), margin=dict(t=60, b=20))
-            fig.update_xaxes(title_text="simulated time (s)", row=2, col=1)
-            st.plotly_chart(fig, width="stretch", key=f"chart_{aid}")
+            _render_candlestick_chart(
+                key_prefix=f"chart_{aid}_{version}",
+                title=asset_names.get(aid, f"asset {aid}"),
+                full_start=float(t_arr.min()),
+                full_end=float(t_arr.max()),
+                get_candles=get_candles,
+                get_overlays=get_overlays,
+            )
 
     _render_price_volume()
 
@@ -941,3 +1128,89 @@ def _render_results_tab():
 
 with tab_results:
     _render_results_tab()
+
+# ---------------------------------------------------------------------------------
+# Tab: Multi-leg overview -- view an entire run_scenario_in_legs sequence at once
+# (e.g. all 300,000s of a 200-leg run) without loading every leg's full trade data
+# into memory simultaneously: each leg contributes only a small, cached candle
+# summary (see _leg_candle_summary above), composed into one candlestick chart via
+# the same _render_candlestick_chart used by the Results tab's single-run chart.
+# ---------------------------------------------------------------------------------
+with tab_overview:
+    st.caption(
+        "View an entire multi-leg run (e.g. all 300,000s of a 200-leg run) as one candlestick chart, without "
+        "loading every leg's full trade data at once -- each leg contributes a small cached OHLC summary "
+        f"({_LEG_SUMMARY_CANDLES} candles), composed together. Zooming narrower than a leg's own summary "
+        "resolution won't reveal more detail -- use \"Load this leg\" below once you've zoomed into one, to "
+        "switch to the Results tab's chart for full single-trade resolution on that leg specifically."
+    )
+    groups = _group_saved_runs(_discover_saved_runs())
+    multi_leg_groups = {k: v for k, v in groups.items() if len(v) > 1}
+    if not multi_leg_groups:
+        st.info("No multi-leg runs found under runs/ yet -- use `market_sim.run_scenario_in_legs` (see README) to create one.")
+    else:
+        group_key = st.selectbox("Multi-leg run", list(multi_leg_groups), format_func=lambda p: os.path.relpath(p, RUNS_ROOT), key="overview_group")
+        leg_dirs = tuple(multi_leg_groups[group_key])
+        group_label = os.path.relpath(group_key, RUNS_ROOT)
+        chart_key_prefix = f"overview_{re.sub(r'[^0-9A-Za-z_]', '_', group_label)}"
+        st.caption(f"{len(leg_dirs)} legs found under `{group_label}`.")
+
+        # Reading each leg's asset list needs at least the leg's metadata (cheap --
+        # JSON, not parquet); pull available asset ids from the *first* leg only
+        # (every leg in a sequence shares the same population/asset config).
+        with open(os.path.join(leg_dirs[0], "run_metadata.json")) as f:
+            first_leg_meta = json.load(f)
+        try:
+            first_cfg = toml.loads(first_leg_meta.get("config_toml", ""))
+            asset_options = {i: a.get("symbol", f"asset {i}") for i, a in enumerate(first_cfg.get("assets", []))}
+        except toml.TomlDecodeError:
+            asset_options = {}
+        if not asset_options:
+            asset_options = {0: "asset 0"}
+        asset_id = st.selectbox("Asset", list(asset_options), format_func=lambda a: asset_options.get(a, str(a)), key="overview_asset")
+
+        if st.button("Build overview", key="overview_build_btn"):
+            with st.spinner(f"Summarizing {len(leg_dirs)} legs (cached after first time, ~0.1-0.2s/leg the first time)..."):
+                _warm_leg_summaries(leg_dirs)
+                _multi_leg_candles_for_asset(leg_dirs, asset_id)
+            st.session_state["overview_built"] = (group_key, asset_id)
+
+        built = st.session_state.get("overview_built")
+        if built == (group_key, asset_id):
+            candles_all = _multi_leg_candles_for_asset(leg_dirs, asset_id)
+            if candles_all.empty:
+                st.warning("No trades found for this asset across these legs.")
+            else:
+                full_start, full_end = float(candles_all["bucket_start"].min()), float(candles_all["bucket_end"].max())
+
+                def get_overview_candles(view_start, view_end, target_candles, candles_all=candles_all):
+                    return resample_candles(candles_all, view_start, view_end, target_candles)
+
+                chart_key = f"{chart_key_prefix}_{asset_id}"
+                _render_candlestick_chart(
+                    key_prefix=chart_key,
+                    title=f"{asset_options.get(asset_id, asset_id)} -- {group_label} (all {len(leg_dirs)} legs)",
+                    full_start=full_start,
+                    full_end=full_end,
+                    get_candles=get_overview_candles,
+                )
+
+                # Once the view has narrowed to within a single leg's own span,
+                # offer to load that leg's full trade data for genuine
+                # single-trade-resolution drill-down via the Results tab.
+                view_start = st.session_state.get(f"{chart_key}_view_start", full_start)
+                view_end = st.session_state.get(f"{chart_key}_view_end", full_end)
+                containing_legs = []
+                for d in leg_dirs:
+                    leg_summary = _leg_candle_summary(d).get(asset_id)
+                    if leg_summary is not None and not leg_summary.empty and leg_summary["bucket_start"].min() <= view_end and leg_summary["bucket_end"].max() >= view_start:
+                        containing_legs.append(d)
+                if len(containing_legs) == 1:
+                    leg_dir = containing_legs[0]
+                    if st.button(f"📂 Load {os.path.relpath(leg_dir, RUNS_ROOT)} for full detail", key="overview_load_leg_btn"):
+                        loaded = load_run(leg_dir)
+                        result = _loaded_run_to_result(loaded)
+                        _activate_result(result, loaded["meta"].get("config_toml", ""), f"Loaded from {os.path.relpath(leg_dir, REPO_ROOT)}", save_path=leg_dir)
+                        st.success("Loaded -- switch to the Results tab to see it at full single-trade resolution.")
+                elif len(containing_legs) > 1:
+                    st.caption(f"Current view spans {len(containing_legs)} legs -- zoom in further (narrow the view to within one leg's span) to load it for full detail.")

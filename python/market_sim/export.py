@@ -111,6 +111,17 @@ def df_to_columnar(df: pd.DataFrame) -> Dict[str, Any]:
     return {col: df[col].to_numpy() for col in df.columns}
 
 
+def load_trades_columns(out_dir: str, columns=("asset_id", "time", "price", "qty")) -> pd.DataFrame:
+    """Reads just the given columns of a saved run's `trades.parquet` -- parquet
+    supports column projection at the file-read level, so this skips
+    deserializing the other columns (the bot-type/variant/agent-id strings and
+    ids) entirely rather than reading the full table and discarding most of it.
+    For the dashboard's per-leg candlestick summaries (only time/price/qty/
+    asset_id are needed), this matters: those other columns are most of a
+    trades.parquet's bytes."""
+    return pd.read_parquet(export_paths(out_dir).trades, columns=list(columns))
+
+
 def load_run(out_dir: str) -> Dict[str, Any]:
     """Read a previously exported run back in (DataFrames + metadata dict), without
     re-running the simulation -- what `market_health/` operates on. Also loads the
