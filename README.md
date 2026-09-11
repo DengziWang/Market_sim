@@ -297,11 +297,13 @@ near-constant across candles the way trade-count-based bucketing would be (a rea
 concern raised and fixed during design: with trade-count buckets, every candle
 holds the same number of trades almost by construction, so the volume chart loses
 the "which period was actually busy" signal). A "Chart type" toggle switches
-between candlestick and a plain line (connecting each bucket's close price) --
-same underlying bucketed data either way, just drawn differently for readers who
-find a line easier to scan than OHLC; neither mode ever plots raw per-trade points,
-only the current view's target-candle-count-bounded buckets, so "Line" is not a
-return to the old unbounded raw-trade line from before the candlestick rebuild.
+between candlestick and a plain line -- the line traces each bucket's `mean`
+price, a genuine time-span average of every trade in that bucket (not a single
+representative trade like `open`/`close`, not a `high`/`low` extremum, and not a
+volume-weighted average either -- a plain arithmetic mean, matching how the line
+chart looked before the candlestick rebuild). Both modes share the same
+bucketing, so neither ever plots raw per-trade points -- only the current view's
+target-candle-count-bounded buckets.
 
 Bucket width isn't a fixed global grid -- it's recomputed for whatever time range
 is currently in view: `width = view_span / target_candle_count` (default target
@@ -330,23 +332,43 @@ toggle and adaptive zoom both work identically in this composed mode.
 
 Once you've zoomed to within a single leg's span, a "Load for full detail" button
 switches that chart specifically into single-leg mode: that leg's actual trade
-data, genuine single-trade-resolution zoom, trade search, agent state, and that
-leg's own `market_health` metrics. A "Back to whole-run overview" button returns
-to the composed view without re-reading anything (the per-leg summaries are
-already cached). Loading any *other* run (a fresh run, a different saved run, a
-different leg picked from the sidebar) resets back to whole-run-overview-by-
-default for whatever multi-leg group it belongs to, if any.
+data, genuine single-trade-resolution zoom, and (see below) whole-run trade search
+and market-health metrics. A "Back to whole-run overview" button returns to the
+composed view without re-reading anything (the per-leg summaries are already
+cached). Loading any *other* run (a fresh run, a different saved run, a different
+leg picked from the sidebar) resets back to whole-run-overview-by-default for
+whatever multi-leg group it belongs to, if any.
 
 **Market-health metrics across a multi-leg run**: rather than one merged whole-run
 composite (which runs into real boundary-handling issues for some metrics --
 autocorrelation-based efficiency measures and resilience/recovery timing right at
-a leg boundary need special treatment to stay exactly correct, see git history for
-the fuller analysis), the Results tab keeps a running **list of the legs you've
-actually loaded for full detail**, one row per leg, each with its own already-
-correct `market_health.compute_run_metrics` output -- a comparison table that
-grows as you drill into more legs, never computed for the whole run's legs up
-front (that would mean reading every leg's full trade/order-event/snapshot/agent-
-state data at once, exactly what splitting into legs was meant to avoid).
+a leg boundary need special treatment to stay exactly correct), each leg keeps its
+own already-correct `market_health.compute_run_metrics` output, shown as **one
+line chart per metric across every leg** (grouped by report dimension, in
+expanders) -- a genuine list of sessions, not one number that hides how it
+changes over the run's whole length. This is real work, not the ~15-20s/200-legs
+cost the candle overview has: `compute_run_metrics` needs every export file (not
+just `trades.parquet`), measured on this machine's real 200-leg run at ~2s to
+load + ~11-13s to compute *per leg*. So it's an explicit "Compute market-health
+for the remaining N legs" button (with an honest time estimate before you click),
+parallelized (`ThreadPoolExecutor`, 4 workers -- this is CPU-bound pandas/numpy
+work, not I/O-bound like the candle summaries, so more threads than cores doesn't
+help), and cached per leg afterward so it's a one-time cost per dashboard process.
+Loading a leg for full detail also computes (and caches) that one leg's metrics as
+a side effect, same as before.
+
+**Trade search across an entire multi-leg run**: a checkbox on the Trade search
+table extends it from "this one loaded leg" to "every leg" -- each leg's
+`trades.parquet` is read and filtered in turn (not just the four candle-summary
+columns; search needs bot-type/agent-id/side too), keeping only the matching rows,
+never holding more than a small batch of legs' full trade tables in memory at
+once. Measured ~0.5s/leg to read a full `trades.parquet` (~100s serially for 200
+legs, well under the market-health cost above) -- and since an unfiltered or very
+permissive search would otherwise match literally every trade in every leg
+(reintroducing the exact unbounded-memory problem splitting into legs exists to
+avoid), the scan stops as soon as 5,000 matches are found, same as the existing
+single-leg display cap, with a note that the result may be incomplete so you know
+to narrow the filters rather than trusting a partial count silently.
 
 ## Configuration format
 

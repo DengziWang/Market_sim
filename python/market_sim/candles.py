@@ -31,7 +31,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-CANDLE_COLUMNS = ["bucket_start", "bucket_end", "open", "high", "low", "close", "volume", "n_trades"]
+CANDLE_COLUMNS = ["bucket_start", "bucket_end", "open", "high", "low", "close", "mean", "volume", "n_trades"]
 
 
 def _bucket_index(t: np.ndarray, view_start: float, view_end: float, target_buckets: int) -> tuple[np.ndarray, float, int]:
@@ -87,14 +87,23 @@ def candles_from_trades(
     # over contiguous runs, not a hash-based grouping.
     starts = np.concatenate(([0], np.flatnonzero(np.diff(idx)) + 1))
     ends = np.concatenate((starts[1:], [len(p)]))
+    counts = ends - starts
     agg = pd.DataFrame(
         {
             "open": p[starts],
             "high": np.maximum.reduceat(p, starts),
             "low": np.minimum.reduceat(p, starts),
             "close": p[ends - 1],
+            # Plain arithmetic mean of trade prices within the bucket -- the line
+            # chart's y-value (see dashboard.py's Line chart-type mode): a genuine
+            # time-span average, not a single representative trade (close/open) or
+            # a min/max extremum, per the user's explicit preference. Composes
+            # exactly under `resample_candles` below via a count-weighted average
+            # of sub-bucket means, since that's arithmetically identical to
+            # averaging the underlying individual trade prices directly.
+            "mean": np.add.reduceat(p, starts) / counts,
             "volume": np.add.reduceat(q, starts),
-            "n_trades": ends - starts,
+            "n_trades": counts,
         },
         index=idx[starts],
     )
@@ -111,6 +120,7 @@ def candles_from_trades(
     out["open"] = out["open"].fillna(out["close"])
     out["high"] = out["high"].fillna(out["close"])
     out["low"] = out["low"].fillna(out["close"])
+    out["mean"] = out["mean"].ffill().bfill()
     out["volume"] = out["volume"].fillna(0.0)
     out["n_trades"] = out["n_trades"].fillna(0).astype(int)
     return out[CANDLE_COLUMNS]
@@ -131,6 +141,12 @@ def resample_candles(candles: pd.DataFrame, view_start: float, view_end: float, 
     if c.empty:
         return _empty_candles()
     c = c.sort_values("bucket_start")
+    # Count-weighted mean of the sub-buckets' own means -- exactly equal to the
+    # plain average of every underlying individual trade price, since each
+    # sub-bucket's "mean" is itself already an unweighted average over its
+    # n_trades. Computed before groupby so it aggregates as a plain sum like the
+    # other columns.
+    c["_mean_x_n"] = c["mean"] * c["n_trades"]
     midpoint = (c["bucket_start"] + c["bucket_end"]) / 2.0
     idx, width, n_buckets = _bucket_index(midpoint.to_numpy(), view_start, view_end, target_candles)
     c["bucket"] = idx
@@ -140,6 +156,7 @@ def resample_candles(candles: pd.DataFrame, view_start: float, view_end: float, 
         high=("high", "max"),
         low=("low", "min"),
         close=("close", "last"),
+        mean_x_n=("_mean_x_n", "sum"),
         volume=("volume", "sum"),
         n_trades=("n_trades", "sum"),
     )
@@ -151,6 +168,8 @@ def resample_candles(candles: pd.DataFrame, view_start: float, view_end: float, 
     out["open"] = out["open"].fillna(out["close"])
     out["high"] = out["high"].fillna(out["close"])
     out["low"] = out["low"].fillna(out["close"])
+    out["mean"] = (out["mean_x_n"] / out["n_trades"]).where(out["n_trades"] > 0)
+    out["mean"] = out["mean"].ffill().bfill()
     out["volume"] = out["volume"].fillna(0.0)
     out["n_trades"] = out["n_trades"].fillna(0).astype(int)
     return out[CANDLE_COLUMNS]

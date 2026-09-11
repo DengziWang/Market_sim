@@ -23,6 +23,7 @@ def test_single_bucket_basic_ohlcv():
     assert row["high"] == 105.0
     assert row["low"] == 95.0
     assert row["close"] == 102.0
+    assert row["mean"] == pytest.approx((100.0 + 105.0 + 95.0 + 102.0) / 4)
     assert row["volume"] == 10.0
     assert row["n_trades"] == 4
 
@@ -102,8 +103,19 @@ def test_resample_composing_fine_candles_matches_direct_coarse_computation():
     np.testing.assert_allclose(coarse_via_resample["high"].to_numpy(), coarse_direct["high"].to_numpy(), rtol=1e-9)
     np.testing.assert_allclose(coarse_via_resample["low"].to_numpy(), coarse_direct["low"].to_numpy(), rtol=1e-9)
     np.testing.assert_allclose(coarse_via_resample["close"].to_numpy(), coarse_direct["close"].to_numpy(), rtol=1e-9)
+    np.testing.assert_allclose(coarse_via_resample["mean"].to_numpy(), coarse_direct["mean"].to_numpy(), rtol=1e-6)
     np.testing.assert_allclose(coarse_via_resample["volume"].to_numpy(), coarse_direct["volume"].to_numpy(), rtol=1e-6)
     np.testing.assert_array_equal(coarse_via_resample["n_trades"].to_numpy(), coarse_direct["n_trades"].to_numpy())
+
+
+def test_mean_is_plain_average_of_trade_prices_in_bucket():
+    # Unweighted mean of the raw trade prices, not close/open, and not
+    # volume-weighted -- a genuine time-span average, per its docstring.
+    time = np.array([1.0, 2.0, 3.0])
+    price = np.array([100.0, 200.0, 300.0])
+    qty = np.array([1.0, 50.0, 1.0])  # deliberately lopsided qty -- must not skew "mean"
+    out = candles_from_trades(time, price, qty, view_start=0.0, view_end=10.0, target_candles=1)
+    assert out.iloc[0]["mean"] == pytest.approx(200.0)  # (100+200+300)/3, not qty-weighted
 
 
 def test_resample_composes_multiple_concatenated_leg_summaries():

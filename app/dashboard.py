@@ -36,6 +36,7 @@ from market_sim.candles import candles_from_trades, resample_candles
 from market_sim.export import df_to_columnar, export_run, load_run, load_trades_columns
 from market_sim.runner import combine_results, discover_legs, run_scenario_in_legs
 import market_health
+from market_health.score import DIMENSION_OF
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCENARIOS = {
@@ -281,12 +282,10 @@ def _activate_result(result: dict, config_toml: str, source: str, save_path: str
     # detail", sets this back to True itself right after calling this function.
     st.session_state.leg_drilldown = False
     # If this is one leg of a multi-leg sequence, remember its metrics permanently
-    # (keyed by leg dir) so the Results tab can show a running list across every
-    # leg the user has actually loaded for full detail -- see the "Market-health
-    # metrics" section below. Deliberately NOT computed for every leg up front
-    # (that would mean reading every leg's full trade/order-event/snapshot/
-    # agent-state data at once, exactly what splitting into legs was meant to
-    # avoid) -- it only grows as legs get loaded.
+    # (keyed by leg dir) so the Results tab's per-metric line charts across legs
+    # (see _render_market_health/_compute_all_leg_metrics) count this leg as
+    # already known and don't recompute it -- this dict also grows in bulk via
+    # the "Compute market-health for the remaining N legs" button there.
     leg_group = _leg_group_for_path(save_path)
     if leg_group:
         st.session_state.setdefault("leg_metrics_by_dir", {})[save_path] = dict(st.session_state.metrics)
@@ -398,6 +397,131 @@ def _warm_leg_summaries(leg_dirs) -> None:
     # membership separately, and cheap enough not to matter.
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         list(ex.map(_leg_candle_summary, leg_dirs))
+
+
+@st.cache_resource(show_spinner=False, max_entries=2000)
+def _leg_market_health(leg_dir: str) -> dict:
+    """Full `market_health.compute_run_metrics` for one leg -- unlike
+    `_leg_candle_summary` above (which reads only 4 narrow columns), this loads
+    every export file (trades, order_events, snapshots, agent_state) for the leg
+    and runs the full report metric suite on it. Measured on this machine's real
+    200-leg run: ~2s to load + ~11-13s to compute per leg (~1.2-1.5M trades,
+    ~8M order events each) -- genuinely heavy, not the sub-second-per-leg cost
+    `_leg_candle_summary` has, which is why computing this for *every* leg is an
+    explicit opt-in action (see `_compute_all_leg_metrics`) with a real progress
+    bar, not something done silently on every render the way the candle overview
+    is. Cached per leg (process-wide, like `_leg_candle_summary`) so it's a
+    one-time cost per leg per dashboard process, not per rerun."""
+    loaded = load_run(leg_dir)
+    run = {
+        "trades": loaded["trades"],
+        "order_events": loaded["order_events"],
+        "orderbook_snapshots": loaded["orderbook_snapshots"],
+        "agent_state": loaded["agent_state"],
+    }
+    return market_health.compute_run_metrics(run)
+
+
+def _compute_all_leg_metrics(leg_dirs: tuple, known: dict) -> dict:
+    """Computes `_leg_market_health` for every leg in `leg_dirs` not already in
+    `known`, showing a live progress bar as legs complete (unlike
+    `_warm_leg_summaries`'s silent spinner -- appropriate there since it's a
+    ~15-20s one-time cost; this can genuinely take many minutes for a large
+    multi-leg run, so a static spinner with no feedback would look hung).
+    `max_workers=4`, not 8 like the candle summaries: this is CPU-heavy pandas/
+    numpy work (variance ratio, autocorrelation, VPIN, Benford, ...), not
+    I/O-bound parquet reads, so oversubscribing threads past the machine's core
+    count buys nothing and can even slow things down via contention. Returns a
+    NEW dict merging `known` with whatever got computed (callers should assign
+    this back into session_state)."""
+    import concurrent.futures
+
+    todo = [d for d in leg_dirs if d not in known]
+    out = dict(known)
+    if not todo:
+        return out
+    progress_bar = st.progress(0.0)
+    status = st.empty()
+    status.caption(f"Computing market-health for {len(todo)} legs (0/{len(todo)})...")
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(_leg_market_health, d): d for d in todo}
+        for fut in concurrent.futures.as_completed(futures):
+            d = futures[fut]
+            out[d] = fut.result()
+            done += 1
+            progress_bar.progress(done / len(todo))
+            status.caption(f"Computing market-health for {len(todo)} legs ({done}/{len(todo)})...")
+    progress_bar.empty()
+    status.empty()
+    return out
+
+
+def _leg_group_time_range(leg_dirs: tuple) -> tuple[float, float]:
+    """Whole-group [min, max] simulated time, from the already-cached (or cheaply
+    computed) per-leg candle summaries -- no trades.parquet re-read needed, unlike
+    the actual search below."""
+    _warm_leg_summaries(leg_dirs)
+    starts, ends = [], []
+    for d in leg_dirs:
+        for df in _leg_candle_summary(d).values():
+            if not df.empty:
+                starts.append(df["bucket_start"].min())
+                ends.append(df["bucket_end"].max())
+    return (float(min(starts)), float(max(ends))) if starts else (0.0, 1.0)
+
+
+_TRADE_SEARCH_COLS = ["asset_id", "price", "qty", "taker_side", "maker_agent_id", "taker_agent_id", "maker_type", "maker_variant", "taker_type", "taker_variant"]
+
+
+def _search_all_legs(leg_dirs: tuple, asset_filter, bot_type_filter, agent_id_val, free_text: str, time_range: tuple, qty_min: float, row_cap: int = 5000, batch_size: int = 16):
+    """Streams every leg's `trades.parquet` (all columns -- unlike the narrow
+    time/price/qty/asset_id read the candle summaries use, search needs the
+    bot-type/agent-id/side columns too), applies the same filters `_render_trade_
+    search` uses per leg, and keeps only the matches -- never holds more than
+    `batch_size` legs' full trades tables in memory at once (processed in
+    batches, not all 200+ dispatched to the thread pool simultaneously), and
+    stops scanning further legs once `row_cap` matches are already found (a
+    permissive-enough filter, e.g. no free text and no other filters, would
+    otherwise match literally every trade in every leg -- reintroducing the same
+    unbounded-memory problem splitting into legs exists to avoid). Measured on
+    this machine's real 200-leg run: ~0.5s/leg to read a full trades.parquet
+    (~100s serially for 200 legs, well under market-health's per-leg cost),
+    parallelized here the same way the candle summaries are.
+
+    Returns `(matches_df, legs_scanned, total_legs, stopped_early)`."""
+    import concurrent.futures
+
+    def one(leg_dir):
+        df = pd.read_parquet(os.path.join(leg_dir, "trades.parquet"))
+        f = df[(df["time"] >= time_range[0]) & (df["time"] <= time_range[1]) & (df["qty"] >= qty_min)]
+        if asset_filter:
+            f = f[f["asset_id"].isin(asset_filter)]
+        if bot_type_filter:
+            f = f[f["maker_type"].isin(bot_type_filter) | f["taker_type"].isin(bot_type_filter)]
+        if agent_id_val is not None:
+            f = f[(f["maker_agent_id"] == agent_id_val) | (f["taker_agent_id"] == agent_id_val)]
+        if free_text.strip():
+            combined = f[_TRADE_SEARCH_COLS[0]].astype(str)
+            for col in _TRADE_SEARCH_COLS[1:]:
+                combined = combined + " " + f[col].astype(str)
+            f = f[combined.str.lower().str.contains(free_text.lower(), regex=False, na=False)]
+        return f
+
+    parts, legs_scanned, total = [], 0, 0
+    stopped_early = False
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        for i in range(0, len(leg_dirs), batch_size):
+            batch = leg_dirs[i : i + batch_size]
+            for part in ex.map(one, batch):
+                parts.append(part)
+                total += len(part)
+                legs_scanned += 1
+            if total >= row_cap:
+                stopped_early = legs_scanned < len(leg_dirs)
+                break
+    matches = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=_TRADE_SEARCH_COLS + ["time"])
+    return matches, legs_scanned, len(leg_dirs), stopped_early
 
 
 @st.cache_resource(show_spinner=False, max_entries=16)
@@ -568,7 +692,12 @@ def _render_candlestick_chart(key_prefix: str, title: str, full_start: float, fu
             col=1,
         )
     else:
-        fig.add_trace(go.Scattergl(x=mid, y=candles["close"], mode="lines", name="price", line=dict(width=1.5, color="#1f77b4")), row=1, col=1)
+        # "mean", not "close": a genuine time-span average of the trade prices in
+        # each bucket, matching how the line chart worked before the candlestick
+        # rebuild (smooth, representative of the whole bucket) rather than
+        # plotting a single representative trade (the bucket's last trade, which
+        # is what "close" is) or a min/max extremum.
+        fig.add_trace(go.Scattergl(x=mid, y=candles["mean"], mode="lines", name="price", line=dict(width=1.5, color="#1f77b4")), row=1, col=1)
     for name, ot, ov, dash, color in get_overlays(view_start, view_end) if get_overlays else []:
         if len(ot):
             fig.add_trace(go.Scattergl(x=ot, y=ov, mode="lines", name=name, line=dict(width=1, dash=dash, color=color)), row=1, col=1)
@@ -1291,26 +1420,65 @@ def _render_results_tab():
 
     _render_price_volume()
 
-    st.subheader("Market-health metrics")
-    leg_group_active = _leg_group_for_path(st.session_state.last_save_path)
-    if leg_group_active:
-        history = {d: m for d, m in st.session_state.leg_metrics_by_dir.items() if os.path.dirname(d) == leg_group_active}
-        st.caption(
-            "One row per leg you've loaded for full detail in this session (not the whole run -- computing "
-            "this for every leg would mean reading every leg's full trade/order-event/snapshot/agent-state "
-            "data at once, exactly what splitting into legs was meant to avoid). Load more legs above to add rows."
-        )
-        if history:
-            hist_df = pd.DataFrame(history).T
-            hist_df.index = [os.path.relpath(d, RUNS_ROOT) for d in history]
-            hist_df = hist_df.sort_index()
-            st.dataframe(hist_df, width="stretch", height=300)
-        else:
-            st.caption("No legs loaded yet -- load one above to see its metrics here.")
-        st.markdown(f"**Currently loaded leg** ({os.path.relpath(st.session_state.last_save_path, RUNS_ROOT)}):")
-    if st.session_state.metrics:
-        metrics_df = pd.DataFrame(sorted(st.session_state.metrics.items()), columns=["metric", "value"])
-        st.dataframe(metrics_df, width="stretch", height=300)
+    @st.fragment
+    def _render_market_health():
+        """Its own fragment for the same reason as _render_price_volume/
+        _render_trade_search: the "compute all legs" action below can genuinely
+        run for minutes (see _leg_market_health's docstring) and shouldn't force
+        the price chart or trade search to rebuild alongside it."""
+        st.subheader("Market-health metrics")
+        leg_group_active = _leg_group_for_path(st.session_state.last_save_path)
+        if leg_group_active:
+            leg_dirs_active = tuple(_group_saved_runs(_discover_saved_runs()).get(leg_group_active, []))
+            known = {d: m for d, m in st.session_state.leg_metrics_by_dir.items() if d in leg_dirs_active}
+            n_missing = len(leg_dirs_active) - len(known)
+            st.caption(
+                f"{len(known)}/{len(leg_dirs_active)} legs have market-health metrics computed, shown below as "
+                "one line chart per metric across legs (a genuine list of sessions, not one merged whole-run "
+                "number -- a few metrics, like autocorrelation-based efficiency and resilience timing, don't "
+                "compose cleanly across a leg boundary, so per-leg is the honest, always-correct unit here)."
+            )
+            if n_missing > 0:
+                # ~13-15s/leg measured serially on this machine's real 200-leg run
+                # (~2s load + ~11-13s compute), ~4x parallel via _compute_all_leg_metrics.
+                est_minutes = n_missing * 14 / 4 / 60
+                st.caption(
+                    f"Computing all of them is genuinely heavy (~14s/leg of real work, this machine's own "
+                    f"measurement) -- estimated ~{est_minutes:.1f} min for the remaining {n_missing} legs, "
+                    "hence a button rather than automatic on every view. Cached per leg afterward."
+                )
+                if st.button(f"📊 Compute market-health for the remaining {n_missing} legs", key="compute_all_leg_metrics_btn"):
+                    st.session_state.leg_metrics_by_dir.update(_compute_all_leg_metrics(leg_dirs_active, known))
+                    # A plain full-page rerun, not scope="fragment" -- that scope is
+                    # only legal during an actual fragment-triggered rerun, not this
+                    # first pass through the fragment (Streamlit raises
+                    # StreamlitInvalidLayoutContextError otherwise, caught by testing
+                    # against a real click rather than assuming). `known`/`hist_df`
+                    # below are computed from session_state at the top of this
+                    # fragment call, so a full rerun (which re-executes this fragment
+                    # too) is what actually picks up the just-computed legs.
+                    st.rerun()
+            if known:
+                hist_df = pd.DataFrame({os.path.basename(d): known[d] for d in sorted(leg_dirs_active) if d in known}).T
+                hist_df.index.name = "leg"
+                by_dim: dict[str, list[str]] = {}
+                for col in hist_df.columns:
+                    by_dim.setdefault(DIMENSION_OF.get(col.split(".", 1)[0], "other"), []).append(col)
+                for dim in sorted(by_dim):
+                    with st.expander(f"{dim} ({len(by_dim[dim])} metrics across {len(hist_df)} legs)"):
+                        grid = st.columns(3)
+                        for i, metric in enumerate(sorted(by_dim[dim])):
+                            with grid[i % 3]:
+                                st.caption(metric)
+                                st.line_chart(hist_df[[metric]], height=180)
+                with st.expander("Raw table (every computed leg x every metric)"):
+                    st.dataframe(hist_df, width="stretch", height=300)
+            st.markdown(f"**Currently loaded leg** ({os.path.relpath(st.session_state.last_save_path, RUNS_ROOT)}):")
+        if st.session_state.metrics:
+            metrics_df = pd.DataFrame(sorted(st.session_state.metrics.items()), columns=["metric", "value"])
+            st.dataframe(metrics_df, width="stretch", height=300)
+
+    _render_market_health()
 
     st.subheader("Human involvement by asset")
     if trades.empty:
@@ -1345,7 +1513,24 @@ def _render_results_tab():
         character -- the main source of the in-browser lag this whole section of
         changes was about fixing."""
         st.subheader("Trade search")
-        if trades.empty:
+
+        leg_group_search = _leg_group_for_path(st.session_state.last_save_path)
+        leg_dirs_search = None
+        if leg_group_search:
+            candidate = _group_saved_runs(_discover_saved_runs()).get(leg_group_search, [])
+            if len(candidate) > 1:
+                leg_dirs_search = tuple(candidate)
+        search_all_legs = False
+        if leg_dirs_search:
+            search_all_legs = st.checkbox(
+                f"Search across all {len(leg_dirs_search)} legs, not just the currently loaded one (reads every "
+                f"leg's trades.parquet once -- measured ~0.5s/leg on this machine's real 200-leg run -- keeping "
+                "only matching rows, and stops scanning once 5,000 matches are found so an unfiltered search "
+                "can't try to hold every leg's full trade table in memory at once)",
+                key="search_all_legs",
+            )
+
+        if trades.empty and not search_all_legs:
             st.caption("No trades to search.")
             return
         # Deliberately no explicit `key=` on the multiselect/slider filters below:
@@ -1354,41 +1539,54 @@ def _render_results_tab():
         # could hold a selection outside the new valid set -- letting Streamlit
         # derive a fresh key from the (also-changing) options/min/max args avoids
         # that rather than needing to reproduce the same clamp-before-render
-        # pattern used for max_session_seconds above.
+        # pattern used for max_session_seconds above. Options come from the
+        # currently loaded leg even in whole-run search mode -- every leg shares
+        # the same bot population/asset config, so that leg's own values are
+        # already representative.
         f1, f2, f3, f4 = st.columns(4)
-        asset_filter = f1.multiselect("Asset", options=sorted(trades["asset_id"].unique()), format_func=lambda a: asset_names.get(a, str(a)))
-        bot_types_present = sorted(set(trades["maker_type"]).union(trades["taker_type"]))
+        asset_filter = f1.multiselect("Asset", options=sorted(trades["asset_id"].unique()) if not trades.empty else sorted(asset_names), format_func=lambda a: asset_names.get(a, str(a)))
+        bot_types_present = sorted(set(trades["maker_type"]).union(trades["taker_type"])) if not trades.empty else []
         bot_type_filter = f2.multiselect("Bot type (maker or taker)", options=bot_types_present)
         agent_id_filter = f3.text_input("Agent ID (maker or taker)", key="trade_search_agent_id")
         free_text = f4.text_input("Free-text search (any column)", key="trade_search_free_text")
 
         f5, f6 = st.columns(2)
-        t_min, t_max = float(trades["time"].min()), float(trades["time"].max())
+        if search_all_legs:
+            t_min, t_max = _leg_group_time_range(leg_dirs_search)
+        else:
+            t_min, t_max = float(trades["time"].min()), float(trades["time"].max())
         time_range = f5.slider("Time range (s)", min_value=t_min, max_value=t_max, value=(t_min, t_max))
         qty_min = f6.number_input("Min quantity", value=0.0, min_value=0.0, key="trade_search_min_qty")
 
-        filtered = trades[(trades["time"] >= time_range[0]) & (trades["time"] <= time_range[1]) & (trades["qty"] >= qty_min)]
-        if asset_filter:
-            filtered = filtered[filtered["asset_id"].isin(asset_filter)]
-        if bot_type_filter:
-            filtered = filtered[filtered["maker_type"].isin(bot_type_filter) | filtered["taker_type"].isin(bot_type_filter)]
+        agent_id_val = None
         if agent_id_filter.strip():
             try:
-                aid_val = int(agent_id_filter.strip())
-                filtered = filtered[(filtered["maker_agent_id"] == aid_val) | (filtered["taker_agent_id"] == aid_val)]
+                agent_id_val = int(agent_id_filter.strip())
             except ValueError:
                 st.warning("Agent ID must be an integer.")
-        if free_text.strip():
-            # Vectorized (column-wise string ops), not a per-row .apply(axis=1) --
-            # the latter is a Python-level loop and was the slowest part of the
-            # whole tab on a large trade table.
-            search_cols = ["asset_id", "price", "qty", "taker_side", "maker_agent_id", "taker_agent_id", "maker_type", "maker_variant", "taker_type", "taker_variant"]
-            combined = filtered[search_cols[0]].astype(str)
-            for col in search_cols[1:]:
-                combined = combined + " " + filtered[col].astype(str)
-            filtered = filtered[combined.str.lower().str.contains(free_text.lower(), regex=False, na=False)]
 
-        st.caption(f"{len(filtered):,} of {len(trades):,} trades match")
+        if search_all_legs:
+            with st.spinner(f"Scanning up to {len(leg_dirs_search)} legs..."):
+                filtered, legs_scanned, n_legs, stopped_early = _search_all_legs(leg_dirs_search, asset_filter, bot_type_filter, agent_id_val, free_text, time_range, qty_min)
+            st.caption(f"{len(filtered):,} matches, scanned {legs_scanned}/{n_legs} legs" + (" (stopped early -- 5,000-match cap reached; narrow the filters for a complete scan)" if stopped_early else ""))
+        else:
+            filtered = trades[(trades["time"] >= time_range[0]) & (trades["time"] <= time_range[1]) & (trades["qty"] >= qty_min)]
+            if asset_filter:
+                filtered = filtered[filtered["asset_id"].isin(asset_filter)]
+            if bot_type_filter:
+                filtered = filtered[filtered["maker_type"].isin(bot_type_filter) | filtered["taker_type"].isin(bot_type_filter)]
+            if agent_id_val is not None:
+                filtered = filtered[(filtered["maker_agent_id"] == agent_id_val) | (filtered["taker_agent_id"] == agent_id_val)]
+            if free_text.strip():
+                # Vectorized (column-wise string ops), not a per-row .apply(axis=1)
+                # -- the latter is a Python-level loop and was the slowest part of
+                # the whole tab on a large trade table.
+                combined = filtered[_TRADE_SEARCH_COLS[0]].astype(str)
+                for col in _TRADE_SEARCH_COLS[1:]:
+                    combined = combined + " " + filtered[col].astype(str)
+                filtered = filtered[combined.str.lower().str.contains(free_text.lower(), regex=False, na=False)]
+            st.caption(f"{len(filtered):,} of {len(trades):,} trades match")
+
         st.dataframe(filtered.sort_values("time").head(5000), width="stretch", height=400)
         if len(filtered) > 5000:
             st.caption("Showing first 5,000 matching rows; narrow the filters to see more precisely, or download all matches below.")
