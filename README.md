@@ -254,9 +254,10 @@ length is picked so each leg's own estimate lands around ~8% of total RAM, saved
 display keeps working seamlessly across leg boundaries (`ProgressHandle` reports
 *absolute* simulated time, so a leg continuation's first reading already starts where
 the previous leg left off) with a "leg N/M" counter alongside it. When it finishes,
-the last leg loads into the Results tab immediately (full detail on that specific
-leg) and the Multi-leg overview tab auto-selects the new run and builds its overview
-with no extra click. `min_trades` being set disables auto-split (a trade-count floor
+the last leg loads into the Results tab immediately, which shows the whole run's
+overview chart automatically since it's a multi-leg run (see "Candlestick chart +
+multi-leg overview" below) -- no extra click, no separate tab to switch to.
+`min_trades` being set disables auto-split (a trade-count floor
 across an unknown final split doesn't have a sensible meaning) and falls back to the
 manual single-run confirmation instead.
 
@@ -286,7 +287,7 @@ sequence and want to exclude the cold start entirely, drop leg 1's data specific
 (or start your analysis window a few seconds into it) rather than treating every leg
 the same way.
 
-### Candlestick chart + multi-leg overview
+### Candlestick chart + multi-leg overview (one chart, one tab)
 
 The dashboard's price chart (Results tab) is a candlestick chart with adaptive,
 time-window-based zoom (`market_sim.candles`): a candle covers a slice of simulated
@@ -295,7 +296,12 @@ normally means -- how much happened in that slice -- rather than being
 near-constant across candles the way trade-count-based bucketing would be (a real
 concern raised and fixed during design: with trade-count buckets, every candle
 holds the same number of trades almost by construction, so the volume chart loses
-the "which period was actually busy" signal).
+the "which period was actually busy" signal). A "Chart type" toggle switches
+between candlestick and a plain line (connecting each bucket's close price) --
+same underlying bucketed data either way, just drawn differently for readers who
+find a line easier to scan than OHLC; neither mode ever plots raw per-trade points,
+only the current view's target-candle-count-bounded buckets, so "Line" is not a
+return to the old unbounded raw-trade line from before the candlestick rebuild.
 
 Bucket width isn't a fixed global grid -- it's recomputed for whatever time range
 is currently in view: `width = view_span / target_candle_count` (default target
@@ -308,37 +314,39 @@ once the window is narrow enough. Empty buckets forward-fill from the previous
 close (flat candle, zero volume) rather than leaving a gap, same as a real
 exchange chart showing a quiet period.
 
-**Multi-leg overview** (its own tab): view an entire `run_scenario_in_legs`
-sequence (e.g. all 300,000s of a 200-leg run) as one candlestick chart without
-loading every leg's full trade data at once. Builds automatically -- no button --
-as soon as you pick a multi-leg run (or right after an auto-split run finishes, see
-above, which selects it for you too); each leg contributes a small, cached OHLC
-summary (300 candles, computed from just the `time`/`price`/`qty` columns of that
-leg's `trades.parquet` -- `market_sim.load_trades_columns`, not the full table);
-these compose into one series via `market_sim.candles.resample_candles`, which
-works because OHLC composes correctly across resolutions -- the same math real
-charting software uses to build 1-hour candles from 1-minute ones. Once you've
-zoomed the overview to within a single leg's span, a "Load this leg" button loads
-that leg's actual trade data for genuine single-trade-resolution drill-down via the
-same chart -- full `market_health` metrics and the trade-search table are available
-for that specific leg this way (not for the whole multi-leg run at once -- see the
-note on whole-run metrics below). Summarizing a many-legs run takes a few/several
-seconds the first time per session (parallelized across legs with a thread pool;
-measured ~15-20s for 200 legs) -- cached per leg afterward, so re-viewing or
-re-zooming is instant.
+**Multi-leg runs use the same chart, in the same Results tab** -- there's no
+separate "overview" tab to switch to. Whenever the currently loaded run is one leg
+of a `run_scenario_in_legs` sequence, the chart defaults to showing the *whole* run
+(e.g. all 300,000s of a 200-leg run) composed from small, cached per-leg OHLC
+summaries, not every leg's full trade data at once: each leg contributes a 300-
+candle summary computed from just the `time`/`price`/`qty` columns of that leg's
+`trades.parquet` (`market_sim.load_trades_columns`, not the full table), and these
+compose into one series via `market_sim.candles.resample_candles`, the same OHLC
+math real charting software uses to build 1-hour candles from 1-minute ones.
+Summarizing a many-legs run takes a few/several seconds the first time per session
+(parallelized across legs with a thread pool; measured ~15-20s for 200 legs) --
+cached per leg afterward, so re-viewing or re-zooming is instant. The chart-type
+toggle and adaptive zoom both work identically in this composed mode.
 
-**Whole-run `market_health` metrics across every leg of a multi-leg run**: not
-implemented yet -- an open design question, not just an engineering one. Most of
-the report's metrics (means, ratios, HHI/concentration, Benford/round-number wash
-tests) *can* be computed exactly across an arbitrary number of legs without ever
-holding more than one leg's data at a time, by accumulating the right sufficient
-statistics per leg (sums, sums-of-squares, per-agent volume totals, digit
-histograms) and combining them once at the end -- not by naively averaging each
-leg's already-computed metric value, which is the wrong combination for a ratio or
-an index. A few (autocorrelation-based efficiency measures, resilience/recovery
-timing right at a leg boundary) need extra boundary handling to stay exactly
-correct. This hasn't been built -- ask before assuming which metrics are worth it
-and how "whole-run" should be defined.
+Once you've zoomed to within a single leg's span, a "Load for full detail" button
+switches that chart specifically into single-leg mode: that leg's actual trade
+data, genuine single-trade-resolution zoom, trade search, agent state, and that
+leg's own `market_health` metrics. A "Back to whole-run overview" button returns
+to the composed view without re-reading anything (the per-leg summaries are
+already cached). Loading any *other* run (a fresh run, a different saved run, a
+different leg picked from the sidebar) resets back to whole-run-overview-by-
+default for whatever multi-leg group it belongs to, if any.
+
+**Market-health metrics across a multi-leg run**: rather than one merged whole-run
+composite (which runs into real boundary-handling issues for some metrics --
+autocorrelation-based efficiency measures and resilience/recovery timing right at
+a leg boundary need special treatment to stay exactly correct, see git history for
+the fuller analysis), the Results tab keeps a running **list of the legs you've
+actually loaded for full detail**, one row per leg, each with its own already-
+correct `market_health.compute_run_metrics` output -- a comparison table that
+grows as you drill into more legs, never computed for the whole run's legs up
+front (that would mean reading every leg's full trade/order-event/snapshot/agent-
+state data at once, exactly what splitting into legs was meant to avoid).
 
 ## Configuration format
 

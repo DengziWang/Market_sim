@@ -255,12 +255,41 @@ def _group_saved_runs(saved: list) -> dict:
     return dict(sorted(groups.items()))
 
 
+def _leg_group_for_path(path: str | None) -> str | None:
+    """If `path` is one leg of a `run_scenario_in_legs` sequence (a `leg_NNNN`
+    directory), returns its parent (the group key `_group_saved_runs` would use);
+    `None` for a plain single-run path or `None` itself. Recomputed fresh from
+    whatever's currently loaded (`last_save_path`) rather than cached in its own
+    session_state flag, so it can't go stale the way a separately-tracked "current
+    group" flag could (e.g. after loading an unrelated single run following a
+    multi-leg one)."""
+    if not path:
+        return None
+    parent, leaf = os.path.dirname(path), os.path.basename(path)
+    return parent if _LEG_DIR_RE.match(leaf) else None
+
+
 def _activate_result(result: dict, config_toml: str, source: str, save_path: str | None = None) -> None:
     st.session_state.active_result = result
     st.session_state.active_config_toml = config_toml
     st.session_state.active_source = source
     st.session_state.metrics = market_health.compute_run_metrics(result)
     st.session_state.last_save_path = save_path
+    # Every activation defaults to whole-run overview mode when the loaded run is
+    # part of a leg group (see _render_price_volume) -- the one exception, drilling
+    # into a specific leg's full single-trade-resolution chart via "Load for full
+    # detail", sets this back to True itself right after calling this function.
+    st.session_state.leg_drilldown = False
+    # If this is one leg of a multi-leg sequence, remember its metrics permanently
+    # (keyed by leg dir) so the Results tab can show a running list across every
+    # leg the user has actually loaded for full detail -- see the "Market-health
+    # metrics" section below. Deliberately NOT computed for every leg up front
+    # (that would mean reading every leg's full trade/order-event/snapshot/
+    # agent-state data at once, exactly what splitting into legs was meant to
+    # avoid) -- it only grows as legs get loaded.
+    leg_group = _leg_group_for_path(save_path)
+    if leg_group:
+        st.session_state.setdefault("leg_metrics_by_dir", {})[save_path] = dict(st.session_state.metrics)
     # Bumped so cached, version-keyed derivations (see _trades_df_cached below) know
     # to recompute -- without this a long session's results stay slow to browse
     # (every widget interaction anywhere re-sent every trade to the browser); see
@@ -571,7 +600,7 @@ for _key, _default in [
     ("sim_is_continue", False), ("sim_base_result", None),
     ("sim_progress", None), ("sim_target_seconds", None),
     ("sim_is_leg_run", False), ("sim_leg_progress", None),
-    ("active_leg_group", None),
+    ("leg_metrics_by_dir", {}), ("leg_drilldown", False),
 ]:
     if _key not in st.session_state:
         st.session_state[_key] = _default
@@ -757,7 +786,6 @@ with st.sidebar:
         is_continue = st.session_state.sim_is_continue
         base_result = st.session_state.sim_base_result
         is_leg_run = st.session_state.sim_is_leg_run
-        leg_progress = st.session_state.sim_leg_progress
         st.session_state.sim_thread = None
         st.session_state.sim_token = None
         st.session_state.sim_progress = None
@@ -770,17 +798,16 @@ with st.sidebar:
             st.session_state.run_error = holder["error"]
         elif is_leg_run:
             legs = holder["result"]  # list[LegResult] -- see run_scenario_in_legs
-            out_dir = leg_progress["out_dir"] if leg_progress else (legs[0].out_dir if legs else None)
             if legs:
-                st.session_state.active_leg_group = out_dir
-                # Also load the last leg into the normal single-run view, so the
-                # Results tab has something immediately too -- not just the
-                # overview -- without an extra click. Full detail on that specific
-                # leg is genuinely correct/complete, unlike a whole-run summary.
+                # Load the last leg into the normal single-run view -- its
+                # save_path is a `leg_NNNN` dir, which _leg_group_for_path picks up
+                # to switch the Results tab's chart into whole-run overview mode
+                # automatically (see _render_price_volume below), full detail on
+                # this specific leg still one click away via "Load for full detail".
                 loaded = load_run(legs[-1].out_dir)
                 result = _loaded_run_to_result(loaded)
                 was_cancelled = legs[-1].meta.get("cancelled", False)
-                source = f"Auto-split run{' (stopped early)' if was_cancelled else ''} -- showing leg {legs[-1].index}/{len(legs)} (see Multi-leg overview for the whole run)"
+                source = f"Auto-split run{' (stopped early)' if was_cancelled else ''} -- showing leg {legs[-1].index}/{len(legs)}"
                 _activate_result(result, loaded["meta"].get("config_toml", ""), source, save_path=legs[-1].out_dir)
             else:
                 st.session_state.run_error = "Auto-split run produced no legs (cancelled before the first one finished)."
@@ -844,7 +871,7 @@ with st.sidebar:
                 _activate_result(result, loaded["meta"].get("config_toml", ""), f"Loaded from {os.path.relpath(pick, REPO_ROOT)}", save_path=pick)
                 st.rerun()
 
-tab_setup, tab_pop, tab_advanced, tab_results, tab_overview = st.tabs(["Run & Market Setup", "Bot Population", "Advanced (raw TOML)", "Results", "Multi-leg overview"])
+tab_setup, tab_pop, tab_advanced, tab_results = st.tabs(["Run & Market Setup", "Bot Population", "Advanced (raw TOML)", "Results"])
 
 # ---------------------------------------------------------------------------------
 # Tab: Run & Market Setup
@@ -1132,8 +1159,86 @@ def _render_results_tab():
         most expensive thing in this tab, so it should only happen when a chart
         control changes -- not on every keystroke in the unrelated Trade search box
         below, which (before this split) forced the *whole* Results tab, charts
-        included, to re-render on every single character typed."""
+        included, to re-render on every single character typed.
+
+        Two data sources feed the same `_render_candlestick_chart`, chosen by
+        whether the currently loaded run is one leg of a `run_scenario_in_legs`
+        sequence (`_leg_group_for_path`): a plain run charts directly from its own
+        (already fully in-memory) trades, same as always; a multi-leg run instead
+        composes the *whole* run from small cached per-leg OHLC summaries (see
+        `_leg_candle_summary`) -- so browsing a 200-leg run's price history never
+        needs more than one leg's full trade data in memory at once, the same
+        principle `run_scenario_in_legs` itself exists for. Both paths share the
+        same adaptive zoom/candlestick-or-line rendering, so there's nothing
+        chart-mechanic-specific to switch between -- only where the candles come
+        from changes."""
         st.subheader("Price & volume (candlestick or line -- drag to zoom in, Reset zoom to back out)")
+
+        leg_group = _leg_group_for_path(st.session_state.last_save_path)
+        leg_dirs = None
+        if leg_group and not st.session_state.leg_drilldown:
+            candidate = _group_saved_runs(_discover_saved_runs()).get(leg_group, [])
+            if len(candidate) > 1:
+                leg_dirs = tuple(candidate)
+
+        if leg_dirs:
+            group_label = os.path.relpath(leg_group, RUNS_ROOT)
+            st.caption(
+                f"This run has {len(leg_dirs)} legs under `{group_label}` -- showing the *whole* run, composed "
+                f"from small cached per-leg summaries ({_LEG_SUMMARY_CANDLES} candles/leg each), not every leg's "
+                "full trade data at once. Zoom into a single leg's span for a \"Load for full detail\" button "
+                "(single-trade resolution, trade search, and that leg's own market-health metrics)."
+            )
+            with st.spinner(f"Summarizing {len(leg_dirs)} legs (first time only, ~0.1-0.2s/leg)..."):
+                _warm_leg_summaries(leg_dirs)
+
+            for aid in sorted(asset_names):
+                candles_all = _multi_leg_candles_for_asset(leg_dirs, aid)
+                if candles_all.empty:
+                    continue
+                full_start, full_end = float(candles_all["bucket_start"].min()), float(candles_all["bucket_end"].max())
+
+                def get_candles(view_start, view_end, target_candles, candles_all=candles_all):
+                    return resample_candles(candles_all, view_start, view_end, target_candles)
+
+                chart_key = f"legoverview_{re.sub(r'[^0-9A-Za-z_]', '_', leg_group)}_{aid}"
+                _render_candlestick_chart(
+                    key_prefix=chart_key,
+                    title=asset_names.get(aid, f"asset {aid}"),
+                    full_start=full_start,
+                    full_end=full_end,
+                    get_candles=get_candles,
+                )
+
+                # Once the view has narrowed to within a single leg's own span for
+                # this asset, offer to load that leg's full trade data -- genuine
+                # single-trade-resolution drill-down, trade search, agent state,
+                # and that leg's own market-health metrics (see below).
+                view_start = st.session_state.get(f"{chart_key}_view_start", full_start)
+                view_end = st.session_state.get(f"{chart_key}_view_end", full_end)
+                containing_legs = []
+                for d in leg_dirs:
+                    leg_summary = _leg_candle_summary(d).get(aid)
+                    if leg_summary is not None and not leg_summary.empty and leg_summary["bucket_start"].min() <= view_end and leg_summary["bucket_end"].max() >= view_start:
+                        containing_legs.append(d)
+                if len(containing_legs) == 1:
+                    leg_dir = containing_legs[0]
+                    if st.button(f"📂 Load {os.path.relpath(leg_dir, RUNS_ROOT)} for full detail", key=f"load_leg_btn_{aid}"):
+                        loaded = load_run(leg_dir)
+                        result2 = _loaded_run_to_result(loaded)
+                        _activate_result(result2, loaded["meta"].get("config_toml", ""), f"Loaded from {os.path.relpath(leg_dir, REPO_ROOT)}", save_path=leg_dir)
+                        st.session_state.leg_drilldown = True  # _activate_result just reset this to False
+                        st.rerun()
+                elif len(containing_legs) > 1:
+                    st.caption(f"Current {asset_names.get(aid, aid)} view spans {len(containing_legs)} legs -- zoom in further to load one for full detail.")
+            return
+
+        if leg_group:
+            st.caption(f"Showing full single-trade-resolution detail for one leg of `{os.path.relpath(leg_group, RUNS_ROOT)}` (`{os.path.relpath(st.session_state.last_save_path, RUNS_ROOT)}`).")
+            if st.button("🔭 Back to whole-run overview", key="back_to_overview_btn"):
+                st.session_state.leg_drilldown = False
+                st.rerun()
+
         if trades.empty:
             st.warning("No trades occurred in this run.")
             return
@@ -1187,6 +1292,22 @@ def _render_results_tab():
     _render_price_volume()
 
     st.subheader("Market-health metrics")
+    leg_group_active = _leg_group_for_path(st.session_state.last_save_path)
+    if leg_group_active:
+        history = {d: m for d, m in st.session_state.leg_metrics_by_dir.items() if os.path.dirname(d) == leg_group_active}
+        st.caption(
+            "One row per leg you've loaded for full detail in this session (not the whole run -- computing "
+            "this for every leg would mean reading every leg's full trade/order-event/snapshot/agent-state "
+            "data at once, exactly what splitting into legs was meant to avoid). Load more legs above to add rows."
+        )
+        if history:
+            hist_df = pd.DataFrame(history).T
+            hist_df.index = [os.path.relpath(d, RUNS_ROOT) for d in history]
+            hist_df = hist_df.sort_index()
+            st.dataframe(hist_df, width="stretch", height=300)
+        else:
+            st.caption("No legs loaded yet -- load one above to see its metrics here.")
+        st.markdown(f"**Currently loaded leg** ({os.path.relpath(st.session_state.last_save_path, RUNS_ROOT)}):")
     if st.session_state.metrics:
         metrics_df = pd.DataFrame(sorted(st.session_state.metrics.items()), columns=["metric", "value"])
         st.dataframe(metrics_df, width="stretch", height=300)
@@ -1282,98 +1403,3 @@ def _render_results_tab():
 
 with tab_results:
     _render_results_tab()
-
-# ---------------------------------------------------------------------------------
-# Tab: Multi-leg overview -- view an entire run_scenario_in_legs sequence at once
-# (e.g. all 300,000s of a 200-leg run) without loading every leg's full trade data
-# into memory simultaneously: each leg contributes only a small, cached candle
-# summary (see _leg_candle_summary above), composed into one candlestick chart via
-# the same _render_candlestick_chart used by the Results tab's single-run chart.
-# ---------------------------------------------------------------------------------
-with tab_overview:
-    st.caption(
-        "View an entire multi-leg run (e.g. all 300,000s of a 200-leg run) as one candlestick chart, without "
-        "loading every leg's full trade data at once -- each leg contributes a small cached OHLC summary "
-        f"({_LEG_SUMMARY_CANDLES} candles), composed together. Zooming narrower than a leg's own summary "
-        "resolution won't reveal more detail -- use \"Load this leg\" below once you've zoomed into one, to "
-        "switch to the Results tab's chart for full single-trade resolution on that leg specifically."
-    )
-    groups = _group_saved_runs(_discover_saved_runs())
-    multi_leg_groups = {k: v for k, v in groups.items() if len(v) > 1}
-    if not multi_leg_groups:
-        st.info("No multi-leg runs found under runs/ yet -- an auto-split run (see the sidebar) creates one automatically, or use `market_sim.run_scenario_in_legs` (see README).")
-    else:
-        # Auto-select the most recently finished auto-split run, exactly once (not
-        # on every rerun -- that would fight a later manual choice of a different
-        # group) -- same "set session_state before the widget instantiates" pattern
-        # as elsewhere in this file, needed because this runs before the selectbox
-        # below. active_leg_group is set by _poll_sim_status right when an
-        # auto-split run completes.
-        if st.session_state.active_leg_group and st.session_state.active_leg_group in multi_leg_groups and st.session_state.get("_last_auto_selected_leg_group") != st.session_state.active_leg_group:
-            st.session_state["overview_group"] = st.session_state.active_leg_group
-            st.session_state["_last_auto_selected_leg_group"] = st.session_state.active_leg_group
-
-        group_key = st.selectbox("Multi-leg run", list(multi_leg_groups), format_func=lambda p: os.path.relpath(p, RUNS_ROOT), key="overview_group")
-        leg_dirs = tuple(multi_leg_groups[group_key])
-        group_label = os.path.relpath(group_key, RUNS_ROOT)
-        chart_key_prefix = f"overview_{re.sub(r'[^0-9A-Za-z_]', '_', group_label)}"
-        st.caption(f"{len(leg_dirs)} legs found under `{group_label}`.")
-
-        # Reading each leg's asset list needs at least the leg's metadata (cheap --
-        # JSON, not parquet); pull available asset ids from the *first* leg only
-        # (every leg in a sequence shares the same population/asset config).
-        with open(os.path.join(leg_dirs[0], "run_metadata.json")) as f:
-            first_leg_meta = json.load(f)
-        try:
-            first_cfg = toml.loads(first_leg_meta.get("config_toml", ""))
-            asset_options = {i: a.get("symbol", f"asset {i}") for i, a in enumerate(first_cfg.get("assets", []))}
-        except toml.TomlDecodeError:
-            asset_options = {}
-        if not asset_options:
-            asset_options = {0: "asset 0"}
-        asset_id = st.selectbox("Asset", list(asset_options), format_func=lambda a: asset_options.get(a, str(a)), key="overview_asset")
-
-        # Builds automatically -- no button. _leg_candle_summary/_warm_leg_summaries
-        # are cached (st.cache_resource), so this only actually costs anything the
-        # first time a given leg is summarized in this session; re-rendering (a
-        # different zoom, a rerun from an unrelated widget elsewhere) is instant.
-        with st.spinner(f"Summarizing {len(leg_dirs)} legs (first time only, ~0.1-0.2s/leg)..."):
-            _warm_leg_summaries(leg_dirs)
-            candles_all = _multi_leg_candles_for_asset(leg_dirs, asset_id)
-
-        if candles_all.empty:
-            st.warning("No trades found for this asset across these legs.")
-        else:
-            full_start, full_end = float(candles_all["bucket_start"].min()), float(candles_all["bucket_end"].max())
-
-            def get_overview_candles(view_start, view_end, target_candles, candles_all=candles_all):
-                return resample_candles(candles_all, view_start, view_end, target_candles)
-
-            chart_key = f"{chart_key_prefix}_{asset_id}"
-            _render_candlestick_chart(
-                key_prefix=chart_key,
-                title=f"{asset_options.get(asset_id, asset_id)} -- {group_label} (all {len(leg_dirs)} legs)",
-                full_start=full_start,
-                full_end=full_end,
-                get_candles=get_overview_candles,
-            )
-
-            # Once the view has narrowed to within a single leg's own span,
-            # offer to load that leg's full trade data for genuine
-            # single-trade-resolution drill-down via the Results tab.
-            view_start = st.session_state.get(f"{chart_key}_view_start", full_start)
-            view_end = st.session_state.get(f"{chart_key}_view_end", full_end)
-            containing_legs = []
-            for d in leg_dirs:
-                leg_summary = _leg_candle_summary(d).get(asset_id)
-                if leg_summary is not None and not leg_summary.empty and leg_summary["bucket_start"].min() <= view_end and leg_summary["bucket_end"].max() >= view_start:
-                    containing_legs.append(d)
-            if len(containing_legs) == 1:
-                leg_dir = containing_legs[0]
-                if st.button(f"📂 Load {os.path.relpath(leg_dir, RUNS_ROOT)} for full detail", key="overview_load_leg_btn"):
-                    loaded = load_run(leg_dir)
-                    result = _loaded_run_to_result(loaded)
-                    _activate_result(result, loaded["meta"].get("config_toml", ""), f"Loaded from {os.path.relpath(leg_dir, REPO_ROOT)}", save_path=leg_dir)
-                    st.success("Loaded -- switch to the Results tab to see it at full single-trade resolution.")
-            elif len(containing_legs) > 1:
-                st.caption(f"Current view spans {len(containing_legs)} legs -- zoom in further (narrow the view to within one leg's span) to load it for full detail.")
