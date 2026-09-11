@@ -106,6 +106,13 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
 
     let sigma = s.vol_window.std().unwrap_or(0.0).max(1e-9);
     let inventory = agent.inventory_of(s.asset_id);
+    // Shared by every variant below that reacts to inventory: raw asset units (as
+    // `inventory` is) scale inversely with price via `max_inventory`'s own
+    // dollar-notional derivation (see `from_params`) -- the same $30,000 of risk
+    // is 0.5 BTC units but 200,000 DOGE units. Normalizing first, to [-1, 1]-ish,
+    // keeps every variant's inventory reaction a *fraction* of mid regardless of
+    // which asset it's quoting, not an asset-price-dependent one.
+    let inventory_norm = inventory / s.max_inventory.max(1e-9);
 
     let (reservation, half_spread) = match s.variant {
         Variant::SymmetricAvellanedaStoikov => {
@@ -116,18 +123,14 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             // Dimensional fix: the textbook formula's sigma is an *absolute* price
             // volatility (dS, dollars/sqrt(time)), and its inventory term uses q in
             // raw units against that same absolute scale. `sigma` here is a fractional
-            // (log-return) volatility instead, and inventory is in raw asset units
-            // whose *scale* (via max_inventory, itself now dollar-notional-derived --
-            // see from_params) varies enormously by asset price. Naively mixing these
-            // treats a price-scale-independent quantity as if it were already in price
-            // units, adding e.g. a fixed ~1.3 absolute-price spread term regardless of
-            // whether the asset is worth $60,000 or $0.15 -- negligible for the former,
-            // many times the entire price for the latter (this produced actual
+            // (log-return) volatility instead. Naively mixing these treats a
+            // price-scale-independent quantity as if it were already in price units,
+            // adding e.g. a fixed ~1.3 absolute-price spread term regardless of whether
+            // the asset is worth $60,000 or $0.15 -- negligible for the former, many
+            // times the entire price for the latter (this produced actual
             // sub-half-price/over-double-price quotes in testing; see git history).
-            // Fixed by working entirely in *fractional* terms (inventory normalized by
-            // max_inventory, to [-1, 1]-ish) and converting to a price only once, at
-            // the end, by multiplying by mid.
-            let inventory_norm = inventory / s.max_inventory.max(1e-9);
+            // Fixed by working entirely in *fractional* terms (`inventory_norm` above)
+            // and converting to a price only once, at the end, by multiplying by mid.
             let reservation = mid * (1.0 - inventory_norm * s.gamma * sigma.powi(2) * s.horizon_secs);
             // The order-arrival-intensity term (2/gamma)*ln(1+gamma/k) is dimensionless
             // by construction (a pure function of gamma/k), not a price or even a
@@ -142,7 +145,17 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             // Linear-skew approximation of the Gueant-Lehalle-Fernandez-Tapia inventory
             // adjustment: push the mid reference against the current inventory so quotes
             // asymmetrically encourage inventory back toward zero.
-            let skewed = mid - s.skew_factor * mid * inventory;
+            //
+            // Dimensional fix (same bug class, same fix, as Avellaneda-Stoikov above --
+            // found second, while investigating why BTC stayed calm but the cheaper/
+            // higher-unit-count assets didn't): this used raw `inventory` directly, so
+            // `skew_factor * mid * inventory` at a given *dollar* inventory position is
+            // the same absolute number regardless of asset (`mid * inventory` toward
+            // `max_inventory_notional` cancels price out) -- negligible against BTC's
+            // price, many multiples of DOGE's entire price at even a perfectly ordinary
+            // (e.g. half-of-max) inventory position, not an extreme one. Fixed the same
+            // way: react to `inventory_norm` (a fraction of max_inventory), not raw units.
+            let skewed = mid * (1.0 - s.skew_factor * inventory_norm);
             (skewed, mid * s.base_half_spread_frac)
         }
         Variant::AdaptiveSpread => {

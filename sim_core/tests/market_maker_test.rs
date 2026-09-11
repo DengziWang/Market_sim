@@ -1,16 +1,18 @@
-//! Regression test for a real bug found by inspecting an actual large run: the
-//! Avellaneda-Stoikov market maker's `reservation` price had no defensive bound
-//! (unlike `half_spread`, right next to it), so a momentary spike in this bot's
-//! own rolling realized-volatility estimate could push its quote many multiples
-//! of the real mid price away -- a real 5,000-agent/300,000s run had DOGE's
-//! traded price jump 17.6x in a single trade this way. See market_maker.rs's
-//! `reservation` clamp for the fix and full writeup.
+//! Regression tests for two real bugs found by inspecting an actual large run
+//! (5,000 agents, 300,000s): the Avellaneda-Stoikov and InventorySkew market
+//! makers both mixed a dollar/raw-unit-scale quantity into a formula meant to
+//! produce a *fractional* (relative-to-mid) price adjustment, without first
+//! normalizing by `max_inventory` -- the same bug class in two different
+//! variants, the second found while investigating why the first fix alone
+//! didn't fully explain why BTC stayed calm but the cheaper, higher-unit-count
+//! assets (DOGE especially) didn't. See market_maker.rs's `reservation` clamp
+//! and the `InventorySkew` arm's `inventory_norm` fix for the full writeup.
 //!
-//! Directly drives `bots::market_maker::step` with a manually-crafted extreme
-//! `vol_window`/inventory (rather than hoping a full stochastic run happens to
-//! reproduce the same rare event) -- deterministic and targeted, the same
-//! rare-condition-triggering approach `matching_engine_tests.rs`'s circuit-
-//! breaker tests use at the order-book level.
+//! Both tests directly drive `bots::market_maker::step` with manually-crafted
+//! state (rather than hoping a full stochastic run happens to reproduce the
+//! same rare/not-so-rare event) -- deterministic and targeted, the same
+//! condition-triggering approach `matching_engine_tests.rs`'s circuit-breaker
+//! tests use at the order-book level.
 
 use sim_core::agent::Action;
 use sim_core::bots::{step as bots_step, BotStrategy, StepCtx};
@@ -75,6 +77,65 @@ fn avellaneda_stoikov_reservation_stays_bounded_under_an_extreme_volatility_spik
                 "quote price {price} should stay within a generous band around mid {mid} even under an \
                  extreme volatility spike -- reservation (and hence both sides of the quote) must be \
                  clamped, not just half_spread"
+            );
+        }
+    }
+    assert!(saw_a_quote, "expected at least one Submit action (bid and/or ask) from this wake");
+}
+
+const INVENTORY_SKEW_CONFIG: &str = r#"
+[run]
+seed = 1
+session_seconds = 10.0
+
+[[assets]]
+symbol = "DOGE"
+tick_size = 0.00001
+initial_price = 0.15
+fundamental_vol = 0.04
+fundamental_theta = 0.12
+
+[export]
+out_dir = "/tmp/does_not_matter"
+
+[[population.groups]]
+bot_type = "market_maker"
+variant = "inventory_skew"
+count = 1
+"#;
+
+#[test]
+fn inventory_skew_stays_bounded_at_an_entirely_ordinary_inventory_level() {
+    // Deliberately NOT an extreme edge case (not near-max inventory, no crafted
+    // volatility spike) -- the whole point of this bug was that it broke DOGE at
+    // a perfectly ordinary inventory level, precisely because raw DOGE units for
+    // a given dollar position vastly outnumber raw BTC units for the same dollar
+    // position. Half of max_inventory is an unremarkable, everyday position for
+    // an active market maker to be sitting at.
+    let parsed = ScenarioConfig::from_toml_str(INVENTORY_SKEW_CONFIG).expect("config must parse");
+    let mut sim = Simulation::build(parsed).expect("population must build");
+    let mid = sim.market.mid_price(0, 0).expect("book should have a fallback mid price at t=0");
+
+    let BotStrategy::MarketMaker(state) = &mut sim.strategies[0] else {
+        panic!("population group 0 must be the inventory_skew market maker configured above");
+    };
+    let half_max = state.max_inventory * 0.5;
+    sim.agents[0].add_inventory(0, half_max);
+
+    let ctx = StepCtx { market: &sim.market, venue: 0, now: 0.0 };
+    let result = bots_step(&mut sim.agents[0], &mut sim.strategies[0], &ctx);
+
+    let mut saw_a_quote = false;
+    for action in &result.actions {
+        if let Action::Submit(req) = action {
+            let price = req.price.expect("market maker quotes are limit orders with an explicit price");
+            saw_a_quote = true;
+            assert!(
+                price > 0.0 && price >= mid * 0.9 && price <= mid * 1.1,
+                "quote price {price} should stay close to mid {mid} at a perfectly ordinary (50%-of-max) \
+                 inventory level -- the pre-fix formula used raw asset units directly, and DOGE's raw \
+                 units for a given dollar position vastly outnumber BTC's for the same position, so this \
+                 same inventory level produced a deeply negative reservation price on DOGE specifically"
             );
         }
     }
