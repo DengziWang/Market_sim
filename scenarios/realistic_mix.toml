@@ -14,8 +14,9 @@
 #     rather than assumed -- adjust counts if your own run doesn't bear it out.
 #   - mev: spec 5.8 explicitly calls for a small, heavily concentrated population
 #     (a handful of very-active agents), not an even spread.
-#   - wash_trading: kept modest here (2%) -- the "worst case" ~70%-of-volume anchor
-#     from the report is deliberately reserved for scenario (c), stress_wash_mev.
+#   - wash_trading: removed from this template (2026-09-12, at the user's request,
+#     after investigating a real run) -- see stress_wash_mev.toml if you want it back
+#     for a run specifically studying wash-trading detection/authenticity metrics.
 #   - retail baseline (noise + human, ~57% headcount combined): consistent with real
 #     markets where retail participants vastly outnumber HFT/algorithmic firms even
 #     though they don't dominate volume. Split across two different retail models
@@ -92,7 +93,6 @@ default_maker_fee = 0.0002
 default_taker_fee = 0.0005
 [fees.by_bot_type]
 market_maker = [0.0000, 0.0004]
-wash_trading = [0.0002, 0.0005]
 
 [latency]
 default_latency_secs = 0.08
@@ -292,19 +292,6 @@ count = 2
 initial_cash_range = [100000.0, 300000.0]
 [population.groups.params]
 wake_interval_secs = 0.02
-
-# ---- wash_trading (10 agents, 2%) -----------------------------------------------------
-[[population.groups]]
-bot_type = "wash_trading"
-variant = "self_ring"
-count = 5
-
-[[population.groups]]
-bot_type = "wash_trading"
-variant = "volume_ranking"
-count = 5
-[population.groups.params]
-target_session_volume = 200000.0
 
 # ---- noise / retail baseline (244 agents, 48.8%) ----------------------------------------
 [[population.groups]]
