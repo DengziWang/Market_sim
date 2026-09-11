@@ -140,18 +140,21 @@ made short-session, wash/MEV-heavy example to point it at.
 
 ### Human-fraction sweep
 
-`scenarios/human_sweep/human_{50,40,30,20,15,10,5,2_5,1}pct.toml` -- 9 scenarios
+`scenarios/human_sweep/human_{50,40,30,20,15,10,5,2_5,1,0}pct.toml` -- 10 scenarios
 (2026-09-12, at the user's request), each 1,000 agents / 10,000s simulated / seed 1,
-differing *only* in what fraction of the population is `human`. Every non-human
-bot type/variant is rescaled to keep its relative share of the non-human population
-exactly what it is in `realistic_mix.toml` (the base template they're generated
-from), so the sweep isolates "how much of the market is human" as the one variable
--- not a side effect of some other bot type's headcount also shifting. Same seed
-across every point deliberately: this is a composition sweep, not a seed sweep (add
-multiple seeds per point yourself, e.g. via `build_plan_from_compositions`, for
-real confidence intervals per spec 6a's 20-50-seeds recommendation -- not done here
-since only one seed per point was asked for). All 9 are also selectable from the
-dashboard's "Load a base scenario" dropdown (`SCENARIOS`, prefixed "Human sweep:").
+differing *only* in what fraction of the population is `human` (the `0pct` point
+keeps the `human` group in the config with `count = 0`, i.e. zero of those agents
+actually get built, rather than omitting the group -- verified this runs cleanly,
+same as any other count). Every non-human bot type/variant is rescaled to keep its
+relative share of the non-human population exactly what it is in `realistic_mix.toml`
+(the base template they're generated from), so the sweep isolates "how much of the
+market is human" as the one variable -- not a side effect of some other bot type's
+headcount also shifting. Same seed across every point deliberately: this is a
+composition sweep, not a seed sweep (add multiple seeds per point yourself, e.g. via
+`build_plan_from_compositions`, for real confidence intervals per spec 6a's
+20-50-seeds recommendation -- not done here since only one seed per point was
+asked for). All 10 are also selectable from the dashboard's "Load a base scenario"
+dropdown (`SCENARIOS`, prefixed "Human sweep:").
 
 Regenerate (e.g. after editing `realistic_mix.toml`'s non-human composition) via
 the generator script's logic in git history (2026-09-12) -- not a permanent CLI
