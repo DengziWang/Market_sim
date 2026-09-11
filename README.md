@@ -138,6 +138,32 @@ repeats) rather than a special code path -- `build_stress_test_plan` is a thin
 wrapper around the same mechanism, and `scenarios/stress_wash_mev.toml` is a ready-
 made short-session, wash/MEV-heavy example to point it at.
 
+### Human-fraction sweep
+
+`scenarios/human_sweep/human_{50,40,30,20,15,10,5,2_5,1}pct.toml` -- 9 scenarios
+(2026-09-12, at the user's request), each 1,000 agents / 10,000s simulated / seed 1,
+differing *only* in what fraction of the population is `human`. Every non-human
+bot type/variant is rescaled to keep its relative share of the non-human population
+exactly what it is in `realistic_mix.toml` (the base template they're generated
+from), so the sweep isolates "how much of the market is human" as the one variable
+-- not a side effect of some other bot type's headcount also shifting. Same seed
+across every point deliberately: this is a composition sweep, not a seed sweep (add
+multiple seeds per point yourself, e.g. via `build_plan_from_compositions`, for
+real confidence intervals per spec 6a's 20-50-seeds recommendation -- not done here
+since only one seed per point was asked for). All 9 are also selectable from the
+dashboard's "Load a base scenario" dropdown (`SCENARIOS`, prefixed "Human sweep:").
+
+Regenerate (e.g. after editing `realistic_mix.toml`'s non-human composition) via
+the generator script's logic in git history (2026-09-12) -- not a permanent CLI
+tool, since a sweep's shape (which fractions, what varies) is itself something to
+decide per-question rather than a fixed pipeline.
+
+At 1,000 agents / 10,000s, `_estimate_run_cost` puts each point at ~4.1GB peak RAM
+if run as one session -- above this project's dashboard's 15%-of-RAM auto-split
+threshold on a 16GB machine, so running one from the dashboard will automatically
+split it into legs (see "Splitting a long run into legs" above) rather than risking
+the memory problem that feature exists to avoid.
+
 ## Dashboard (local, interactive)
 
 `app/dashboard.py` is a local Streamlit UI over the same `market_sim`/`market_health`

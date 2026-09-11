@@ -44,6 +44,13 @@ SCENARIOS = {
     "Pure bot market": os.path.join(REPO_ROOT, "scenarios", "pure_bot_market.toml"),
     "Stress test (wash/MEV)": os.path.join(REPO_ROOT, "scenarios", "stress_wash_mev.toml"),
 }
+# Human-fraction sweep (2026-09-12, at the user's request): 9 scenarios, same
+# 1,000-agent/10,000s/seed-1 setup, differing only in what fraction of the
+# population is `human` vs. everything else (rescaled to preserve its relative
+# composition) -- see scenarios/human_sweep/*.toml for the generated files
+# themselves and README's note on how they were derived from realistic_mix.toml.
+for _pct_label, _slug in [("50%", "50pct"), ("40%", "40pct"), ("30%", "30pct"), ("20%", "20pct"), ("15%", "15pct"), ("10%", "10pct"), ("5%", "5pct"), ("2.5%", "2_5pct"), ("1%", "1pct")]:
+    SCENARIOS[f"Human sweep: {_pct_label} human"] = os.path.join(REPO_ROOT, "scenarios", "human_sweep", f"human_{_slug}.toml")
 BOT_TYPES = [
     "market_maker", "arbitrage", "momentum", "mean_reversion", "grid", "dca",
     "liquidation_trader", "mev", "wash_trading", "noise", "human",
