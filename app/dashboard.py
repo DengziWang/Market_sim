@@ -458,10 +458,19 @@ def _extract_box_x_range(box_list):
 
 
 def _render_candlestick_chart(key_prefix: str, title: str, full_start: float, full_end: float, get_candles, get_overlays=None):
-    """One candlestick + volume chart with drag-to-zoom and explicit numeric
-    start/end controls (a guaranteed-to-work alternative/fallback to dragging, and
-    a quick way to jump to an exact time -- see `_extract_box_x_range`'s doc
-    comment on why drag alone isn't relied on as the only way in).
+    """One price + volume chart, switchable between candlestick and plain line,
+    with drag-to-zoom and explicit numeric start/end controls (a guaranteed-to-work
+    alternative/fallback to dragging, and a quick way to jump to an exact time --
+    see `_extract_box_x_range`'s doc comment on why drag alone isn't relied on as
+    the only way in).
+
+    Both chart types are driven by the same adaptive candle bucketing (`get_candles`
+    below) -- "Line" mode connects each bucket's close price instead of drawing an
+    OHLC candle, so it still gets more detailed as you zoom in rather than being a
+    fixed-resolution line over the whole run. It's not the old raw-per-trade line
+    (that view is gone, replaced by candlestick's single-trade resolution at max
+    zoom) -- it's the same underlying data, just drawn as a line for readers who
+    find OHLC candles harder to scan at a glance.
 
     `get_candles(view_start, view_end, target_candles) -> DataFrame` (shape:
     `market_sim.candles.CANDLE_COLUMNS`) supplies the candle data -- lets the same
@@ -501,6 +510,8 @@ def _render_candlestick_chart(key_prefix: str, title: str, full_start: float, fu
     st.session_state[start_key] = min(max(st.session_state[start_key], float(full_start)), float(full_end))
     st.session_state[end_key] = min(max(st.session_state[end_key], st.session_state[start_key] + 1e-9), float(full_end))
 
+    chart_type = st.radio("Chart type", ["Candlestick", "Line"], horizontal=True, key=f"{key_prefix}_chart_type")
+
     c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
     step = max((full_end - full_start) / 100, 1.0)
     view_start = c1.number_input("View start (s)", min_value=float(full_start), max_value=float(full_end), step=step, key=start_key)
@@ -521,11 +532,14 @@ def _render_candlestick_chart(key_prefix: str, title: str, full_start: float, fu
 
     mid = (candles["bucket_start"] + candles["bucket_end"]) / 2.0
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.04)
-    fig.add_trace(
-        go.Candlestick(x=mid, open=candles["open"], high=candles["high"], low=candles["low"], close=candles["close"], name="price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350"),
-        row=1,
-        col=1,
-    )
+    if chart_type == "Candlestick":
+        fig.add_trace(
+            go.Candlestick(x=mid, open=candles["open"], high=candles["high"], low=candles["low"], close=candles["close"], name="price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350"),
+            row=1,
+            col=1,
+        )
+    else:
+        fig.add_trace(go.Scattergl(x=mid, y=candles["close"], mode="lines", name="price", line=dict(width=1.5, color="#1f77b4")), row=1, col=1)
     for name, ot, ov, dash, color in get_overlays(view_start, view_end) if get_overlays else []:
         if len(ot):
             fig.add_trace(go.Scattergl(x=ot, y=ov, mode="lines", name=name, line=dict(width=1, dash=dash, color=color)), row=1, col=1)
@@ -1119,7 +1133,7 @@ def _render_results_tab():
         control changes -- not on every keystroke in the unrelated Trade search box
         below, which (before this split) forced the *whole* Results tab, charts
         included, to re-render on every single character typed."""
-        st.subheader("Price & volume (candlestick -- drag to zoom in, Reset zoom to back out)")
+        st.subheader("Price & volume (candlestick or line -- drag to zoom in, Reset zoom to back out)")
         if trades.empty:
             st.warning("No trades occurred in this run.")
             return
