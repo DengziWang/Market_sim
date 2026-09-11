@@ -109,7 +109,11 @@ impl State {
             price_weight: params::get_f64(p, "price_weight", 0.5).clamp(0.0, 1.0),
             fomo_exponent: params::get_f64(p, "fomo_exponent", 1.1),
             perception_noise: params::get_f64(p, "perception_noise", 0.25),
-            order_notional: params::get_f64(p, "order_notional", 800.0),
+            // 200, not 800: dropped 4x at the user's request (2026-09-12), after
+            // measuring that human bots already trade ~150x less *often* than the
+            // noise::zero_intelligence baseline -- this makes each individual trade
+            // smaller too, on top of being rarer.
+            order_notional: params::get_f64(p, "order_notional", 200.0),
             max_position: params::get_f64(p, "max_position_notional", 4000.0) / price,
             disposition_loss_hold: params::get_f64(p, "disposition_loss_hold", 0.35),
             disposition_gain_eagerness: params::get_f64(p, "disposition_gain_eagerness", 1.3),
