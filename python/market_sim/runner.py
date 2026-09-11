@@ -151,6 +151,7 @@ def run_scenario_in_legs(
     progress: Optional[ProgressHandle] = None,
     on_leg_saved: Optional[Callable[[LegResult], None]] = None,
     resume: bool = True,
+    compute_market_health: bool = True,
 ) -> List[LegResult]:
     """Runs a scenario as `n_legs` sequential sessions of `leg_seconds` simulated
     seconds each, saving every leg to its own subdirectory
@@ -207,6 +208,17 @@ def run_scenario_in_legs(
     unsplit run of the same total length. Using this requires a `CancelToken`
     internally (the underlying `*_cancellable` calls take one together with
     `progress`) -- one is created automatically if `cancel_token` wasn't given.
+
+    `compute_market_health` (default `True`): also computes and persists
+    (`market_health.save_metrics`, `<leg_dir>/market_health.json`) that leg's full
+    `market_health.compute_run_metrics` output right after exporting it, while
+    `result` is still in memory -- so a later caller (the dashboard's per-leg
+    market-health line charts, in particular) can just read the file back instead
+    of reloading every export file and recomputing, which measured ~13-15s/leg on
+    a real multi-leg run. This genuinely adds that same ~13-15s/leg to the run
+    itself (paying the cost once, upfront, instead of never or lazily-later) --
+    pass `False` to skip it and keep legs finishing as fast as possible, e.g. for
+    a scan where you don't care about market-health metrics at all.
     """
     if progress is not None and cancel_token is None:
         cancel_token = CancelToken()
@@ -260,6 +272,19 @@ def run_scenario_in_legs(
             scenario_name=scenario_name,
             extra_meta={"leg_index": leg_idx, "n_legs": n_legs, "leg_seconds": leg_seconds},
         )
+        if compute_market_health:
+            # Local import: market_health.batch_compare imports market_sim.export,
+            # so importing market_health at module level here (this module is
+            # itself imported as part of market_sim/__init__.py) would risk a
+            # circular import at package-init time -- a local import defers it
+            # until this function actually runs, by which point both packages are
+            # already fully loaded. Uses `result` directly (compute_run_metrics
+            # accepts the raw in-memory shape, not just a loaded-from-disk one) --
+            # no extra reload needed, unlike computing this lazily later would.
+            import market_health
+
+            metrics = market_health.compute_run_metrics(result)
+            market_health.save_metrics(metrics, leg_out_dir)
         leg_result = LegResult(index=leg_idx, out_dir=leg_out_dir, paths=paths, meta=dict(result["meta"]))
         results.append(leg_result)
         checkpoint = result["checkpoint"]

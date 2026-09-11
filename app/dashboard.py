@@ -274,19 +274,35 @@ def _activate_result(result: dict, config_toml: str, source: str, save_path: str
     st.session_state.active_result = result
     st.session_state.active_config_toml = config_toml
     st.session_state.active_source = source
-    st.session_state.metrics = market_health.compute_run_metrics(result)
+    # A leg from a run made after `run_scenario_in_legs`'s `compute_market_health`
+    # default already has this persisted (`<leg_dir>/market_health.json`) -- reuse
+    # it rather than recomputing from `result` (already in memory, so recomputing
+    # is "just" ~11-13s of CPU wasted, not a reload, but still no reason to pay it
+    # twice). An older leg without one gets computed here AND persisted, same as
+    # `_leg_market_health`'s own miss path -- either way this leg never needs
+    # computing again after this.
+    leg_group = _leg_group_for_path(save_path)
+    persisted = market_health.load_metrics(save_path) if leg_group else None
+    if persisted is not None:
+        st.session_state.metrics = persisted
+    else:
+        st.session_state.metrics = market_health.compute_run_metrics(result)
+        if leg_group:
+            try:
+                market_health.save_metrics(st.session_state.metrics, save_path)
+            except OSError:
+                pass
     st.session_state.last_save_path = save_path
     # Every activation defaults to whole-run overview mode when the loaded run is
     # part of a leg group (see _render_price_volume) -- the one exception, drilling
     # into a specific leg's full single-trade-resolution chart via "Load for full
     # detail", sets this back to True itself right after calling this function.
     st.session_state.leg_drilldown = False
-    # If this is one leg of a multi-leg sequence, remember its metrics permanently
-    # (keyed by leg dir) so the Results tab's per-metric line charts across legs
-    # (see _render_market_health/_compute_all_leg_metrics) count this leg as
-    # already known and don't recompute it -- this dict also grows in bulk via
-    # the "Compute market-health for the remaining N legs" button there.
-    leg_group = _leg_group_for_path(save_path)
+    # Remember this leg's metrics (keyed by leg dir) so the Results tab's
+    # per-metric line charts across legs (see _render_market_health/
+    # _compute_all_leg_metrics) count this leg as already known and don't
+    # recompute it -- this dict also grows in bulk via the "Compute market-health
+    # for the remaining N legs" button there.
     if leg_group:
         st.session_state.setdefault("leg_metrics_by_dir", {})[save_path] = dict(st.session_state.metrics)
     # Bumped so cached, version-keyed derivations (see _trades_df_cached below) know
@@ -401,17 +417,28 @@ def _warm_leg_summaries(leg_dirs) -> None:
 
 @st.cache_resource(show_spinner=False, max_entries=2000)
 def _leg_market_health(leg_dir: str) -> dict:
-    """Full `market_health.compute_run_metrics` for one leg -- unlike
-    `_leg_candle_summary` above (which reads only 4 narrow columns), this loads
-    every export file (trades, order_events, snapshots, agent_state) for the leg
-    and runs the full report metric suite on it. Measured on this machine's real
-    200-leg run: ~2s to load + ~11-13s to compute per leg (~1.2-1.5M trades,
-    ~8M order events each) -- genuinely heavy, not the sub-second-per-leg cost
-    `_leg_candle_summary` has, which is why computing this for *every* leg is an
-    explicit opt-in action (see `_compute_all_leg_metrics`) with a real progress
-    bar, not something done silently on every render the way the candle overview
-    is. Cached per leg (process-wide, like `_leg_candle_summary`) so it's a
-    one-time cost per leg per dashboard process, not per rerun."""
+    """One leg's `market_health.compute_run_metrics` output. Checks for a
+    persisted `market_health.json` first (`market_health.load_metrics` --
+    written automatically by `run_scenario_in_legs` right after each leg since
+    `compute_market_health=True` became its default, so most legs from a run
+    made after that hit this path and are essentially free, just a JSON read).
+    Only on a miss (an older run made before persisting existed, or one made
+    with `compute_market_health=False`) does it fall back to the actually heavy
+    path: loading every export file (trades, order_events, snapshots,
+    agent_state) for the leg -- unlike `_leg_candle_summary` above, which reads
+    only 4 narrow columns -- and running the full report metric suite. Measured
+    on this machine's real 200-leg run: ~2s to load + ~11-13s to compute per leg
+    (~1.2-1.5M trades, ~8M order events each) -- genuinely heavy, which is why
+    computing this for *every* leg of an old run is an explicit opt-in action
+    (see `_compute_all_leg_metrics`) with a real progress bar, not something
+    done silently on every render the way the candle overview is. Persists the
+    result on a miss too (not just the in-process `st.cache_resource` above,
+    which is lost on dashboard restart), so a leg computed lazily here only
+    ever needs it once, same guarantee a fresh run's own automatic computation
+    gives."""
+    persisted = market_health.load_metrics(leg_dir)
+    if persisted is not None:
+        return persisted
     loaded = load_run(leg_dir)
     run = {
         "trades": loaded["trades"],
@@ -419,7 +446,12 @@ def _leg_market_health(leg_dir: str) -> dict:
         "orderbook_snapshots": loaded["orderbook_snapshots"],
         "agent_state": loaded["agent_state"],
     }
-    return market_health.compute_run_metrics(run)
+    metrics = market_health.compute_run_metrics(run)
+    try:
+        market_health.save_metrics(metrics, leg_dir)
+    except OSError:
+        pass  # e.g. a read-only run directory -- the in-process cache above still avoids recomputing this session
+    return metrics
 
 
 def _compute_all_leg_metrics(leg_dirs: tuple, known: dict) -> dict:
@@ -428,12 +460,18 @@ def _compute_all_leg_metrics(leg_dirs: tuple, known: dict) -> dict:
     `_warm_leg_summaries`'s silent spinner -- appropriate there since it's a
     ~15-20s one-time cost; this can genuinely take many minutes for a large
     multi-leg run, so a static spinner with no feedback would look hung).
-    `max_workers=4`, not 8 like the candle summaries: this is CPU-heavy pandas/
+    `max_workers=2`, not 8 like the candle summaries: this is CPU-heavy pandas/
     numpy work (variance ratio, autocorrelation, VPIN, Benford, ...), not
     I/O-bound parquet reads, so oversubscribing threads past the machine's core
-    count buys nothing and can even slow things down via contention. Returns a
-    NEW dict merging `known` with whatever got computed (callers should assign
-    this back into session_state)."""
+    count buys nothing and can even slow things down via contention -- but the
+    real reason it's this low is memory, not CPU: each in-flight leg holds its
+    full trades/order_events/snapshots/agent_state DataFrames at once (unlike
+    the narrow 4-column reads the candle summaries use), and a first attempt at
+    4 workers measured RSS climbing to 4.3GB in 15s on this machine with only
+    ~5GB free at the time -- real evidence of a genuine OOM risk, not a
+    theoretical one, on the same machine this whole project's memory-safety work
+    has been about. Returns a NEW dict merging `known` with whatever got
+    computed (callers should assign this back into session_state)."""
     import concurrent.futures
 
     todo = [d for d in leg_dirs if d not in known]
@@ -444,7 +482,7 @@ def _compute_all_leg_metrics(leg_dirs: tuple, known: dict) -> dict:
     status = st.empty()
     status.caption(f"Computing market-health for {len(todo)} legs (0/{len(todo)})...")
     done = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
         futures = {ex.submit(_leg_market_health, d): d for d in todo}
         for fut in concurrent.futures.as_completed(futures):
             d = futures[fut]
@@ -1430,7 +1468,22 @@ def _render_results_tab():
         leg_group_active = _leg_group_for_path(st.session_state.last_save_path)
         if leg_group_active:
             leg_dirs_active = tuple(_group_saved_runs(_discover_saved_runs()).get(leg_group_active, []))
-            known = {d: m for d, m in st.session_state.leg_metrics_by_dir.items() if d in leg_dirs_active}
+            # Not just session_state.leg_metrics_by_dir (empty at the start of a
+            # fresh dashboard session) -- a run made after run_scenario_in_legs's
+            # compute_market_health default already has every leg's metrics
+            # persisted on disk, so check for those too (cheap: an os.path.exists
+            # plus a small JSON read per leg, only for legs not already known this
+            # session) rather than showing a misleading "N legs missing, ~X min"
+            # estimate for legs that are actually already instant to load.
+            known = {}
+            for d in leg_dirs_active:
+                if d in st.session_state.leg_metrics_by_dir:
+                    known[d] = st.session_state.leg_metrics_by_dir[d]
+                    continue
+                persisted = market_health.load_metrics(d)
+                if persisted is not None:
+                    known[d] = persisted
+                    st.session_state.leg_metrics_by_dir[d] = persisted
             n_missing = len(leg_dirs_active) - len(known)
             st.caption(
                 f"{len(known)}/{len(leg_dirs_active)} legs have market-health metrics computed, shown below as "
@@ -1440,8 +1493,10 @@ def _render_results_tab():
             )
             if n_missing > 0:
                 # ~13-15s/leg measured serially on this machine's real 200-leg run
-                # (~2s load + ~11-13s compute), ~4x parallel via _compute_all_leg_metrics.
-                est_minutes = n_missing * 14 / 4 / 60
+                # (~2s load + ~11-13s compute), ~2x parallel via _compute_all_leg_metrics
+                # -- kept deliberately low (not e.g. 4) after a real memory scare: see
+                # that function's docstring.
+                est_minutes = n_missing * 14 / 2 / 60
                 st.caption(
                     f"Computing all of them is genuinely heavy (~14s/leg of real work, this machine's own "
                     f"measurement) -- estimated ~{est_minutes:.1f} min for the remaining {n_missing} legs, "

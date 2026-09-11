@@ -13,6 +13,8 @@ inventing a different one:
 """
 from __future__ import annotations
 
+import json
+import os
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -148,6 +150,39 @@ def compute_run_metrics(run: Dict[str, Any], asset_ids: Optional[Sequence[int]] 
     out["concentration.top1_share_agent"] = concentration.top_n_share(trades, n=1, by="agent")
     out["concentration.top5_share_agent"] = concentration.top_n_share(trades, n=5, by="agent")
     return out
+
+
+METRICS_FILENAME = "market_health.json"
+
+
+def save_metrics(metrics: Dict[str, float], out_dir: str) -> str:
+    """Persists a `compute_run_metrics` output next to a run's other exports
+    (`out_dir/market_health.json`), so a later caller (the dashboard's per-leg
+    line charts, in particular) can just read it back instead of recomputing --
+    recomputing means reloading every export file and re-running the full metric
+    suite, measured at ~13-15s per leg on a real multi-leg run, so persisting it
+    once right after the run (while the DataFrames are already in memory, no
+    reload needed) is strictly cheaper than ever doing it lazily later. Same
+    `json.dump(..., default=str)` convention as `run_metadata.json` -- NaN values
+    (a metric can be undefined, e.g. no snapshots) round-trip fine through
+    Python's `json` module even though strict JSON forbids them, same as every
+    other JSON file this project writes."""
+    path = os.path.join(out_dir, METRICS_FILENAME)
+    with open(path, "w") as f:
+        json.dump(metrics, f, indent=2, default=str)
+    return path
+
+
+def load_metrics(out_dir: str) -> Optional[Dict[str, float]]:
+    """The inverse of `save_metrics` -- `None` if this run wasn't exported with
+    persisted metrics (saved before this existed, or via a path that doesn't call
+    `save_metrics`), letting callers fall back to computing on demand rather than
+    assuming every run has one."""
+    path = os.path.join(out_dir, METRICS_FILENAME)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
 
 
 def composite_scores(
