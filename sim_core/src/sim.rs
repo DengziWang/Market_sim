@@ -679,12 +679,13 @@ fn build_population(cfg: &ScenarioConfig) -> Result<(Vec<AgentCommon>, Vec<BotSt
                     cfg.assets[asset_a as usize].initial_price,
                     cfg.assets[asset_b as usize].initial_price,
                     cfg.assets[asset_c as usize].initial_price,
+                    cash,
                     &params,
                 )),
                 "momentum" => BotStrategy::Momentum(momentum::State::from_params(parse_momentum_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
                 "mean_reversion" => BotStrategy::MeanReversion(mean_reversion::State::from_params(parse_mr_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
                 "grid" => BotStrategy::Grid(grid::State::from_params(parse_grid_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
-                "dca" => BotStrategy::Dca(dca::State::from_params(parse_dca_variant(&group.variant)?, asset_a, &params)),
+                "dca" => BotStrategy::Dca(dca::State::from_params(parse_dca_variant(&group.variant)?, asset_a, cfg.run.session_seconds, &params)),
                 "liquidation_trader" => {
                     BotStrategy::LiquidationTrader(liquidation_trader::State::from_params(parse_liq_variant(&group.variant)?, asset_a, cfg.liquidation.maintenance_margin_buffer, &params))
                 }

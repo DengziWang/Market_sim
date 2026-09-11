@@ -76,10 +76,20 @@ impl State {
     /// satisfy `price_c == price_a/price_b` by coincidence, so an uncalibrated
     /// peg_ratio made the "deviation" signal permanently, enormously past threshold
     /// and the bot trade every single wake regardless of any real mispricing.
+    ///
+    /// `cash`: this agent's own starting capital, used to size `order_notional`
+    /// (2026-09-12, at the user's request after a bot-by-bot realism review found
+    /// every arbitrageur trading the same flat $3,000/leg regardless of whether it
+    /// was capitalized at $30,000 or $100,000 -- unlike a real arbitrageur, who
+    /// sizes trades to their own capital and the opportunity, not a fixed ticket
+    /// size). Default `size_frac_of_cash` (10%) reproduces the old flat $3,000
+    /// default almost exactly at this scenario's $30,000 capital floor, and scales
+    /// up from there for better-capitalized agents.
     #[allow(clippy::too_many_arguments)]
-    pub fn from_params(variant: Variant, asset_a: AssetId, asset_b: AssetId, asset_c: AssetId, venue_a: VenueId, venue_b: VenueId, price_a: f64, price_b: f64, price_c: f64, p: &toml::Value) -> Self {
+    pub fn from_params(variant: Variant, asset_a: AssetId, asset_b: AssetId, asset_c: AssetId, venue_a: VenueId, venue_b: VenueId, price_a: f64, price_b: f64, price_c: f64, cash: f64, p: &toml::Value) -> Self {
         let z_window = params::get_u32(p, "z_window", 50) as usize;
-        let order_notional = params::get_f64(p, "order_notional", 3000.0);
+        let size_frac_of_cash = params::get_f64(p, "size_frac_of_cash", 0.10);
+        let order_notional = params::get_f64(p, "order_notional", cash * size_frac_of_cash);
         let default_peg_ratio = price_c.max(1e-9) * price_b.max(1e-9) / price_a.max(1e-9);
         Self {
             variant,

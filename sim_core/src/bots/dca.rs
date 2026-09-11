@@ -36,11 +36,23 @@ impl State {
         }
     }
 
-    pub fn from_params(variant: Variant, asset_id: AssetId, p: &toml::Value) -> Self {
+    /// `session_seconds`: real dollar-cost-averaging is a daily/weekly/monthly
+    /// discipline, not a fixed few-minutes interval -- but this project's own
+    /// sessions are capped at 30min-6h (spec's own upper bound), so a literally
+    /// realistic "once a week" cadence would almost never fire at all within one.
+    /// Compromise (2026-09-12, at the user's request after a bot-by-bot realism
+    /// review found the old fixed 300s default meant a $2,000-capitalized agent
+    /// could exhaust its entire cash within the session): default to
+    /// `session_seconds / 6` -- a handful of buys across a full session, not
+    /// hundreds -- scaling automatically with however long this particular run
+    /// actually is, rather than a fixed constant tuned for one specific length.
+    /// An explicit `wake_interval_secs` param still overrides this.
+    pub fn from_params(variant: Variant, asset_id: AssetId, session_seconds: SimTime, p: &toml::Value) -> Self {
+        let default_wake_interval = (session_seconds / 6.0).max(60.0);
         Self {
             variant,
             asset_id,
-            wake_interval: params::get_f64(p, "wake_interval_secs", 300.0),
+            wake_interval: params::get_f64(p, "wake_interval_secs", default_wake_interval),
             buy_amount_quote: params::get_f64(p, "buy_amount_quote", 100.0),
             target_initial_value: params::get_f64(p, "target_initial_value", 100.0),
             target_growth_per_period: params::get_f64(p, "target_growth_per_period", 100.0),
