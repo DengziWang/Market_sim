@@ -40,6 +40,26 @@ def test_run_scenario_in_legs_produces_one_directory_per_leg(tmp_path):
     assert legs[2].meta["actual_session_seconds"] == pytest.approx(60.0)
 
 
+def test_resume_picks_up_from_an_interrupted_sequence(tmp_path):
+    out_dir = str(tmp_path / "legs")
+    first = ms.run_scenario_in_legs(SMALL_CFG, leg_seconds=15.0, n_legs=2, out_dir=out_dir)
+    assert len(first) == 2
+
+    # Simulate a crash between calls: ask for more legs than exist yet, with the
+    # default resume=True -- should continue from leg 2's checkpoint, not restart.
+    second = ms.run_scenario_in_legs(SMALL_CFG, leg_seconds=15.0, n_legs=4, out_dir=out_dir)
+    assert len(second) == 4
+    assert second[0].out_dir == first[0].out_dir
+    assert second[1].out_dir == first[1].out_dir
+    assert second[2].meta["actual_session_seconds"] == pytest.approx(45.0)
+    assert second[3].meta["actual_session_seconds"] == pytest.approx(60.0)
+
+    # Calling again with the same n_legs is a no-op -- nothing new to compute.
+    third = ms.run_scenario_in_legs(SMALL_CFG, leg_seconds=15.0, n_legs=4, out_dir=out_dir)
+    assert len(third) == 4
+    assert [l.out_dir for l in third] == [l.out_dir for l in second]
+
+
 def test_discover_legs_and_load_run_legs_roundtrip(tmp_path):
     out_dir = str(tmp_path / "legs")
     legs = ms.run_scenario_in_legs(SMALL_CFG, leg_seconds=20.0, n_legs=3, out_dir=out_dir)

@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import copy
 import glob
+import json
 import os
 import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from market_sim import config as cfgmod
-from market_sim.export import ExportPaths, export_run, load_run
+from market_sim.export import ExportPaths, export_paths, export_run, load_run
 from market_sim.sim_pyo3 import CancelToken, continue_simulation, continue_simulation_cancellable, run_simulation, run_simulation_cancellable
 
 
@@ -148,6 +149,7 @@ def run_scenario_in_legs(
     scenario_name: Optional[str] = None,
     cancel_token: Optional[CancelToken] = None,
     on_leg_saved: Optional[Callable[[LegResult], None]] = None,
+    resume: bool = True,
 ) -> List[LegResult]:
     """Runs a scenario as `n_legs` sequential sessions of `leg_seconds` simulated
     seconds each, saving every leg to its own subdirectory
@@ -187,6 +189,14 @@ def run_scenario_in_legs(
     legs actually completed. `on_leg_saved(leg_result)`, if given, is called after
     each leg is written -- e.g. for a progress readout without loading anything back
     off disk.
+
+    `resume` (default `True`): if `out_dir` already has some `leg_NNNN` directories
+    in it (e.g. a previous call was interrupted -- killed, crashed, cancelled), pick
+    up from the last one's checkpoint instead of starting over from leg 1 -- the
+    already-saved legs are left untouched and counted toward `n_legs`, so calling
+    this again with the same arguments after an interruption just finishes the rest.
+    Set `resume=False` to always start fresh from leg 1 (this overwrites any
+    existing `leg_0001`, `leg_0002`, ... in `out_dir` as it goes).
     """
     cfg = copy.deepcopy(cfg)
     run_cfg = cfg.setdefault("run", {})
@@ -206,7 +216,22 @@ def run_scenario_in_legs(
     os.makedirs(out_dir, exist_ok=True)
     results: List[LegResult] = []
     checkpoint: Optional[bytes] = None
-    for leg_idx in range(1, n_legs + 1):
+    start_idx = 1
+    if resume:
+        existing = discover_legs(out_dir)
+        if existing:
+            last_loaded = load_run(existing[-1])
+            if "checkpoint" not in last_loaded:
+                raise ValueError(f"cannot resume: {existing[-1]} has no checkpoint -- use resume=False or a clean out_dir")
+            checkpoint = last_loaded["checkpoint"]
+            start_idx = len(existing) + 1
+            for i, leg_dir in enumerate(existing, start=1):
+                with open(os.path.join(leg_dir, "run_metadata.json")) as f:
+                    results.append(LegResult(index=i, out_dir=leg_dir, paths=export_paths(leg_dir), meta=json.load(f)))
+    if start_idx > n_legs:
+        return results
+
+    for leg_idx in range(start_idx, n_legs + 1):
         if leg_idx == 1:
             result = run_simulation_cancellable(config_toml, cancel_token) if cancel_token is not None else run_simulation(config_toml)
         else:
