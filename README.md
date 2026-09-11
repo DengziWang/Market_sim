@@ -346,16 +346,28 @@ a leg boundary need special treatment to stay exactly correct), each leg keeps i
 own already-correct `market_health.compute_run_metrics` output, shown as **one
 line chart per metric across every leg** (grouped by report dimension, in
 expanders) -- a genuine list of sessions, not one number that hides how it
-changes over the run's whole length. This is real work, not the ~15-20s/200-legs
-cost the candle overview has: `compute_run_metrics` needs every export file (not
-just `trades.parquet`), measured on this machine's real 200-leg run at ~2s to
-load + ~11-13s to compute *per leg*. So it's an explicit "Compute market-health
-for the remaining N legs" button (with an honest time estimate before you click),
-parallelized (`ThreadPoolExecutor`, 4 workers -- this is CPU-bound pandas/numpy
-work, not I/O-bound like the candle summaries, so more threads than cores doesn't
-help), and cached per leg afterward so it's a one-time cost per dashboard process.
-Loading a leg for full detail also computes (and caches) that one leg's metrics as
-a side effect, same as before.
+changes over the run's whole length.
+
+This is real work, not the ~15-20s/200-legs cost the candle overview has:
+`compute_run_metrics` needs every export file (not just `trades.parquet`),
+measured on this machine's real 200-leg run at ~2s to load + ~11-13s to compute
+*per leg*. `run_scenario_in_legs` pays this cost automatically now
+(`compute_market_health=True`, its default) -- right after exporting each leg,
+while its data is still in memory (no reload needed), computing and persisting
+that leg's metrics to `<leg_dir>/market_health.json` (`market_health.save_metrics`
+/ `load_metrics`). This is a deliberate tradeoff: it genuinely adds that same
+~11-13s/leg to the run itself, paid once upfront instead of never or lazily
+later -- pass `compute_market_health=False` to skip it for a scan where
+market-health doesn't matter. The dashboard checks for this file first and only
+falls back to the actually-heavy recompute-from-scratch path (also persisting the
+result once it does, so it's never paid twice) for an older run made before this
+existed, or one made with the flag off -- shown as an explicit "Compute
+market-health for the remaining N legs" button with an honest time estimate,
+parallelized (`ThreadPoolExecutor`, 2 workers -- deliberately conservative: a
+first attempt at 4 measured RSS climbing to 4.3GB in 15s on this machine, real
+evidence of OOM risk given this project's actual crash history, not just a CPU-
+contention guess). Loading a leg for full detail also checks/persists that one
+leg's metrics the same way.
 
 **Trade search across an entire multi-leg run**: a checkbox on the Trade search
 table extends it from "this one loaded leg" to "every leg" -- each leg's
@@ -626,6 +638,26 @@ Documented in more detail at each site in the code; the significant ones:
   bug in the Avellaneda-Stoikov market-maker (mixing a fractional log-return
   volatility with an absolute-price spread term) and an unstable arbitrage sizing
   formula (dividing a dollar target by a live, potentially-crashing price).
+- **Avellaneda-Stoikov's reservation price is now clamped** (2026-09-12), closing a
+  second, later-discovered gap in the same bot: `half_spread` already had a
+  defensive clamp (the previous point), but the reservation price it's centered on
+  didn't -- `inventory_norm * gamma * sigma^2 * horizon_secs` (`sigma` here is this
+  bot's own rolling realized-volatility estimate from recent observed returns, not
+  the asset's configured `fundamental_vol`) is unbounded, so a momentary spike in
+  that estimate could push the reservation many multiples of mid away from the real
+  market price -- a real, wildly mispriced quote that another bot immediately trades
+  on, feeding an even larger realized return back into the estimate on this bot's
+  *next* wake. Found by inspecting a real 5,000-agent/300,000s run at the user's
+  prompting ("why is BTC stable but the others sometimes near-zero or way up") --
+  DOGE's traded price jumped 17.6x in a single trade this way, repeatedly, on the
+  thinner/higher-vol assets specifically (the latent fundamental value itself stayed
+  perfectly well-behaved throughout, confirming this was a bot-logic bug, not a
+  reference-price or data issue). Fixed by clamping the reservation to within 10% of
+  mid, same bound already used for the spread. Regression test:
+  `sim_core/tests/market_maker_test.rs` drives the bot directly with a manually
+  crafted extreme volatility window (deterministic, not hoping to reproduce the rare
+  stochastic event in a full run) and asserts the resulting quote stays bounded;
+  verified via `git stash` that it fails without the fix and passes with it.
 - **Matching-time circuit breaker** (`market.max_price_move_frac`, default 15%): a
   single order's matching won't cross more than that fraction away from the best
   opposing price it started against, and a resting limit order more than 50x (or

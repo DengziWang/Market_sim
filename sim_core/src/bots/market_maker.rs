@@ -159,13 +159,29 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     }
 
     // Defensive clamps: an extreme (e.g. early-session, thin-sample) volatility or
-    // toxicity estimate must never be able to produce a non-positive or absurdly wide
-    // quote. Without this, adaptive_spread in particular could occasionally emit a
-    // negative bid price. 10% half-spread (20% total) is already a very wide, stressed
-    // quote for any real market maker -- a tighter belt-and-braces bound than the
-    // 50% this used before the Avellaneda-Stoikov dimensional fix above, which was
-    // wide enough to let a formula bug still produce a barely-clamped, badly wrong
-    // quote rather than actually catching it.
+    // toxicity estimate must never be able to produce a non-positive, absurdly wide,
+    // or wildly mis-centered quote. Without this, adaptive_spread in particular could
+    // occasionally emit a negative bid price. 10% half-spread (20% total) is already
+    // a very wide, stressed quote for any real market maker -- a tighter belt-and-
+    // braces bound than the 50% this used before the Avellaneda-Stoikov dimensional
+    // fix above, which was wide enough to let a formula bug still produce a
+    // barely-clamped, badly wrong quote rather than actually catching it.
+    //
+    // The `reservation` clamp is the same idea, closing a real gap: unlike
+    // `half_spread` above, `reservation` (Avellaneda-Stoikov specifically) had no
+    // bound at all until this fix. `inventory_norm * gamma * sigma^2 * horizon_secs`
+    // is unbounded, so a momentary spike in this bot's own rolling realized-
+    // volatility estimate (`sigma`, from recent observed returns -- not the asset's
+    // configured `fundamental_vol`) could push the reservation many multiples of mid
+    // away from the real market price. That produces a real, wildly mispriced quote
+    // that another bot immediately trades on -- which feeds a large realized return
+    // back into `sigma` on this bot's *next* wake, an actual measured runaway
+    // feedback loop: a real 5,000-agent/300,000s run had DOGE's traded price jump
+    // 17.6x in a single trade this way (repeatedly, on the thinner/higher-vol
+    // assets specifically -- see git history). Same 10%-of-mid bound as the spread
+    // above: an aggressive but not fully clamped-to-nothing skew for a stressed
+    // market, not a multiple of the price.
+    let reservation = reservation.clamp(mid * 0.9, mid * 1.1);
     let half_spread = half_spread.max(mid * 1e-6).min(mid * 0.1);
     let bid_price = (reservation - half_spread).max(mid * 1e-4);
     let ask_price = (reservation + half_spread).max(mid * 1e-4);
