@@ -17,6 +17,15 @@ serde_json = "1"
 toml = "0.8"
 rayon = "1.10"
 ordered-float = "4"
+# Faster hasher for the per-asset/per-(venue,asset) HashMaps in market.rs/agent.rs
+# (asset/venue counts are always small -- a handful, not thousands): std's default
+# SipHash is deliberately DoS-resistant, which costs real speed for small integer
+# keys looked up millions of times a run; FxHash (used throughout rustc itself for
+# the same reason) is markedly faster for this shape of key with no behavior
+# change -- same HashMap API/semantics, purely a different hash algorithm. Not
+# used for anything keyed by untrusted external input (nothing here is), so the
+# DoS-resistance SipHash exists for isn't a concern being traded away.
+rustc-hash = "1"
 # Checkpoint wire format: self-describing (unlike bincode) so it round-trips
 # `toml::Value` (BotGroupConfig::params, deliberately dynamic) and the market's
 # tuple-keyed order-book maps (HashMap<(VenueId, AssetId), _>, which JSON can't

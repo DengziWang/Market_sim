@@ -17,7 +17,7 @@ use crate::export::{AgentStateRow, OrderEventRow, SimResult, SnapshotRow, TradeR
 use crate::market::Market;
 use crate::order::{Fill, OrderEventKind};
 use crate::rng;
-use crate::types::{AgentId, AssetId, OrderId, OrderType, Side, SimTime, TimeInForce, VenueId};
+use crate::types::{AgentId, AssetId, FxHashMap, OrderType, Side, SimTime, TimeInForce, VenueId};
 
 const PRIMARY_VENUE: VenueId = 0;
 
@@ -316,14 +316,11 @@ impl Simulation {
 
     fn apply_action(&mut self, agent_id: AgentId, action: Action) {
         match action {
-            Action::Cancel(order_id) => {
+            Action::Cancel(order_id, asset_id) => {
                 // Cancels are applied immediately (no latency modeled on cancels --
                 // documented simplification, see README).
-                let asset_id = self.order_asset_hint(order_id);
-                if let Some(asset_id) = asset_id {
-                    if let Some(ev) = self.market.cancel(PRIMARY_VENUE, asset_id, order_id, self.now) {
-                        self.push_order_event(ev, PRIMARY_VENUE);
-                    }
+                if let Some(ev) = self.market.cancel(PRIMARY_VENUE, asset_id, order_id, self.now) {
+                    self.push_order_event(ev, PRIMARY_VENUE);
                 }
             }
             Action::Submit(req) => {
@@ -353,19 +350,6 @@ impl Simulation {
                 }
             }
         }
-    }
-
-    /// Every currently-open order id was submitted for some asset; strategies only
-    /// ever cancel their own ids, so a lightweight reverse lookup through the book is
-    /// avoided by asking each per-asset book whether it knows this id. With few
-    /// assets this is cheap; see README for the multi-asset scaling note.
-    fn order_asset_hint(&self, order_id: OrderId) -> Option<AssetId> {
-        for aid in 0..self.market.n_assets() as AssetId {
-            if self.market.book(PRIMARY_VENUE, aid).orders.contains_key(&order_id) {
-                return Some(aid);
-            }
-        }
-        None
     }
 
     fn handle_delayed_arrival(&mut self, payload_id: u64) {
@@ -494,7 +478,7 @@ impl Simulation {
     }
 
     fn run_liquidation_sweep(&mut self) {
-        let mark_prices: HashMap<AssetId, f64> = self.market.mark_price_ema.clone();
+        let mark_prices = self.market.mark_price_ema.clone();
         for idx in 0..self.agents.len() {
             if self.agents[idx].bankrupt {
                 continue;
@@ -742,7 +726,7 @@ fn build_population(cfg: &ScenarioConfig) -> Result<(Vec<AgentCommon>, Vec<BotSt
             // start of every session in testing (see git history). 20-60% of the
             // agent's starting budget is pre-converted into inventory at the asset's
             // initial price; the rest stays as cash.
-            let mut inventory = HashMap::new();
+            let mut inventory = FxHashMap::default();
             if group.bot_type == "noise" {
                 let frac = rng.gen_range(0.2..0.6);
                 let initial_price = cfg.assets[asset_a as usize].initial_price.max(1e-9);

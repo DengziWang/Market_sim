@@ -72,7 +72,7 @@ impl State {
 }
 
 pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult {
-    let mut actions: Vec<Action> = s.active_order_ids.drain(..).map(Action::Cancel).collect();
+    let mut actions: Vec<Action> = s.active_order_ids.drain(..).map(|id| Action::Cancel(id, s.asset_id)).collect();
 
     let Some(mid) = ctx.market.mid_price(ctx.venue, s.asset_id) else {
         return StepResult { actions, next_wake: Some(ctx.now + s.wake_interval) };

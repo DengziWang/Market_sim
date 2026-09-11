@@ -456,6 +456,65 @@ matter), and per spec 6a/12: if a real batch run turns out much worse than this
 predicts, reduce the defaults and confirm the change with the user rather than
 deciding alone.
 
+### Engine micro-optimizations (verified behavior-preserving)
+
+`sim_core/examples/bench.rs` is a pure-Rust benchmark (no PyO3/Python overhead)
+built to safely speed up the event loop itself, added when optimizing without
+being allowed to change simulation behavior at all -- run it directly:
+
+```
+cargo build --release --example bench -p sim_core
+./target/release/examples/bench <n_agents_scale> <session_seconds>   # e.g. `2 1000` -> 758 agents
+```
+
+It prints `trades=`/`order_events=`/`snapshots=` counts alongside `elapsed=`/
+`events/sec=`, which is the actual verification methodology used for every change
+below: `git stash` the change, run the benchmark at a fixed seed/scale, `git stash
+pop`, rebuild, run again, and `diff` the two outputs. Only `elapsed`/`events/sec`
+are allowed to differ -- any change to the trade/order_event/snapshot counts means
+the change altered behavior, not just speed, and gets reverted. Two changes passed
+this bar:
+
+1. **`Action::Cancel` carries its `AssetId` directly.** Every bot that cancels one
+   of its own resting orders already knows which asset that order is on (each
+   resting order is single-asset), so `Action::Cancel(OrderId, AssetId)` lets
+   `Simulation::apply_action` cancel directly. Previously it only carried the
+   `OrderId` and `Simulation` had to find the asset itself via `order_asset_hint`,
+   an O(n_assets) scan across every asset's order-book `HashMap` on *every single
+   cancel* -- cheap with a handful of assets, but pure waste since the caller
+   already had the answer.
+2. **FxHash instead of SipHash for small dense-integer-keyed maps.** `std::HashMap`'s
+   default hasher (SipHash) is deliberately DoS-resistant, which costs real speed
+   for the per-asset and per-`(venue, asset)` maps in `market.rs`
+   (`books`/`mark_price_ema`/`fundamental_value`/`sentiment`/`last_trade_price`) and
+   `agent.rs` (`AgentCommon.inventory`) -- typically 1-10 distinct keys, looked up
+   millions of times a run, never keyed by untrusted input. `types::FxHashMap`
+   swaps in `rustc-hash`'s `FxHasher` (the same one used throughout the Rust
+   compiler for this exact reason) as a drop-in hasher-only change: identical
+   `HashMap` API and semantics, no data-structure or logic change.
+
+Measured at scale=2/session=1000s (758 agents), `trades=35434 order_events=791278
+snapshots=113040` identical before and after both changes:
+
+| | elapsed | events/sec |
+|---|---|---|
+| before | 0.374s | 2,208,026 |
+| after | 0.327s | 2,527,424 |
+
+~12.6% faster wall time, ~14.5% higher throughput, for zero change to simulated
+trading behavior (same trades, same prices, same order events, byte-for-byte).
+Verified with the full Rust test suite (`cargo test`, 24 tests including the
+checkpoint CBOR round-trip tests) and the full Python suite (`pytest tests_py/`)
+passing unchanged after rebuilding the `sim_pyo3` wheel.
+
+Not pursued this round (identified but lower confidence/payoff, left for a future
+pass if more speed is needed): `OrderBook.orders: HashMap<OrderId, Order>` --
+order IDs are large monotonically-increasing `u64`s rather than small dense keys,
+so FxHash would still help some, but a `Vec`-based approach would need more design
+work given orders get removed (creating gaps); `Simulation.pending_delayed:
+HashMap<u64, (AgentId, NewOrderRequest)>`, left as `std::HashMap` since it wasn't
+confirmed hot.
+
 ### Memory: the actual scaling limit
 
 Every trade/order-event/snapshot produced during a run is held in memory for the

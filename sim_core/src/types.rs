@@ -5,6 +5,12 @@ pub type VenueId = u16;
 pub type AgentId = u32;
 pub type OrderId = u64;
 
+/// `std::collections::HashMap` with FxHash instead of the default SipHash -- see
+/// the `rustc-hash` dependency comment in Cargo.toml. Used for the small,
+/// dense-integer-keyed maps that get looked up on every single event (per-asset
+/// market state, per-agent inventory), not for anything keyed by untrusted input.
+pub type FxHashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+
 /// Simulated time, in seconds since session start. f64 is precise enough for
 /// sessions of a few hours at sub-millisecond event resolution and is far
 /// simpler to work with across the codebase than a fixed-point duration type.

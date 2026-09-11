@@ -1,11 +1,9 @@
 //! Agent state shared by every bot type/variant, and the small vocabulary
 //! (`Action`, `StepResult`) bots use to talk to the engine.
 
-use std::collections::HashMap;
-
 use rand_chacha::ChaCha8Rng;
 
-use crate::types::{AgentId, AssetId, OrderId, OrderType, PriceTicks, Side, SimTime, TimeInForce};
+use crate::types::{AgentId, AssetId, FxHashMap, OrderId, OrderType, PriceTicks, Side, SimTime, TimeInForce};
 
 /// A leveraged position, held by the configurable sub-population of agents that
 /// trade on margin (Phase 1 simplified model: see sim_core::liquidation).
@@ -68,7 +66,7 @@ pub enum LiquidationExecStyle {
 pub struct AgentCommon {
     pub id: AgentId,
     pub cash: f64,
-    pub inventory: HashMap<AssetId, f64>,
+    pub inventory: FxHashMap<AssetId, f64>,
     pub bankrupt: bool,
     pub margin: Option<MarginPosition>,
     pub liquidation_style: LiquidationExecStyle,
@@ -99,7 +97,7 @@ impl AgentCommon {
         *self.inventory.entry(asset_id).or_insert(0.0) += delta;
     }
 
-    pub fn equity(&self, mark_prices: &HashMap<AssetId, f64>) -> f64 {
+    pub fn equity(&self, mark_prices: &FxHashMap<AssetId, f64>) -> f64 {
         let inv_value: f64 = self
             .inventory
             .iter()
@@ -131,7 +129,12 @@ pub struct NewOrderRequest {
 #[derive(Debug, Clone)]
 pub enum Action {
     Submit(NewOrderRequest),
-    Cancel(OrderId),
+    /// The asset the order being cancelled belongs to -- every bot that cancels its
+    /// own resting orders already knows this (each is single-asset per resting
+    /// order), so carrying it here avoids `Simulation` having to search every
+    /// asset's book for the order id on every single cancel (previously
+    /// `order_asset_hint`, an O(n_assets) scan -- see git history).
+    Cancel(OrderId, AssetId),
 }
 
 pub struct StepResult {

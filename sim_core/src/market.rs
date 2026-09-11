@@ -3,8 +3,6 @@
 //! Uhlenbeck; ground truth for price-efficiency metrics and fundamentalist bots),
 //! and an optional simplified public mempool for MEV bots.
 
-use std::collections::HashMap;
-
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::StandardNormal;
@@ -12,7 +10,7 @@ use rand_distr::StandardNormal;
 use crate::config::{AssetConfig, FeeConfig, MarketConfig, MempoolConfig, VenueConfig};
 use crate::order::{Order, OrderEvent};
 use crate::orderbook::{OrderBook, SubmitResult};
-use crate::types::{AgentId, AssetId, OrderId, OrderType, PriceTicks, Side, SimTime, TimeInForce, VenueId};
+use crate::types::{AgentId, AssetId, FxHashMap, OrderId, OrderType, PriceTicks, Side, SimTime, TimeInForce, VenueId};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingMempoolOrder {
@@ -37,13 +35,13 @@ pub struct Market {
     pub cfg: MarketConfig,
     pub fees: FeeConfig,
     pub mempool_cfg: MempoolConfig,
-    books: HashMap<(VenueId, AssetId), OrderBook>,
-    pub mark_price_ema: HashMap<AssetId, f64>,
-    pub fundamental_value: HashMap<AssetId, f64>,
+    books: FxHashMap<(VenueId, AssetId), OrderBook>,
+    pub mark_price_ema: FxHashMap<AssetId, f64>,
+    pub fundamental_value: FxHashMap<AssetId, f64>,
     /// Collective market mood per asset, roughly in [-1, 1]. See
     /// `AssetConfig::sentiment_vol`/`sentiment_theta`'s doc comment.
-    pub sentiment: HashMap<AssetId, f64>,
-    pub last_trade_price: HashMap<(VenueId, AssetId), f64>,
+    pub sentiment: FxHashMap<AssetId, f64>,
+    pub last_trade_price: FxHashMap<(VenueId, AssetId), f64>,
     pub pending_mempool: Vec<PendingMempoolOrder>,
     next_order_id: OrderId,
     next_payload_id: u64,
@@ -51,10 +49,10 @@ pub struct Market {
 
 impl Market {
     pub fn new(assets: Vec<AssetConfig>, venues: Vec<VenueConfig>, cfg: MarketConfig, fees: FeeConfig, mempool_cfg: MempoolConfig) -> Self {
-        let mut books = HashMap::new();
-        let mut mark_price_ema = HashMap::new();
-        let mut fundamental_value = HashMap::new();
-        let mut sentiment = HashMap::new();
+        let mut books = FxHashMap::default();
+        let mut mark_price_ema = FxHashMap::default();
+        let mut fundamental_value = FxHashMap::default();
+        let mut sentiment = FxHashMap::default();
         for (vid, _venue) in venues.iter().enumerate() {
             for (aid, asset) in assets.iter().enumerate() {
                 books.insert((vid as VenueId, aid as AssetId), OrderBook::new(aid as AssetId, asset.tick_size, cfg.max_price_move_frac));
@@ -75,7 +73,7 @@ impl Market {
             mark_price_ema,
             fundamental_value,
             sentiment,
-            last_trade_price: HashMap::new(),
+            last_trade_price: FxHashMap::default(),
             pending_mempool: Vec::new(),
             next_order_id: 1,
             next_payload_id: 1,

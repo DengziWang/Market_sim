@@ -87,10 +87,10 @@ impl State {
 pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult {
     let mut actions = Vec::new();
     if let Some(id) = s.last_bid_id.take() {
-        actions.push(Action::Cancel(id));
+        actions.push(Action::Cancel(id, s.asset_id));
     }
     if let Some(id) = s.last_ask_id.take() {
-        actions.push(Action::Cancel(id));
+        actions.push(Action::Cancel(id, s.asset_id));
     }
 
     let Some(mid) = ctx.market.mid_price(ctx.venue, s.asset_id) else {
