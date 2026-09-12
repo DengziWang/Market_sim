@@ -10,13 +10,41 @@
 //! `sentiment_herder` only to mood -- merged into one bot that does both, since a
 //! real retail trader isn't cleanly one or the other):
 //!   - **Reacts to both price trend and sentiment**: the directional signal blends a
-//!     recent-price-return component with the latent, price-independent
-//!     `Market::sentiment` process (see market.rs), each normalized by its own
-//!     threshold and perceived with individual noise -- see `raw_signal` in `step()`.
-//!   - **Disposition effect**: hold losers too long, sell winners too early --
-//!     probably the most robust documented bias in retail trading. Needs the bot's
-//!     own average entry price, which nothing elsewhere in the engine tracks; see
-//!     `avg_entry_price`'s inference logic in `step()`.
+//!     trend/mean-reversion component (see "chartist vs. fundamentalist" below) with
+//!     the latent, price-independent `Market::sentiment` process (see market.rs),
+//!     each normalized by its own threshold and perceived with individual noise --
+//!     see `raw_signal` in `step()`.
+//!   - **Chartist-vs-fundamentalist strategy switching (2026-09-13)**: real retail
+//!     traders don't consistently trust momentum ("it's going up, buy") or mean-
+//!     reversion ("it's overpriced, sell") -- they drift toward whichever has
+//!     recently been paying off, the same mechanism Brock & Hommes (1998,
+//!     *Heterogeneous beliefs and routes to chaos in a simple asset pricing model*,
+//!     JEDC) use to explain endogenous bubbles/crashes from a population that keeps
+//!     re-weighting itself toward the currently-winning strategy. Each agent tracks
+//!     a rolling "fitness" (realized hypothetical payoff, decayed like
+//!     `recent_pnl_frac` below) for a chartist (momentum) and a fundamentalist
+//!     (mean-reversion toward the market's own known-but-not-directly-observed-by-
+//!     the-agent `fundamental_value`) signal, and blends between them via a
+//!     logistic function of the fitness *difference* scaled by `intensity_of_choice`
+//!     (Brock-Hommes' own parameter name) -- the sharper the recent gap in which
+//!     strategy paid off, the more the agent leans into it. This replaces what used
+//!     to be a single fixed momentum-only price component with something that can
+//!     genuinely flip character mid-run, the way real retail sentiment does.
+//!   - **Disposition effect via Cumulative Prospect Theory (2026-09-13)**: hold
+//!     losers too long, sell winners too early -- probably the most robust
+//!     documented bias in retail trading (Odean 1998). Previously modeled as two
+//!     fixed multipliers (`disposition_loss_hold`/`disposition_gain_eagerness`)
+//!     applied identically regardless of how big the gain/loss actually was. Now
+//!     uses the real CPT value function from Tversky & Kahneman (1992, *Advances in
+//!     Prospect Theory*): `v(r) = r^alpha` for gains, `v(r) = -lambda*(-r)^beta` for
+//!     losses, with their own empirically-estimated defaults (alpha=beta=0.88,
+//!     lambda=2.25) -- diminishing sensitivity in *both* domains (a bigger loss
+//!     doesn't hurt proportionally more once you're already deep in one, which is
+//!     the actual mathematical reason CPT predicts "hold and hope" rather than
+//!     accepting a small loss) and loss aversion (losses hurt ~2.25x more than an
+//!     equal-sized gain feels good). Needs the bot's own average entry price,
+//!     which nothing elsewhere in the engine tracks; see `avg_entry_price`'s
+//!     inference logic in `step()`.
 //!   - **Irregular, bursty attention**: a long, jittery background check-in interval
 //!     (not a fixed wake_interval like every other bot type), with a much shorter
 //!     "can't stop refreshing" interval after a big move/mood swing was just
@@ -59,18 +87,40 @@ pub struct State {
     /// Return (fraction) since this agent's own last check-in that counts as a full
     /// "one unit" price signal -- see `raw_signal`'s normalization in `step()`.
     pub price_signal_threshold: f64,
+    /// Deviation from the (agent-unobserved) fundamental value that counts as a
+    /// full "one unit" mean-reversion signal -- the fundamentalist counterpart to
+    /// `price_signal_threshold`'s chartist one.
+    pub fundamentalist_signal_threshold: f64,
+    /// Brock & Hommes' own parameter name: how sharply the population re-weights
+    /// toward whichever of chartist/fundamentalist has recently paid off. 0 = always
+    /// an even 50/50 blend regardless of fitness; higher = faster, more decisive
+    /// switching toward the currently-winning strategy.
+    pub intensity_of_choice: f64,
     /// Perceived sentiment reading (already normalized to roughly [-1, 1]) that
     /// counts as a full "one unit" mood signal.
     pub sentiment_signal_threshold: f64,
-    /// Blend weight for the two normalized signal components: 1.0 = price trend
-    /// only, 0.0 = sentiment only, 0.5 (default) = equal weight to both.
+    /// Blend weight for the two normalized signal components: 1.0 = price-based
+    /// (chartist/fundamentalist blend) only, 0.0 = sentiment only, 0.5 (default) =
+    /// equal weight to both.
     pub price_weight: f64,
     pub fomo_exponent: f64,
     pub perception_noise: f64,
     pub order_notional: f64,
     pub max_position: f64,
-    pub disposition_loss_hold: f64,
-    pub disposition_gain_eagerness: f64,
+    /// Tversky & Kahneman (1992) CPT value-function parameters -- see the module
+    /// doc comment. `cpt_alpha`/`cpt_beta` are the diminishing-sensitivity curvature
+    /// for gains/losses respectively (canonical estimate: both 0.88); `cpt_lambda`
+    /// is the loss-aversion coefficient (canonical estimate: 2.25).
+    pub cpt_alpha: f64,
+    pub cpt_beta: f64,
+    pub cpt_lambda: f64,
+    /// Free scale constants (not from the CPT literature, which doesn't specify how
+    /// *this* engine's sell-quantity multiplier should respond to a given CPT value
+    /// -- these calibrate the mapping) converting the CPT value into how much the
+    /// sell quantity shrinks (losses) or grows (gains) relative to the un-adjusted
+    /// signal-driven quantity.
+    pub cpt_loss_hold_scale: f64,
+    pub cpt_gain_eagerness_scale: f64,
     pub pnl_sizing_sensitivity: f64,
     pub max_cash_frac_per_trade: f64,
     pub p_act_given_signal: f64,
@@ -79,6 +129,15 @@ pub struct State {
     pub last_seen_inventory: f64,
     pub avg_entry_price: Option<f64>,
     pub recent_pnl_frac: f64,
+    /// Rolling, decayed fitness (realized hypothetical payoff) of the chartist and
+    /// fundamentalist signals -- see the module doc comment's Brock-Hommes section.
+    /// Updated each wake from what actually happened since the *previous* one, using
+    /// `last_chartist_signal`/`last_fundamentalist_signal` (that previous wake's
+    /// signals, i.e. what each strategy "predicted" then).
+    pub chartist_fitness: f64,
+    pub fundamentalist_fitness: f64,
+    pub last_chartist_signal: f64,
+    pub last_fundamentalist_signal: f64,
 }
 
 impl State {
@@ -105,6 +164,8 @@ impl State {
             // in a couple of minutes" is more human than refreshing every 20s.
             alert_wake_interval: params::get_f64(p, "alert_wake_interval_secs", 120.0),
             price_signal_threshold: params::get_f64(p, "price_signal_threshold", 0.02),
+            fundamentalist_signal_threshold: params::get_f64(p, "fundamentalist_signal_threshold", 0.02),
+            intensity_of_choice: params::get_f64(p, "intensity_of_choice", 4.0),
             sentiment_signal_threshold: params::get_f64(p, "sentiment_signal_threshold", 0.15),
             price_weight: params::get_f64(p, "price_weight", 0.5).clamp(0.0, 1.0),
             fomo_exponent: params::get_f64(p, "fomo_exponent", 1.1),
@@ -115,8 +176,11 @@ impl State {
             // smaller too, on top of being rarer.
             order_notional: params::get_f64(p, "order_notional", 200.0),
             max_position: params::get_f64(p, "max_position_notional", 4000.0) / price,
-            disposition_loss_hold: params::get_f64(p, "disposition_loss_hold", 0.35),
-            disposition_gain_eagerness: params::get_f64(p, "disposition_gain_eagerness", 1.3),
+            cpt_alpha: params::get_f64(p, "cpt_alpha", 0.88),
+            cpt_beta: params::get_f64(p, "cpt_beta", 0.88),
+            cpt_lambda: params::get_f64(p, "cpt_lambda", 2.25),
+            cpt_loss_hold_scale: params::get_f64(p, "cpt_loss_hold_scale", 2.0),
+            cpt_gain_eagerness_scale: params::get_f64(p, "cpt_gain_eagerness_scale", 1.5),
             pnl_sizing_sensitivity: params::get_f64(p, "pnl_sizing_sensitivity", 0.8),
             // Even a panicking/euphoric person rarely deploys their *entire*
             // remaining cash into one single trade; also directly bounds how much any
@@ -133,6 +197,10 @@ impl State {
             last_seen_inventory: 0.0,
             avg_entry_price: None,
             recent_pnl_frac: 0.0,
+            chartist_fitness: 0.0,
+            fundamentalist_fitness: 0.0,
+            last_chartist_signal: 0.0,
+            last_fundamentalist_signal: 0.0,
         }
     }
 }
@@ -158,6 +226,20 @@ fn round_to_nice(x: f64) -> f64 {
     nice * base
 }
 
+/// Tversky & Kahneman (1992) cumulative prospect theory value function: diminishing
+/// sensitivity in both domains (concave for gains, convex for losses -- curvature
+/// `alpha`/`beta`), loss aversion (`lambda`, applied only to the loss side). `r` is
+/// a return fraction (e.g. 0.10 = +10%, -0.10 = -10%), not a raw dollar amount --
+/// this engine has no natural absolute-dollar reference point, but return fractions
+/// are exactly what `avg_entry_price` already gives us for free.
+fn cpt_value(r: f64, alpha: f64, beta: f64, lambda: f64) -> f64 {
+    if r >= 0.0 {
+        r.powf(alpha)
+    } else {
+        -lambda * (-r).powf(beta)
+    }
+}
+
 pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult {
     let mut actions = Vec::new();
     let Some(mid) = ctx.market.mid_price(ctx.venue, s.asset_id) else {
@@ -169,8 +251,8 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     // Infer fills from the observed inventory change since last wake (there's no
     // synchronous fill callback here, same constraint every other bot works under),
     // and use it to track a running average entry price and a decaying estimate of
-    // recent realized P&L -- the two things the disposition effect and "hot hand"
-    // sizing below need, and that nothing generic in AgentCommon tracks.
+    // recent realized P&L -- the two things the CPT-based disposition effect and
+    // "hot hand" sizing below need, and that nothing generic in AgentCommon tracks.
     let delta_inv = inventory - s.last_seen_inventory;
     if delta_inv > 1e-9 {
         let prev_qty = s.last_seen_inventory.max(0.0);
@@ -188,25 +270,57 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     }
     s.last_seen_inventory = inventory;
 
-    // Price-trend component: recent return, normalized for elapsed-time-since-last-
-    // check (irregular attention means that gap varies a lot -- comparing raw return
-    // straight to a fixed threshold makes an agent that happened to sleep longer see
-    // an artificially bigger "move" for the same underlying drift rate, not a real
-    // signal). Normalize by sqrt(elapsed / reference), consistent with how return
-    // volatility scales with time in a random walk, so a return observed after the
-    // *typical* gap keeps a ~1x multiplier while a return spanning an unusually long
-    // gap is scaled back down. Without this, a large population sharing a wide range
-    // of check-in intervals could produce a feedback loop: bots with longer gaps
-    // overreact, push price further, and *other* bots' next (possibly also-long) gap
-    // then spans an even bigger apparent move -- this happened in testing (see git
-    // history). Then normalized by `price_signal_threshold` so it's on the same
-    // "1 unit = alert-worthy" scale as the sentiment component below.
+    // Realized return since last check-in, time-normalized the same way regardless
+    // of which downstream use it feeds (chartist signal below, and the Brock-Hommes
+    // fitness update just after) -- see the original comment on why sqrt(elapsed/
+    // reference) normalization matters: without it, agents with a longer gap since
+    // their last wake see an artificially amplified "move" for the same underlying
+    // drift rate, which produced a real feedback loop in testing (see git history).
     let prev_price = s.last_price.unwrap_or(mid);
     let raw_return = (mid - prev_price) / prev_price.max(1e-9);
     let reference_interval = (s.background_wake_min + s.background_wake_max) / 2.0;
     let elapsed = ctx.now - s.last_wake_time.unwrap_or(ctx.now);
     let time_norm = (elapsed / reference_interval.max(1e-9)).sqrt().max(0.3);
+
+    // Brock & Hommes (1998) fitness update: score last wake's chartist and
+    // fundamentalist signals against what the price *actually* did since then. A
+    // signal that correctly anticipated the direction of `raw_return` gets a
+    // positive contribution (scaled by the return's own magnitude, so being right
+    // about a big move matters more than being right about noise); decayed like
+    // `recent_pnl_frac` above so this tracks recent form, not a lifetime average --
+    // consistent with Brock-Hommes' own emphasis on fast strategy-switching being
+    // what drives the endogenous bubble/crash dynamics their model produces.
+    s.chartist_fitness = 0.7 * s.chartist_fitness + 0.3 * (s.last_chartist_signal.signum() * raw_return);
+    s.fundamentalist_fitness = 0.7 * s.fundamentalist_fitness + 0.3 * (s.last_fundamentalist_signal.signum() * raw_return);
+
+    // Chartist (momentum) component: "it's been going up, so it'll keep going up."
     let price_component = (raw_return / time_norm) / s.price_signal_threshold.max(1e-9);
+
+    // Fundamentalist (mean-reversion) component: "it's trading above what it's
+    // really worth, so it'll fall back." Sign is flipped relative to the raw
+    // deviation -- trading *above* fundamental value is a *bearish* signal here.
+    // The agent doesn't literally observe `fundamental_value` (nothing in the
+    // engine claims retail traders have insider access to ground truth) so much as
+    // proxy it the way a real fundamentalist would -- forming a view from whatever
+    // information they have -- but per this project's existing convention (e.g.
+    // `efficiency.fundamental_deviation` in market_health already compares traded
+    // price to this same ground-truth series to *measure* efficiency), using the
+    // engine's actual latent fundamental value here is the direct, honest way to
+    // give this strategy a real chance of being right, rather than inventing a
+    // separate proxy signal with no principled anchor.
+    let fair_value = *ctx.market.fundamental_value.get(&s.asset_id).unwrap_or(&mid);
+    let deviation = (mid - fair_value) / fair_value.max(1e-9);
+    let fundamentalist_component = -deviation / s.fundamentalist_signal_threshold.max(1e-9);
+
+    // Logistic blend of the two by fitness difference (Brock-Hommes' "intensity of
+    // choice" applied to a 2-strategy case simplifies to a sigmoid of the fitness
+    // gap) -- 0.5 when the two have performed identically, sliding toward whichever
+    // has been winning as the gap grows. f64::exp saturates to 0/+inf at extreme
+    // inputs rather than panicking, so this stays well-behaved even if fitness
+    // diverges further than typical.
+    let fitness_gap = s.intensity_of_choice * (s.chartist_fitness - s.fundamentalist_fitness);
+    let chartist_weight = 1.0 / (1.0 + (-fitness_gap).exp());
+    let trend_component = chartist_weight * price_component + (1.0 - chartist_weight) * fundamentalist_component;
 
     // Mood component: the latent, price-independent sentiment process, read with
     // individual perception noise (no two people read "the mood" identically) and
@@ -220,9 +334,11 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     // combined alert condition regardless of which component (or mix of both) drove
     // it there -- a real trader doesn't cleanly separate "the price moved" from
     // "everyone's talking about it", they reinforce each other.
-    let raw_signal = s.price_weight * price_component + (1.0 - s.price_weight) * sentiment_component;
+    let raw_signal = s.price_weight * trend_component + (1.0 - s.price_weight) * sentiment_component;
     s.last_price = Some(mid);
     s.last_wake_time = Some(ctx.now);
+    s.last_chartist_signal = price_component;
+    s.last_fundamentalist_signal = fundamentalist_component;
 
     // Convex (not linear) response with a dead zone: no reaction below the combined
     // threshold, then intensity grows faster than the signal itself past it --
@@ -249,11 +365,24 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
 
         match side {
             Side::Sell => {
-                // Disposition effect: only modulates exits. Reluctant to sell at a
-                // loss (hoping to "get back to even"), eager to sell at a gain (lock
-                // it in) -- the opposite of what a rational risk-manager would do.
+                // Disposition effect via real CPT (see module doc comment and
+                // `cpt_value` above): a positive CPT value (gain, diminishing
+                // sensitivity) makes selling *more* eager the bigger the gain is --
+                // "lock it in" -- while a negative CPT value (loss, also diminishing
+                // sensitivity but loss-averse-scaled) makes selling *less* eager the
+                // deeper the loss is -- "hold and hope", the actual predicted
+                // mechanism behind the disposition effect, not just an assumed
+                // constant. Unlike the old fixed multipliers, this is genuinely
+                // sensitive to *how big* the gain/loss is, not just its sign.
                 if let Some(entry) = s.avg_entry_price {
-                    qty *= if mid < entry { s.disposition_loss_hold } else { s.disposition_gain_eagerness };
+                    let r = (mid - entry) / entry.max(1e-9);
+                    let v = cpt_value(r, s.cpt_alpha, s.cpt_beta, s.cpt_lambda);
+                    let sell_mult = if v >= 0.0 {
+                        1.0 + s.cpt_gain_eagerness_scale * v
+                    } else {
+                        1.0 / (1.0 + s.cpt_loss_hold_scale * (-v))
+                    };
+                    qty *= sell_mult;
                 }
                 // Never short: real retail traders overwhelmingly don't, and (like
                 // noise.rs) an unconstrained sell here would be unlimited,

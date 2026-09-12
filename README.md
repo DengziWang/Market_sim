@@ -491,32 +491,72 @@ compositional change.
 ### `human` bots (not spec-mandated)
 
 Added on request to model actual behavioral-finance biases -- disposition effect
-(hold losers, sell winners early), convex FOMO/panic response with a dead zone
-(not linear trend-following), "hot hand" position sizing off the bot's own recent
-realized P&L, irregular bursty attention (long jittery background check-ins, much
-shorter ones right after noticing a big move), and round-number trade sizes --
-rather than a rational or mechanical strategy. `noise` remains the spec's
-deliberately-simple memoryless baseline; `human` is the opposite: it remembers its
-own trades and reacts the way research says people actually do, not randomly.
+(hold losers, sell winners early), chartist-vs-fundamentalist strategy switching,
+convex FOMO/panic response with a dead zone (not linear trend-following), "hot
+hand" position sizing off the bot's own recent realized P&L, irregular bursty
+attention (long jittery background check-ins, much shorter ones right after
+noticing a big move), and round-number trade sizes -- rather than a rational or
+mechanical strategy. `noise` remains the spec's deliberately-simple memoryless
+baseline; `human` is the opposite: it remembers its own trades and reacts the way
+research says people actually do, not randomly.
 
 A single variant (`retail`) carries every bias listed above at once -- this used to
 be split across two variants (`disposition_chaser` reacting only to price trend,
 `sentiment_herder` only to mood), merged into one bot since a real retail trader
-isn't cleanly one or the other. Its directional signal blends both: a recent-price-
-return component (time-normalized, so an agent that happened to sleep longer doesn't
-see an artificially bigger "move" for the same underlying drift) and a
-`Market::sentiment` component (a latent, price-independent process -- same
-Ornstein-Uhlenbeck shape as the fundamental-value process, but mean-reverting to
-neutral mood rather than to a price -- read with individual perception noise, not
-identically by everyone). Each is normalized by its own threshold before blending
-(`price_signal_threshold`/`sentiment_signal_threshold`, default weighted 50/50 via
-`price_weight`), so "the price moved" and "everyone's talking about it" reinforce
-each other the way they would for an actual person instead of being handled as
-mutually exclusive triggers. Capped fairly conservatively by default (see
-`sim_core/src/bots/human.rs`'s `from_params`) after testing showed a large,
-synchronized population of these bots reading a shared signal can otherwise
-overwhelm book depth on thin assets -- tune `fomo_exponent`, `max_cash_frac_per_trade`
-up if you deliberately want more extreme herding/bubble dynamics to study.
+isn't cleanly one or the other. Its directional signal blends a price-driven
+component with a `Market::sentiment` component (a latent, price-independent
+process -- same Ornstein-Uhlenbeck shape as the fundamental-value process, but
+mean-reverting to neutral mood rather than to a price -- read with individual
+perception noise, not identically by everyone). Each is normalized by its own
+threshold before blending (`price_signal_threshold`/`sentiment_signal_threshold`,
+default weighted 50/50 via `price_weight`), so "the price moved" and "everyone's
+talking about it" reinforce each other the way they would for an actual person
+instead of being handled as mutually exclusive triggers. Capped fairly
+conservatively by default (see `sim_core/src/bots/human.rs`'s `from_params`) after
+testing showed a large, synchronized population of these bots reading a shared
+signal can otherwise overwhelm book depth on thin assets -- tune `fomo_exponent`,
+`max_cash_frac_per_trade` up if you deliberately want more extreme herding/bubble
+dynamics to study.
+
+**Chartist-vs-fundamentalist switching (2026-09-13, research-backed upgrade).**
+The price-driven component used to be pure momentum ("it went up, so it'll keep
+going up") -- real retail traders don't consistently trust either momentum or
+mean-reversion, they drift toward whichever has recently been paying off. Replaced
+with Brock & Hommes' (1998, *Heterogeneous beliefs and routes to chaos in a simple
+asset pricing model*, JEDC) heterogeneous-agent model: each agent tracks a rolling,
+decayed "fitness" (realized hypothetical payoff, same decay as `recent_pnl_frac`)
+for a chartist (momentum) and a fundamentalist (mean-reversion toward the engine's
+own latent `Market::fundamental_value`) signal, and blends between the two via a
+logistic function of the fitness *gap* scaled by `intensity_of_choice` (Brock-
+Hommes' own parameter name -- 0 = always an even 50/50 blend, higher = faster,
+more decisive switching toward whichever strategy has recently won). This produces
+genuine emergent regime-switching (a population that can flip from
+momentum-chasing to mean-reverting mid-run as one strategy's fitness overtakes the
+other's) instead of a single scripted response curve. Verified in
+`sim_core/tests/human_bot_test.rs` (a fitness-dominant chartist and a
+fitness-dominant fundamentalist facing the *identical* market condition trade in
+opposite directions) and empirically on a full `realistic_mix.toml` run
+(`chartist_weight` sampled across ~500 real wakes: min ~0, max 1.0, mean 0.65 --
+genuinely swings across its whole range rather than sitting pinned at 0.5).
+
+**Cumulative Prospect Theory disposition effect (2026-09-13, research-backed
+upgrade).** The disposition effect used to be two fixed multipliers
+(`disposition_loss_hold`/`disposition_gain_eagerness`) applied identically
+regardless of how big the actual gain or loss was -- magnitude-insensitive, only
+sign-sensitive. Replaced with the real CPT value function from Tversky & Kahneman
+(1992, *Advances in Prospect Theory*): `v(r) = r^alpha` for gains, `v(r) =
+-lambda*(-r)^beta` for losses, using their own empirically-estimated defaults
+(`cpt_alpha`/`cpt_beta` = 0.88, `cpt_lambda` = 2.25). Diminishing sensitivity in the
+loss domain is the actual mathematical mechanism CPT predicts behind "hold and
+hope" (Odean 1998): a deeper loss hurts proportionally *less* on the margin than a
+shallow one, so there's progressively less pressure to realize it -- a genuine
+behavioral prediction the old fixed constants couldn't produce. Two free scale
+constants not from the CPT literature (`cpt_loss_hold_scale`/
+`cpt_gain_eagerness_scale`) convert the dimensionless CPT value into how much this
+engine's sell-quantity multiplier actually shrinks or grows. Verified in
+`sim_core/tests/human_bot_test.rs`: selling a winner is more eager than selling a
+small loser, which is in turn more eager than selling a much deeper loser --
+something the old sign-only model couldn't distinguish.
 
 Trades noticeably less often than every other bot type by design: real retail
 traders don't watch a chart continuously. Check-ins are spaced 3-40 min apart on
