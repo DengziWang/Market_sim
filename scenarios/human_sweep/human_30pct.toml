@@ -241,7 +241,8 @@ count = 8
 initial_cash_range = [ 100000.0, 300000.0,]
 
 [population.groups.params]
-wake_interval_secs = 0.02
+wake_interval_secs = 0.1
+size_frac_of_victim = 0.25
 [[population.groups]]
 bot_type = "mev"
 variant = "frontrun"
@@ -249,7 +250,8 @@ count = 8
 initial_cash_range = [ 100000.0, 300000.0,]
 
 [population.groups.params]
-wake_interval_secs = 0.02
+wake_interval_secs = 0.1
+size_frac_of_victim = 0.25
 [[population.groups]]
 bot_type = "mev"
 variant = "backrun"
@@ -257,19 +259,26 @@ count = 8
 initial_cash_range = [ 100000.0, 300000.0,]
 
 [population.groups.params]
-wake_interval_secs = 0.02
+wake_interval_secs = 0.1
+size_frac_of_victim = 0.25
 [[population.groups]]
 bot_type = "noise"
 variant = "zero_intelligence"
 count = 780
 initial_cash_range = [ 500.0, 15000.0,]
 
+[population.groups.params]
+wake_interval_secs = 2.0
+notional_range = [ 75.0, 750.0,]
 [[population.groups]]
 bot_type = "noise"
 variant = "herding"
 count = 171
 initial_cash_range = [ 500.0, 15000.0,]
 
+[population.groups.params]
+wake_interval_secs = 2.0
+notional_range = [ 75.0, 750.0,]
 [[population.groups]]
 bot_type = "human"
 variant = "retail"

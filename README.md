@@ -441,6 +441,53 @@ of the file, including `human` bots -- see below); `pure_bot_market.toml` and
 `stress_wash_mev.toml` are deliberately extreme by design (not meant to be
 "realistic"), see their own header comments.
 
+**Composition sources (2026-09-13)**: the original weights (headcount percentages)
+were this project's own estimates, not sourced from real data -- flagged and
+re-derived at the user's request. Real, cited findings and what changed as a
+result:
+
+- Retail's share of crypto trading *volume* has shrunk hard even as headcount stays
+  dominant: on Coinbase, retail volume share fell from ~80% (2018) to ~18% (Q1 2024)
+  ([source](https://finance.yahoo.com/news/does-stock-crypto-investor-divide-signal-121645815.html)),
+  and institutions were >70% of volume industry-wide in H1 2026
+  ([BitKE / Wintermute report](https://bitcoinke.io/2026/07/the-wintermute-h1-2026-report/)).
+  Measuring this project's *original* config directly (not assumed) found `noise` +
+  `human`'s ~58% combined headcount contributing only ~2.1% of volume -- far below
+  even the most institution-dominated real venue. Fix: sped up and enlarged `noise`
+  (`wake_interval_secs` 8.0 -> 2.0, `notional_range` [50,500] -> [75,750]) --
+  `human` deliberately left untouched, since its low activity models a specific,
+  real behavioral trait (infrequent, irregular checking), not a bug. Re-measured
+  after the change: retail volume share landed at ~19.3%, right in the real range.
+- Bitwise's SEC filing found ~95% of volume on *unregulated* crypto exchanges was
+  wash-traded, versus a real, legitimate market on ~10 major regulated exchanges
+  ([Cointelegraph](https://cointelegraph.com/news/bitwise-tells-us-sec-that-95-of-volume-on-unregulated-crypto-exchanges-is-suspect)).
+  This didn't change anything here -- `wash_trading` was already removed from this
+  template entirely (see git history, "isn't wash trading illegal" discussion) --
+  but it's relevant if you ever build a variant meant to model a low-quality venue
+  specifically (closer to `stress_wash_mev.toml`'s territory).
+- MEV, measured directly rather than assumed: the original config's `mev` (1.2%
+  headcount, `wake_interval_secs=0.02`) contributed ~26% of total volume --
+  disproportionate next to any real analog. Real Ethereum MEV data (~89% of blocks
+  via MEV-Boost, but MEV is only ~26% of *validator revenue*, and sandwich-attack
+  revenue specifically has shrunk to ~$740K/30 days after mitigations --
+  [survey via Binance Square](https://www.binance.com/en/square/post/13660663730586))
+  doesn't map cleanly onto this project's continuous-limit-order-book structure
+  anyway (that's Ethereum-mempool MEV, a different market structure entirely), so
+  there's no precise target number to hit -- just "not a quarter of all volume from
+  1.2% of agents." Fix: `wake_interval_secs` 0.02 -> 0.1, added
+  `size_frac_of_victim` 0.5 (the prior unnamed default) -> 0.25. Re-measured: mev's
+  volume share dropped to ~2.4%.
+- `market_maker` (measured ~47% -> ~40% of volume from 8% headcount after the above
+  changes shifted the mix) and `arbitrage` (~21% -> ~33%) weren't touched --
+  broadly consistent with "small headcount, majority of volume" for market makers,
+  but no precise real citation was found for either specific number, so these are
+  still this project's own judgment, not sourced.
+
+All percentages above are from actually running the scenario and measuring
+maker+taker notional volume by bot type (not assumed) -- see git history for the
+exact measurement script if you want to re-run this check after any future
+compositional change.
+
 ### `human` bots (not spec-mandated)
 
 Added on request to model actual behavioral-finance biases -- disposition effect

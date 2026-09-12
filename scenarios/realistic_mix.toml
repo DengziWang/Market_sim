@@ -275,7 +275,18 @@ variant = "sandwich"
 count = 2
 initial_cash_range = [100000.0, 300000.0]
 [population.groups.params]
-wake_interval_secs = 0.02
+# Slower + smaller than the old 0.02s/default-50%-of-victim defaults
+# (2026-09-13, real-data recalibration): a real measured run of this
+# scenario's original config showed mev's 1.2% headcount contributing
+# ~26% of total volume -- disproportionate next to any real MEV
+# footprint (Ethereum MEV revenue is a small fraction of total market
+# activity, not a quarter of it -- see README's composition-sources
+# section). wake_interval_secs 0.02 -> 0.1 means it catches fewer
+# fast-resolving opportunities; size_frac_of_victim (not previously
+# overridden, so it used the 0.5 default) -> 0.25 halves the size of
+# whatever it does catch.
+wake_interval_secs = 0.1
+size_frac_of_victim = 0.25
 
 [[population.groups]]
 bot_type = "mev"
@@ -283,7 +294,18 @@ variant = "frontrun"
 count = 2
 initial_cash_range = [100000.0, 300000.0]
 [population.groups.params]
-wake_interval_secs = 0.02
+# Slower + smaller than the old 0.02s/default-50%-of-victim defaults
+# (2026-09-13, real-data recalibration): a real measured run of this
+# scenario's original config showed mev's 1.2% headcount contributing
+# ~26% of total volume -- disproportionate next to any real MEV
+# footprint (Ethereum MEV revenue is a small fraction of total market
+# activity, not a quarter of it -- see README's composition-sources
+# section). wake_interval_secs 0.02 -> 0.1 means it catches fewer
+# fast-resolving opportunities; size_frac_of_victim (not previously
+# overridden, so it used the 0.5 default) -> 0.25 halves the size of
+# whatever it does catch.
+wake_interval_secs = 0.1
+size_frac_of_victim = 0.25
 
 [[population.groups]]
 bot_type = "mev"
@@ -291,7 +313,18 @@ variant = "backrun"
 count = 2
 initial_cash_range = [100000.0, 300000.0]
 [population.groups.params]
-wake_interval_secs = 0.02
+# Slower + smaller than the old 0.02s/default-50%-of-victim defaults
+# (2026-09-13, real-data recalibration): a real measured run of this
+# scenario's original config showed mev's 1.2% headcount contributing
+# ~26% of total volume -- disproportionate next to any real MEV
+# footprint (Ethereum MEV revenue is a small fraction of total market
+# activity, not a quarter of it -- see README's composition-sources
+# section). wake_interval_secs 0.02 -> 0.1 means it catches fewer
+# fast-resolving opportunities; size_frac_of_victim (not previously
+# overridden, so it used the 0.5 default) -> 0.25 halves the size of
+# whatever it does catch.
+wake_interval_secs = 0.1
+size_frac_of_victim = 0.25
 
 # ---- noise / retail baseline (244 agents, 48.8%) ----------------------------------------
 [[population.groups]]
@@ -299,12 +332,32 @@ bot_type = "noise"
 variant = "zero_intelligence"
 count = 200
 initial_cash_range = [500.0, 15000.0]
+[population.groups.params]
+# Faster + slightly larger than the plain wake_interval_secs=8.0/
+# notional_range=[50,500] defaults (2026-09-13, real-data
+# recalibration): a real measured run of this scenario's original
+# config showed noise+human's ~58% combined headcount contributing
+# only ~2.1% of total volume -- real markets never get retail volume
+# that low even on the most institution-dominated major exchanges
+# (Coinbase's retail volume share was ~18% in Q1 2024; see README's
+# composition-sources section). `human` is deliberately left
+# untouched -- its low activity models a real, specific behavioral
+# trait (infrequent, irregular checking), not a bug to correct, so
+# this fix is scoped to the mechanical noise baseline only. Doesn't
+# fully close the gap to ~18-30% by itself; a further increase (or a
+# human-side rethink) may still be warranted after actually
+# re-measuring against a run.
+wake_interval_secs = 2.0
+notional_range = [75.0, 750.0]
 
 [[population.groups]]
 bot_type = "noise"
 variant = "herding"
 count = 44
 initial_cash_range = [500.0, 15000.0]
+[population.groups.params]
+wake_interval_secs = 2.0
+notional_range = [75.0, 750.0]
 
 # ---- human / behaviorally-rich retail (40 agents, 8%) ------------------------------------
 # See the header comment above -- the other half of the retail-headcount anchor,
