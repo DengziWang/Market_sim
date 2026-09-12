@@ -730,9 +730,25 @@ def _render_candlestick_chart(key_prefix: str, title: str, full_start: float, fu
 
     mid = (candles["bucket_start"] + candles["bucket_end"]) / 2.0
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.04)
+    # Volume attached to both price traces' own hover (via customdata), not just
+    # the separate bar subplot below -- hovering the candle/line itself should
+    # already tell you how much traded in that bucket, not require also looking
+    # at the bar underneath it.
+    volume_hover = candles["volume"].to_numpy()
     if chart_type == "Candlestick":
         fig.add_trace(
-            go.Candlestick(x=mid, open=candles["open"], high=candles["high"], low=candles["low"], close=candles["close"], name="price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350"),
+            go.Candlestick(
+                x=mid,
+                open=candles["open"],
+                high=candles["high"],
+                low=candles["low"],
+                close=candles["close"],
+                name="price",
+                increasing_line_color="#26a69a",
+                decreasing_line_color="#ef5350",
+                customdata=volume_hover,
+                hovertemplate="Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<br>Volume: %{customdata:,.0f}<extra></extra>",
+            ),
             row=1,
             col=1,
         )
@@ -742,7 +758,19 @@ def _render_candlestick_chart(key_prefix: str, title: str, full_start: float, fu
         # rebuild (smooth, representative of the whole bucket) rather than
         # plotting a single representative trade (the bucket's last trade, which
         # is what "close" is) or a min/max extremum.
-        fig.add_trace(go.Scattergl(x=mid, y=candles["mean"], mode="lines", name="price", line=dict(width=1.5, color="#1f77b4")), row=1, col=1)
+        fig.add_trace(
+            go.Scattergl(
+                x=mid,
+                y=candles["mean"],
+                mode="lines",
+                name="price",
+                line=dict(width=1.5, color="#1f77b4"),
+                customdata=volume_hover,
+                hovertemplate="Price: %{y}<br>Volume: %{customdata:,.0f}<extra></extra>",
+            ),
+            row=1,
+            col=1,
+        )
     for name, ot, ov, dash, color in get_overlays(view_start, view_end) if get_overlays else []:
         if len(ot):
             fig.add_trace(go.Scattergl(x=ot, y=ov, mode="lines", name=name, line=dict(width=1, dash=dash, color=color)), row=1, col=1)
