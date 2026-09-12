@@ -714,7 +714,7 @@ def _render_candlestick_chart(key_prefix: str, title: str, full_start: float, fu
     step = max((full_end - full_start) / 100, 1.0)
     view_start = c1.number_input("View start (s)", min_value=float(full_start), max_value=float(full_end), step=step, key=start_key)
     view_end = c2.number_input("View end (s)", min_value=float(full_start), max_value=float(full_end), step=step, key=end_key)
-    target_candles = c3.number_input("Target candles", min_value=20, max_value=500, step=10, key=target_key, help="Chart aims to show target-2x this many candles for the current view; this is the X in 'X to 2X'.")
+    target_candles = c3.number_input("Target candles", min_value=20, max_value=500, step=10, key=target_key, help="Chart aims to show target-2x this many candles for the current view; this is the X in 'X to 2X'. Line mode uses 25x this value -- a line stays readable at much finer resolution than a candlestick does.")
     if c4.button("Reset zoom", key=f"{key_prefix}_reset_zoom"):
         st.session_state[pending_key] = (float(full_start), float(full_end))
         st.rerun()
@@ -723,7 +723,17 @@ def _render_candlestick_chart(key_prefix: str, title: str, full_start: float, fu
         st.caption("View end must be after view start.")
         return
 
-    candles = get_candles(view_start, view_end, int(target_candles))
+    # Line mode gets 25x the candlestick resolution (2,500 buckets at the default
+    # target of 100, instead of 100) -- a candlestick chart with that many wicks
+    # would be an unreadable smear, but a line is still perfectly readable at much
+    # finer resolution, and there's no reason to cap it to the same number just
+    # because they share one "Target candles" control. Since the volume bars are
+    # built from this same `candles` frame, they automatically follow at the same
+    # resolution too -- every line point gets its own volume bar, not a coarser
+    # shared one.
+    LINE_RESOLUTION_MULTIPLIER = 25
+    effective_target = int(target_candles) * LINE_RESOLUTION_MULTIPLIER if chart_type == "Line" else int(target_candles)
+    candles = get_candles(view_start, view_end, effective_target)
     if candles.empty:
         st.caption("No trades in this range.")
         return
