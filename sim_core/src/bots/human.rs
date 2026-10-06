@@ -60,21 +60,71 @@
 //!     P&L, not just its cash budget.
 //!   - **Round-number bias**: trade notional is rounded to a "nice" number (1/2/5 x
 //!     10^k), not a raw computed float.
+//!   - **Grouped crowd trend (2026-10-06 revert)**: every human agent is
+//!     assigned to one of `n_trend_groups` groups at construction
+//!     (`State::trend_group`, drawn directly from this agent's own
+//!     construction-time RNG). Each group reads its own independent
+//!     `Market::random_trend` line for the asset it trades (see that field's
+//!     doc comment) -- agents in the same group read the literal same
+//!     number, and disagreement comes entirely from `personal_trend_weight`
+//!     (how much each individual leans on it), drawn once per agent so some
+//!     agents are far more swept up in the crowd than others. This replaced
+//!     a brief social-network-graph experiment (2026-10-05/06) that was
+//!     reverted at the user's request; see git history/session notes for
+//!     why, and note this is a best-effort reconstruction of the original
+//!     group mechanism, not a byte-exact restore (the original code was
+//!     never committed).
+//!   - **Liquidity-aware order placement (2026-10-04)**: previously this bot
+//!     always submitted an unconditional IOC market order -- accepting *any*
+//!     available price, with no check at all. Now, before submitting, it looks
+//!     at the book: if there's no resting order on the side it would need to hit
+//!     (e.g. no resting ask at all when it wants to buy), or the best available
+//!     price is too far from what this agent itself believes the asset is worth
+//!     (`believed_value`, see below), it posts a resting limit order at
+//!     `believed_value` instead of taking the bad/missing price -- GTC and
+//!     post-only, so it only ever adds liquidity, never crosses. This is what
+//!     lets a 100%-human market trade at all: previously every human order was a
+//!     taker order with nothing to take, so a population with zero market-making
+//!     bot types produced exactly zero trades for the entire run (measured,
+//!     not assumed -- see git history). `believed_value` is derived from this
+//!     agent's own `raw_signal` (already personalized: its own perceived
+//!     sentiment noise, its own network neighbors' influence, its own
+//!     `social_weight`), not the engine's raw ground-truth
+//!     `fundamental_value` -- using ground truth directly would mean every agent
+//!     silently agreed on the exact same "fair" price, which contradicts the
+//!     whole point of this bot's per-agent heterogeneity. At most one resting
+//!     buy and one resting sell order per agent at a time (`resting_buy_order`/
+//!     `resting_sell_order`) -- placing a new one on a side cancels whatever this
+//!     agent still had resting on that same side first, so stale orders from a
+//!     check-in long ago never pile up.
 
 use rand::Rng;
 
 use super::StepCtx;
 use crate::agent::{Action, AgentCommon, NewOrderRequest, StepResult};
 use crate::params;
-use crate::types::{AssetId, OrderType, Side, SimTime, TimeInForce};
+use crate::types::{AssetId, OrderId, OrderType, Side, SimTime, TimeInForce};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Variant {
-    /// The only variant: an ordinary retail trader carrying every bias listed in the
-    /// module doc comment at once. Kept as a one-value enum (rather than dropping
-    /// `Variant` entirely) so `human` still fits the same `bot_type`/`variant`
-    /// dispatch pattern every other bot type uses.
+    /// An ordinary retail trader carrying every bias listed in the module doc
+    /// comment at once.
     Retail,
+    /// Cheaper variant (2026-09-17), added specifically to replace `noise` as the
+    /// bulk non-strategic population: keeps every bias `Retail` has *except* the
+    /// Brock-Hommes dynamic chartist/fundamentalist fitness-switching, which is
+    /// replaced by one fixed blend weight (`lite_blend_weight`). This removes, on
+    /// *every* wake (not just acting ones): two EMA fitness updates and one
+    /// `f64::exp` logistic call -- see `step()`'s `Variant::Lite` branch. Everything
+    /// else (sentiment blend, CPT disposition effect, FOMO convexity, hot-hand
+    /// sizing, round-number bias, bursty attention) is identical to `Retail`, so
+    /// this is a genuinely simpler *mechanism* for the same *kind* of bot, not a
+    /// tuned-down/randomized approximation of one -- unlike widening the wake
+    /// interval (rejected: would only suppress an already-too-low human trade
+    /// volume further) or a parameter-fuzzed `Retail` (no guarantee of actually
+    /// landing near memoryless). `Retail` itself is left byte-for-byte unchanged so
+    /// every existing sweep (human_sweep, human_sweep_2) stays exactly reproducible.
+    Lite,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -96,6 +146,12 @@ pub struct State {
     /// an even 50/50 blend regardless of fitness; higher = faster, more decisive
     /// switching toward the currently-winning strategy.
     pub intensity_of_choice: f64,
+    /// `Variant::Lite` only: fixed chartist-vs-fundamentalist blend weight, used in
+    /// place of the dynamic Brock-Hommes fitness-based switch (`Retail` ignores
+    /// this field entirely). Same meaning as the dynamic `chartist_weight` it
+    /// replaces: 1.0 = pure chartist/momentum, 0.0 = pure fundamentalist, 0.5 =
+    /// even blend.
+    pub lite_blend_weight: f64,
     /// Perceived sentiment reading (already normalized to roughly [-1, 1]) that
     /// counts as a full "one unit" mood signal.
     pub sentiment_signal_threshold: f64,
@@ -138,18 +194,55 @@ pub struct State {
     pub fundamentalist_fitness: f64,
     pub last_chartist_signal: f64,
     pub last_fundamentalist_signal: f64,
+    /// This group's `Market::random_trend` value that counts as a full "one
+    /// unit" signal, same normalization convention as
+    /// `sentiment_signal_threshold`. A fixed per-variant constant (not
+    /// randomized) -- the heterogeneity across agents comes from
+    /// `personal_trend_weight` below and from which group they landed in,
+    /// not from this.
+    pub personal_trend_signal_threshold: f64,
+    /// How much this agent's group crowd-trend value influences its *own*
+    /// final signal, versus its private market-based signal (price/
+    /// fundamentalist/sentiment blend, which already carries this agent's
+    /// own perception noise -- its "individual random voice"). Drawn once
+    /// per agent, independently, at construction (see `from_params`'s `rng`
+    /// parameter) -- the source of cross-sectional disagreement even among
+    /// agents in the same group: everyone in a group reads the literal same
+    /// trend value but weights it completely differently. 0.0 = this agent
+    /// ignores the crowd entirely; higher = more swept up in it.
+    pub personal_trend_weight: f64,
+    /// Which of `Market::n_trend_groups` groups this agent belongs to (see
+    /// module doc comment) -- fixed at construction, never changes
+    /// afterward.
+    pub trend_group: u32,
+    /// This agent's own currently-resting buy limit order, if any: `(order_id,
+    /// asset_id)`. See the module doc comment's "Liquidity-aware order
+    /// placement" section -- placing a new resting buy cancels whatever's here
+    /// first, so this is never more than one order.
+    pub resting_buy_order: Option<(OrderId, AssetId)>,
+    /// Same as `resting_buy_order`, for this agent's resting sell side.
+    pub resting_sell_order: Option<(OrderId, AssetId)>,
 }
 
 impl State {
     pub fn variant_name(&self) -> &'static str {
         match self.variant {
             Variant::Retail => "retail",
+            Variant::Lite => "lite",
         }
     }
 
     /// `initial_price`: converts dollar-notional size params into asset units --
     /// see market_maker.rs's from_params doc comment for why that matters.
-    pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value) -> Self {
+    /// `rng`: used to draw this specific agent's own `trend_group` and
+    /// `personal_trend_weight` (see those fields' doc comments) -- the same
+    /// construction-time RNG `sim.rs`'s `build_population` already uses for this
+    /// agent's starting cash/leverage, so the draw is deterministic given a fixed
+    /// run seed, same as everything else about population construction.
+    /// `n_trend_groups`: passed in by the caller (`sim.rs::build_population`,
+    /// via `compute_n_trend_groups`) rather than recomputed here, so every
+    /// human agent in the same scenario draws from the same group range.
+    pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value, n_trend_groups: u32, rng: &mut impl Rng) -> Self {
         let price = initial_price.max(1e-9);
         Self {
             variant,
@@ -166,6 +259,7 @@ impl State {
             price_signal_threshold: params::get_f64(p, "price_signal_threshold", 0.02),
             fundamentalist_signal_threshold: params::get_f64(p, "fundamentalist_signal_threshold", 0.02),
             intensity_of_choice: params::get_f64(p, "intensity_of_choice", 4.0),
+            lite_blend_weight: params::get_f64(p, "lite_blend_weight", 0.5).clamp(0.0, 1.0),
             sentiment_signal_threshold: params::get_f64(p, "sentiment_signal_threshold", 0.15),
             price_weight: params::get_f64(p, "price_weight", 0.5).clamp(0.0, 1.0),
             fomo_exponent: params::get_f64(p, "fomo_exponent", 1.1),
@@ -201,6 +295,21 @@ impl State {
             fundamentalist_fitness: 0.0,
             last_chartist_signal: 0.0,
             last_fundamentalist_signal: 0.0,
+            personal_trend_signal_threshold: params::get_f64(p, "personal_trend_signal_threshold", 0.2),
+            // Drawn once per agent from Uniform(0, max) -- "differently much", not
+            // a single fixed weight applied identically to every agent (that would
+            // make every human agent lean on the crowd the same amount, which is
+            // just a fixed extra blend term, not genuine heterogeneity). Nonzero max
+            // by default (not opt-in via TOML) -- meant to be an always-on source of
+            // cross-sectional disagreement, not a dormant feature every existing
+            // scenario config would need editing to exercise.
+            personal_trend_weight: {
+                let max = params::get_f64(p, "personal_trend_weight_max", 0.6).clamp(0.0, 1.0);
+                if max > 0.0 { rng.gen_range(0.0..max) } else { 0.0 }
+            },
+            trend_group: if n_trend_groups > 0 { rng.gen_range(0..n_trend_groups) } else { 0 },
+            resting_buy_order: None,
+            resting_sell_order: None,
         }
     }
 }
@@ -290,8 +399,13 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     // `recent_pnl_frac` above so this tracks recent form, not a lifetime average --
     // consistent with Brock-Hommes' own emphasis on fast strategy-switching being
     // what drives the endogenous bubble/crash dynamics their model produces.
-    s.chartist_fitness = 0.7 * s.chartist_fitness + 0.3 * (s.last_chartist_signal.signum() * raw_return);
-    s.fundamentalist_fitness = 0.7 * s.fundamentalist_fitness + 0.3 * (s.last_fundamentalist_signal.signum() * raw_return);
+    //
+    // `Variant::Lite` skips this update entirely (and the logistic blend below) --
+    // see the variant doc comment for why.
+    if s.variant == Variant::Retail {
+        s.chartist_fitness = 0.7 * s.chartist_fitness + 0.3 * (s.last_chartist_signal.signum() * raw_return);
+        s.fundamentalist_fitness = 0.7 * s.fundamentalist_fitness + 0.3 * (s.last_fundamentalist_signal.signum() * raw_return);
+    }
 
     // Chartist (momentum) component: "it's been going up, so it'll keep going up."
     let price_component = (raw_return / time_norm) / s.price_signal_threshold.max(1e-9);
@@ -318,8 +432,17 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     // has been winning as the gap grows. f64::exp saturates to 0/+inf at extreme
     // inputs rather than panicking, so this stays well-behaved even if fitness
     // diverges further than typical.
-    let fitness_gap = s.intensity_of_choice * (s.chartist_fitness - s.fundamentalist_fitness);
-    let chartist_weight = 1.0 / (1.0 + (-fitness_gap).exp());
+    //
+    // `Variant::Lite` skips the fitness-based switch and uses one fixed weight
+    // instead -- no `f64::exp` call, and no dependence on the (unupdated, for Lite)
+    // fitness state above.
+    let chartist_weight = match s.variant {
+        Variant::Retail => {
+            let fitness_gap = s.intensity_of_choice * (s.chartist_fitness - s.fundamentalist_fitness);
+            1.0 / (1.0 + (-fitness_gap).exp())
+        }
+        Variant::Lite => s.lite_blend_weight,
+    };
     let trend_component = chartist_weight * price_component + (1.0 - chartist_weight) * fundamentalist_component;
 
     // Mood component: the latent, price-independent sentiment process, read with
@@ -329,12 +452,19 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     let perceived_sentiment = (true_sentiment + agent.rng.gen_range(-s.perception_noise..s.perception_noise)).clamp(-1.0, 1.0);
     let sentiment_component = perceived_sentiment / s.sentiment_signal_threshold.max(1e-9);
 
-    // Blended, normalized signal: both components are already on a "1.0 = as strong
-    // as this agent's own alert threshold" scale, so `magnitude > 1.0` below is the
-    // combined alert condition regardless of which component (or mix of both) drove
-    // it there -- a real trader doesn't cleanly separate "the price moved" from
-    // "everyone's talking about it", they reinforce each other.
-    let raw_signal = s.price_weight * trend_component + (1.0 - s.price_weight) * sentiment_component;
+    // Blended, normalized private signal: every component is already on a "1.0 =
+    // as strong as this agent's own alert threshold" scale. This is this agent's
+    // *own* view -- price/fundamentalist trend, perceived sentiment (with its own
+    // perception noise, its "individual random voice") -- before any outside
+    // influence.
+    let market_signal = s.price_weight * trend_component + (1.0 - s.price_weight) * sentiment_component;
+
+    // Crowd trend: this agent's group's own shared `Market::random_trend`
+    // line (see module doc comment), normalized the same way every other
+    // signal component is.
+    let group_trend = ctx.market.trend_for(s.asset_id, s.trend_group);
+    let trend_component_group = group_trend / s.personal_trend_signal_threshold.max(1e-9);
+    let raw_signal = (1.0 - s.personal_trend_weight) * market_signal + s.personal_trend_weight * trend_component_group;
     s.last_price = Some(mid);
     s.last_wake_time = Some(ctx.now);
     s.last_chartist_signal = price_component;
@@ -400,15 +530,107 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         }
 
         if qty > 1e-9 {
-            actions.push(Action::Submit(NewOrderRequest {
-                asset_id: s.asset_id,
-                side,
-                order_type: OrderType::Market,
-                tif: TimeInForce::Ioc,
-                post_only: false,
-                price: None,
-                qty,
-            }));
+            // Liquidity check, added 2026-10-04 (see module doc comment): don't
+            // blindly take whatever's resting on the other side. `believed_value`
+            // is this agent's own view of what the asset is worth, derived from
+            // its own (already personalized) `raw_signal` rather than the
+            // engine's raw ground-truth `fair_value` -- using ground truth
+            // directly here would mean every agent silently agreed on the same
+            // "fair" price, defeating the point of this bot's per-agent
+            // heterogeneity. Converted back from signal-space ("how many
+            // multiples of my own alert threshold") into a price using the same
+            // `price_signal_threshold` the chartist component above already
+            // uses as its price-move unit.
+            // `raw_signal` itself is unbounded (only the dead-zoned `intensity`
+            // derived from it is capped, at 1.2) -- a large value here, now newly
+            // reachable since each trend group's line is its own independent
+            // random walk rather than one bounded shared value, could otherwise
+            // send `believed_value` negative or absurd, which the engine's own
+            // sanity guard (`Market::submit`'s `invalid_price`/
+            // `far_from_fundamental` checks) would then reject outright.
+            //
+            // Clamped to `fair_value` (ground truth), NOT `mid` -- measured
+            // during development: with zero agents starting with inventory, no
+            // sell order (market or limit) is possible until *someone* has
+            // already bought (`qty.min(inventory)` below), so the book starts
+            // bid-only; `OrderBook::mid_price()` then falls back to the single
+            // best bid when no ask exists at all. Clamping relative to `mid` in
+            // that regime bounds each new belief relative to the *previous*
+            // ratchet-up, not to anything stable -- compounding over hundreds of
+            // wake-ups into a runaway spiral (observed: up to ~130x the asset's
+            // starting price in a 20,000s smoke test). `fair_value` is the one
+            // process in this engine that's provably immune to being corrupted
+            // by trading activity itself (see market.rs's doc comment), so
+            // anchoring the clamp to it bounds the worst case regardless of how
+            // far a one-sided book has already drifted -- while the *base*
+            // computation still uses `mid`, so this agent's own signal still
+            // moves the belief around within that band.
+            let believed_value = (mid * (1.0 + raw_signal * s.price_signal_threshold)).clamp(fair_value * 0.5, fair_value * 2.0);
+            let book = ctx.market.book(ctx.venue, s.asset_id);
+            let best_opposite = match side {
+                Side::Buy => book.best_ask(),
+                Side::Sell => book.best_bid(),
+            };
+            // Directional, not a plain distance check: only the *unfavorable*
+            // direction counts as "too far." A buyer only balks at an ask priced
+            // too far *above* its own belief (paying a premium); an ask that's a
+            // bargain (at or below belief, however far below) is never a reason
+            // to avoid it -- symmetric for a seller and the bid. This also keeps
+            // the resulting limit order safe: whenever this fires, the believed
+            // price this agent would then post at is, by construction, still on
+            // its own side of the best opposite price *as observed right now* --
+            // a buy-limit at a believed_value strictly below the current
+            // best_ask can never cross it at decision time (symmetric for
+            // sell/best_bid). This order still goes through this agent's own
+            // latency before actually reaching the book (see sim.rs's
+            // `apply_action`, `Action::Submit`'s latency delay vs. `Cancel`'s
+            // immediate one) -- if the book moves in that window, `post_only`
+            // correctly rejects the now-stale cross rather than resting it at a
+            // bad price. Measured: ~0.07% of this bot's submits in a 100%-human
+            // smoke test, an expected, benign rate given realistic latency, not
+            // a sign this check is wrong.
+            let too_far = |p: f64| match side {
+                Side::Buy => (p - believed_value) / believed_value.max(1e-9) > s.fundamentalist_signal_threshold,
+                Side::Sell => (believed_value - p) / believed_value.max(1e-9) > s.fundamentalist_signal_threshold,
+            };
+            let use_limit = match best_opposite {
+                None => true,
+                Some(p) => too_far(p),
+            };
+
+            if use_limit {
+                // Cancel-and-replace on this same side only -- see module doc
+                // comment and `resting_buy_order`/`resting_sell_order`'s field
+                // comments: at most one resting order per side per agent, always
+                // freshly priced at this wake's `believed_value`, never a pile-up
+                // of stale orders from check-ins long past.
+                let slot = match side {
+                    Side::Buy => &mut s.resting_buy_order,
+                    Side::Sell => &mut s.resting_sell_order,
+                };
+                if let Some((id, aid)) = slot.take() {
+                    actions.push(Action::Cancel(id, aid));
+                }
+                actions.push(Action::Submit(NewOrderRequest {
+                    asset_id: s.asset_id,
+                    side,
+                    order_type: OrderType::Limit,
+                    tif: TimeInForce::Gtc,
+                    post_only: true,
+                    price: Some(believed_value),
+                    qty,
+                }));
+            } else {
+                actions.push(Action::Submit(NewOrderRequest {
+                    asset_id: s.asset_id,
+                    side,
+                    order_type: OrderType::Market,
+                    tif: TimeInForce::Ioc,
+                    post_only: false,
+                    price: None,
+                    qty,
+                }));
+            }
         }
     }
 
@@ -421,4 +643,20 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     };
 
     StepResult { actions, next_wake: Some(next_wake) }
+}
+
+/// Called by `sim.rs` after an order from `Action::Submit` gets an id assigned
+/// (same hook market_maker.rs/grid.rs use), so this agent remembers which
+/// resting limit order to cancel before replacing it next time -- see
+/// `resting_buy_order`/`resting_sell_order`'s field comments. Market/IOC orders
+/// fill or expire immediately so there's nothing to remember for those; only a
+/// `Limit` request ever needs tracking here.
+pub fn on_order_id(s: &mut State, req: &NewOrderRequest, id: OrderId) {
+    if req.order_type != OrderType::Limit {
+        return;
+    }
+    match req.side {
+        Side::Buy => s.resting_buy_order = Some((id, req.asset_id)),
+        Side::Sell => s.resting_sell_order = Some((id, req.asset_id)),
+    }
 }

@@ -48,6 +48,21 @@ pub struct AssetConfig {
     pub sentiment_vol: f64,
     #[serde(default = "default_sentiment_theta")]
     pub sentiment_theta: f64,
+    /// Same Ornstein-Uhlenbeck shape again, a third independent process: a single
+    /// shared "crowd trend" line that every `human` agent trading this asset reads
+    /// (2026-10-04) -- unlike `sentiment` (also shared, but perceived with
+    /// per-agent noise on top of the same draw), each agent's *sensitivity* to this
+    /// trend is itself randomized once at construction (see
+    /// `human::State::personal_trend_weight`), so the disagreement across agents
+    /// comes from "how much do I let myself be swept up in this" rather than "what
+    /// do I separately think the trend is" -- everyone is reacting to the literal
+    /// same number. Mean-reverts to neutral (0); much slower than sentiment's
+    /// default (see default fns below) since a "trend" that decayed with a ~14s
+    /// half-life like sentiment's own default would never read as a trend at all.
+    #[serde(default = "default_trend_vol")]
+    pub trend_vol: f64,
+    #[serde(default = "default_trend_theta")]
+    pub trend_theta: f64,
 }
 fn default_fundamental_vol() -> f64 {
     0.02
@@ -60,6 +75,15 @@ fn default_sentiment_vol() -> f64 {
 }
 fn default_sentiment_theta() -> f64 {
     0.05
+}
+fn default_trend_vol() -> f64 {
+    0.01
+}
+fn default_trend_theta() -> f64 {
+    // Half-life = ln(2)/theta ~= 1386s (~23 min) -- persists across many of a
+    // human agent's own background check-ins (~20 min apart on average) instead
+    // of decaying before anyone notices it moved.
+    0.0005
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +118,25 @@ pub struct MarketConfig {
     /// effectively disable this as its own research variable.
     #[serde(default = "default_max_price_move_frac")]
     pub max_price_move_frac: f64,
+    /// A resting GTC limit order older than this (by `now - submitted_at`) is
+    /// force-cancelled (emitted as an `Expire` order event, not `Cancel`) the next
+    /// time the expiry sweep runs. Several bot types (noise, wash_trading) place a
+    /// fresh GTC order on every wake without ever cancelling the previous one if it
+    /// didn't fill -- unlike market_maker/grid/human, which explicitly cancel their
+    /// own resting order before replacing it. Over a long session this leaves
+    /// unbounded stale litter in the book: confirmed in testing as the cause of a
+    /// 2026-10-06 anomaly where one job's checkpoint.bin reached 852MB (vs. ~2.6MB
+    /// normal) and its per-leg wall-clock time climbed steadily *while trade volume
+    /// fell* -- the smoking gun for "more and more dead resting orders to scan,
+    /// fewer of them still near the live price." 3600s (1 hour) is chosen to sit
+    /// comfortably above every strategy's own legitimate intentional resting
+    /// period (the longest is human's `background_wake_max`, 2400s by default) so
+    /// it never interferes with normal cancel-and-replace behavior, while still
+    /// being short enough to bound backlog growth within a small fraction of a
+    /// typical multi-hour session. Set very large (e.g. 1e12) to effectively
+    /// disable.
+    #[serde(default = "default_max_resting_order_age")]
+    pub max_resting_order_age_secs: f64,
 }
 fn default_snapshot_interval() -> f64 {
     1.0
@@ -107,6 +150,9 @@ fn default_mark_halflife() -> f64 {
 fn default_max_price_move_frac() -> f64 {
     0.15
 }
+fn default_max_resting_order_age() -> f64 {
+    3600.0
+}
 impl Default for MarketConfig {
     fn default() -> Self {
         Self {
@@ -114,6 +160,7 @@ impl Default for MarketConfig {
             snapshot_depth_levels: default_snapshot_depth(),
             mark_price_ema_halflife_secs: default_mark_halflife(),
             max_price_move_frac: default_max_price_move_frac(),
+            max_resting_order_age_secs: default_max_resting_order_age(),
         }
     }
 }

@@ -1,0 +1,279 @@
+# =============================================================================
+# Human-fraction sweep point (noise-free design): 10% human/retail bots,
+# 2500 agents base (scaled at runtime), 100000s simulated in this base template.
+#
+# Noise removed entirely (2026-09-17), NOT replaced by human/lite (that variant
+# exists in the engine -- sim_core/src/bots/human.rs's Variant::Lite -- but is
+# unused in this sweep, per explicit decision: it also carries bot_type="human",
+# which would make "10%" ambiguous between retail's own share and
+# retail+lite combined). Instead, the (100-10)% non-retail share is filled
+# entirely by the 8 strategic bot types (market_maker, arbitrage, momentum,
+# mean_reversion, grid, dca, liquidation_trader, mev), scaled up proportionally
+# at their unchanged mutual ratios from realistic_mix.toml -- so "10%" is
+# unambiguously bot_type="human" (all of it, since only variant="retail" is
+# used here) as a fraction of the total population.
+#
+# Same seed (1) as every other point in this sweep. human/retail count: 250 (10%).
+# =============================================================================
+
+[[assets]]
+symbol = "BTC"
+tick_size = 0.5
+initial_price = 60000.0
+fundamental_vol = 0.015
+fundamental_theta = 0.08
+
+[[assets]]
+symbol = "ETH"
+tick_size = 0.05
+initial_price = 3000.0
+fundamental_vol = 0.02
+fundamental_theta = 0.08
+
+[[assets]]
+symbol = "SOL"
+tick_size = 0.01
+initial_price = 150.0
+fundamental_vol = 0.03
+fundamental_theta = 0.1
+
+[[assets]]
+symbol = "XRP"
+tick_size = 0.0001
+initial_price = 0.6
+fundamental_vol = 0.025
+fundamental_theta = 0.1
+
+[[assets]]
+symbol = "DOGE"
+tick_size = 1e-5
+initial_price = 0.15
+fundamental_vol = 0.04
+fundamental_theta = 0.12
+
+[[venues]]
+name = "primary"
+inter_venue_latency_secs = 0.05
+
+[[venues]]
+name = "secondary"
+inter_venue_latency_secs = 0.08
+
+[run]
+seed = 1
+session_seconds = 100000.0
+max_session_seconds = 100000.0
+
+[market]
+snapshot_interval_secs = 1.0
+snapshot_depth_levels = 10
+mark_price_ema_halflife_secs = 30.0
+
+[fees]
+default_maker_fee = 0.0002
+default_taker_fee = 0.0005
+
+[latency]
+default_latency_secs = 0.08
+
+[mempool]
+enabled = true
+reveal_delay_secs = 0.4
+large_order_notional_threshold = 25000.0
+
+[liquidation]
+maintenance_margin_buffer = 0.8
+sweep_interval_secs = 1.0
+staggered_slices = 5
+full_liquidation_fraction = 0.5
+
+[export]
+out_dir = "runs/human_sweep_lite/human_10pct"
+write_snapshots = true
+
+[population]
+[[population.groups]]
+bot_type = "market_maker"
+variant = "avellaneda_stoikov"
+count = 109
+initial_cash_range = [ 20000.0, 80000.0,]
+
+[population.groups.params]
+wake_interval_secs = 0.3
+[[population.groups]]
+bot_type = "market_maker"
+variant = "fixed_offset"
+count = 109
+initial_cash_range = [ 20000.0, 80000.0,]
+
+[[population.groups]]
+bot_type = "market_maker"
+variant = "inventory_skew"
+count = 109
+initial_cash_range = [ 20000.0, 80000.0,]
+
+[[population.groups]]
+bot_type = "market_maker"
+variant = "adaptive_spread"
+count = 109
+initial_cash_range = [ 20000.0, 80000.0,]
+
+[[population.groups]]
+bot_type = "arbitrage"
+variant = "cross_venue"
+count = 55
+initial_cash_range = [ 30000.0, 100000.0,]
+
+[[population.groups]]
+bot_type = "arbitrage"
+variant = "triangular"
+count = 55
+initial_cash_range = [ 30000.0, 100000.0,]
+
+[[population.groups]]
+bot_type = "arbitrage"
+variant = "stat_arb_pairs"
+count = 55
+initial_cash_range = [ 30000.0, 100000.0,]
+
+[[population.groups]]
+bot_type = "arbitrage"
+variant = "latency_arb"
+count = 55
+initial_cash_range = [ 30000.0, 100000.0,]
+
+[population.groups.params]
+wake_interval_secs = 0.05
+[[population.groups]]
+bot_type = "momentum"
+variant = "ma_crossover"
+count = 109
+leveraged_fraction = 0.15
+leverage_range = [ 2.0, 8.0,]
+
+[[population.groups]]
+bot_type = "momentum"
+variant = "breakout_donchian"
+count = 109
+
+[[population.groups]]
+bot_type = "momentum"
+variant = "rsi"
+count = 109
+
+[[population.groups]]
+bot_type = "momentum"
+variant = "ml_online"
+count = 109
+
+[[population.groups]]
+bot_type = "mean_reversion"
+variant = "bollinger"
+count = 109
+
+[[population.groups]]
+bot_type = "mean_reversion"
+variant = "ou_fair_value"
+count = 109
+
+[[population.groups]]
+bot_type = "mean_reversion"
+variant = "zscore"
+count = 109
+
+[[population.groups]]
+bot_type = "grid"
+variant = "static"
+count = 77
+leveraged_fraction = 0.1
+leverage_range = [ 2.0, 5.0,]
+
+[[population.groups]]
+bot_type = "grid"
+variant = "geometric"
+count = 76
+
+[[population.groups]]
+bot_type = "grid"
+variant = "dynamic_atr"
+count = 66
+
+[[population.groups]]
+bot_type = "dca"
+variant = "time_based"
+count = 76
+initial_cash_range = [ 2000.0, 20000.0,]
+
+[[population.groups]]
+bot_type = "dca"
+variant = "value_averaging"
+count = 76
+initial_cash_range = [ 2000.0, 20000.0,]
+
+[[population.groups]]
+bot_type = "dca"
+variant = "dip_buying"
+count = 66
+initial_cash_range = [ 2000.0, 20000.0,]
+
+[[population.groups]]
+bot_type = "liquidation_trader"
+variant = "full"
+count = 164
+initial_cash_range = [ 5000.0, 40000.0,]
+
+[population.groups.params]
+wake_interval_secs = 300.0
+leverage_range = [ 3.0, 20.0,]
+position_frac_of_cash = 0.6
+[[population.groups]]
+bot_type = "liquidation_trader"
+variant = "staggered_twap"
+count = 164
+initial_cash_range = [ 5000.0, 40000.0,]
+
+[population.groups.params]
+wake_interval_secs = 300.0
+leverage_range = [ 3.0, 20.0,]
+position_frac_of_cash = 0.6
+[[population.groups]]
+bot_type = "mev"
+variant = "sandwich"
+count = 22
+initial_cash_range = [ 100000.0, 300000.0,]
+
+[population.groups.params]
+wake_interval_secs = 0.1
+size_frac_of_victim = 0.25
+[[population.groups]]
+bot_type = "mev"
+variant = "frontrun"
+count = 22
+initial_cash_range = [ 100000.0, 300000.0,]
+
+[population.groups.params]
+wake_interval_secs = 0.1
+size_frac_of_victim = 0.25
+[[population.groups]]
+bot_type = "mev"
+variant = "backrun"
+count = 22
+initial_cash_range = [ 100000.0, 300000.0,]
+
+[population.groups.params]
+wake_interval_secs = 0.1
+size_frac_of_victim = 0.25
+[[population.groups]]
+bot_type = "human"
+variant = "retail"
+count = 250
+initial_cash_range = [ 1000.0, 20000.0,]
+
+[fees.by_bot_type]
+market_maker = [ 0.0, 0.0004,]
+
+[latency.by_bot_type]
+market_maker = 0.03
+arbitrage = 0.02
+mev = 0.01
+noise = 0.3

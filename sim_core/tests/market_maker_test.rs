@@ -70,7 +70,13 @@ fn avellaneda_stoikov_reservation_stays_bounded_under_an_extreme_volatility_spik
     let mut saw_a_quote = false;
     for action in &result.actions {
         if let Action::Submit(req) = action {
-            let price = req.price.expect("market maker quotes are limit orders with an explicit price");
+            // Inventory pinned at 99.9% of max (see above) is also now well past
+            // `derisk_inventory_frac`'s default 0.7 threshold (2026-10-05's active
+            // de-risking fix -- see market_maker.rs's module doc comment), so this
+            // wake legitimately also emits an unpriced IOC market order alongside
+            // the two limit quotes; this test is specifically about the *quote*
+            // price staying bounded, so it only checks priced (limit) actions.
+            let Some(price) = req.price else { continue };
             saw_a_quote = true;
             assert!(
                 price >= mid * 0.75 && price <= mid * 1.25,
@@ -128,7 +134,11 @@ fn inventory_skew_stays_bounded_at_an_entirely_ordinary_inventory_level() {
     let mut saw_a_quote = false;
     for action in &result.actions {
         if let Action::Submit(req) = action {
-            let price = req.price.expect("market maker quotes are limit orders with an explicit price");
+            // See the avellaneda_stoikov test's matching comment -- half-of-max
+            // inventory is below the active de-risking threshold (0.7 default) so
+            // this shouldn't fire here, but checking `req.price` rather than
+            // `.expect`-ing it keeps this test correct regardless.
+            let Some(price) = req.price else { continue };
             saw_a_quote = true;
             assert!(
                 price > 0.0 && price >= mid * 0.9 && price <= mid * 1.1,

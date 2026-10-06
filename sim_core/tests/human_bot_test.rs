@@ -58,9 +58,13 @@ fn sell_qty_after_price_drop(entry_multiple: f64) -> f64 {
     state.last_wake_time = Some(-1000.0); // typical-gap elapsed since "last wake"
     state.avg_entry_price = Some(100.0 * entry_multiple);
     sim.agents[0].add_inventory(0, 10.0);
-    state.last_seen_inventory = 10.0; // matches the inventory already added, so the
-                                       // fill-inference logic doesn't (mis)read this
-                                       // as a fresh buy on this very step
+    // `last_seen_inventory` must match whatever this agent's inventory actually
+    // is right before this step, not just the 10.0 just added above -- `human`
+    // agents (2026-10-04) start with some pre-seeded inventory already (see
+    // sim.rs's `build_population`, "Noise/retail agents start with an existing
+    // spot holding"), so reading it back here instead of assuming a from-zero
+    // start is what keeps this match (not a hardcoded 10.0).
+    state.last_seen_inventory = sim.agents[0].inventory_of(0);
 
     let ctx = StepCtx { market: &sim.market, venue: 0, now: 0.0 };
     let result = bots_step(&mut sim.agents[0], &mut sim.strategies[0], &ctx);
@@ -123,7 +127,10 @@ fn chartist_vs_fundamentalist_fitness_actually_changes_which_signal_wins() {
         // something to sell, since `human` (correctly) never shorts, the same way
         // `sell_qty_after_price_drop` above does.
         sim.agents[0].add_inventory(0, 10.0);
-        state.last_seen_inventory = 10.0;
+        // See `sell_qty_after_price_drop`'s matching comment -- `human` agents
+        // now start with some pre-seeded inventory, so this reads it back
+        // rather than assuming a from-zero start.
+        state.last_seen_inventory = sim.agents[0].inventory_of(0);
 
         let ctx = StepCtx { market: &sim.market, venue: 0, now: 0.0 };
         let result = bots_step(&mut sim.agents[0], &mut sim.strategies[0], &ctx);

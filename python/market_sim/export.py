@@ -67,19 +67,34 @@ def export_run(
     *,
     scenario_name: Optional[str] = None,
     extra_meta: Optional[Dict[str, Any]] = None,
+    write_order_events: bool = True,
 ) -> ExportPaths:
     """Write the full spec-section-7 export set for one run to `out_dir`.
 
     `config_toml` is stored verbatim in run_metadata.json so the run is exactly
     reproducible (same config text + same seed inside it -> same result, given the
     engine's deterministic ChaCha8 PRNG derivation).
+
+    `write_order_events=False` (2026-10-04) skips writing order_events.parquet --
+    measured as THE dominant cost of a run directory (68MB for a single 1000s leg
+    of one scenario/seed, confirmed present even in scenarios unrelated to any
+    recent engine change -- a pre-existing characteristic, not a regression), and
+    confirmed unused by every report/analysis script in this repo (only
+    `trades`/`agent_state` are ever read back). Filled a 1TB disk mid-sweep (see
+    git history/session notes) before this flag existed. `load_run` below still
+    expects the file to exist when reading one back, so an empty placeholder
+    frame is written in its place rather than skipping the file entirely --
+    keeps every existing reader working unchanged, just on an empty table.
     """
     os.makedirs(out_dir, exist_ok=True)
     paths = export_paths(out_dir)
     frames = to_dataframes(result)
 
     frames["trades"].to_parquet(paths.trades, index=False)
-    frames["order_events"].to_parquet(paths.order_events, index=False)
+    if write_order_events:
+        frames["order_events"].to_parquet(paths.order_events, index=False)
+    else:
+        frames["order_events"].iloc[0:0].to_parquet(paths.order_events, index=False)
     frames["orderbook_snapshots"].to_parquet(paths.orderbook_snapshots, index=False)
     frames["agent_state"].to_parquet(paths.agent_state, index=False)
 
@@ -132,9 +147,18 @@ def load_run(out_dir: str) -> Dict[str, Any]:
     paths = export_paths(out_dir)
     with open(paths.run_metadata) as f:
         meta = json.load(f)
+    # order_events.parquet may be missing entirely (2026-10-04) on a leg saved
+    # either by the disk-full crash this flag was added to prevent, or by this
+    # session's own bulk cleanup of pre-existing order_events files once they
+    # were confirmed unused -- `write_order_events=False` normally still writes
+    # an empty placeholder (see `export_run`), but neither of those two cases
+    # went through that path. Read back as empty rather than erroring, since
+    # that's exactly what `write_order_events=False` would have produced here
+    # anyway.
+    order_events = pd.read_parquet(paths.order_events) if os.path.exists(paths.order_events) else pd.DataFrame()
     out = {
         "trades": pd.read_parquet(paths.trades),
-        "order_events": pd.read_parquet(paths.order_events),
+        "order_events": order_events,
         "orderbook_snapshots": pd.read_parquet(paths.orderbook_snapshots),
         "agent_state": pd.read_parquet(paths.agent_state),
         "meta": meta,

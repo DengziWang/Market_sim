@@ -86,6 +86,11 @@ pub struct AgentCommon {
     /// Cumulative notional traded (maker + taker fills), for concentration (HHI) and
     /// volume-authenticity analysis.
     pub cumulative_volume: f64,
+    /// Net worth (cash + inventory value, at the asset's own initial price) at the
+    /// moment this agent was spawned -- the fixed baseline the universal drawdown
+    /// bankruptcy check (`Sim::run_net_worth_bankruptcy_sweep`) measures an 80% loss
+    /// against. Set once at construction, never mutated afterward.
+    pub initial_net_worth: f64,
 }
 
 impl AgentCommon {

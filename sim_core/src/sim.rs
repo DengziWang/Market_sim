@@ -16,8 +16,9 @@ use crate::event::{EventKind, EventQueue};
 use crate::export::{AgentStateRow, OrderEventRow, SimResult, SnapshotRow, TradeRow};
 use crate::market::Market;
 use crate::order::{Fill, OrderEventKind};
+use crate::params;
 use crate::rng;
-use crate::types::{AgentId, AssetId, FxHashMap, OrderType, Side, SimTime, TimeInForce, VenueId};
+use crate::types::{AgentId, AssetId, FxHashMap, OrderId, OrderType, Side, SimTime, TimeInForce, VenueId};
 
 const PRIMARY_VENUE: VenueId = 0;
 
@@ -63,8 +64,9 @@ fn kind_str(k: OrderEventKind) -> &'static str {
 
 impl Simulation {
     pub fn build(cfg: ScenarioConfig) -> Result<Self, String> {
-        let market = Market::new(cfg.assets.clone(), cfg.venues.clone(), cfg.market.clone(), cfg.fees.clone(), cfg.mempool.clone());
-        let (agents, strategies) = build_population(&cfg)?;
+        let n_trend_groups = compute_n_trend_groups(&cfg);
+        let market = Market::new(cfg.assets.clone(), cfg.venues.clone(), cfg.market.clone(), cfg.fees.clone(), cfg.mempool.clone(), n_trend_groups);
+        let (agents, strategies) = build_population(&cfg, n_trend_groups)?;
         let now = 0.0;
         Ok(Self {
             market,
@@ -220,6 +222,10 @@ impl Simulation {
                 EventKind::MarkPriceTick { .. } => {}
                 EventKind::LiquidationSweep => {
                     self.run_liquidation_sweep();
+                    self.run_net_worth_bankruptcy_sweep();
+                    // Piggybacks on this same periodic tick rather than its own EventKind --
+                    // see `run_order_expiry_sweep`'s doc comment for why this exists.
+                    self.run_order_expiry_sweep();
                     self.events.push(self.now + self.cfg.liquidation.sweep_interval_secs, EventKind::LiquidationSweep);
                 }
                 EventKind::LiquidationSlice { agent_id, asset_id, slice_no } => self.handle_liquidation_slice(agent_id, asset_id, slice_no),
@@ -354,12 +360,29 @@ impl Simulation {
 
     fn handle_delayed_arrival(&mut self, payload_id: u64) {
         if let Some((agent_id, req)) = self.pending_delayed.remove(&payload_id) {
+            // This order was submitted (and its latency delay started) before the
+            // agent potentially went bankrupt in between -- the universal
+            // net-worth sweep (`run_net_worth_bankruptcy_sweep`) can mark any
+            // agent bankrupt mid-stream now, not just at a tightly-controlled
+            // margin-close call site, so an order already "in flight" when that
+            // happens needs to be dropped here rather than landing on the book
+            // for a dormant agent and silently reintroducing a position that was
+            // just guaranteed flat (measured directly in testing before this
+            // check was added).
+            if self.agents[agent_id as usize].bankrupt {
+                return;
+            }
             self.apply_submit(agent_id, req);
         }
     }
 
     fn handle_mempool_execute(&mut self, payload_id: u64) {
         if let Some(p) = self.market.take_pending_mempool(payload_id) {
+            // Same reasoning as `handle_delayed_arrival` -- drop an in-flight
+            // mempool order for an agent that went bankrupt while it sat pending.
+            if self.agents[p.agent_id as usize].bankrupt {
+                return;
+            }
             let req = NewOrderRequest {
                 asset_id: p.asset_id,
                 side: p.side,
@@ -560,9 +583,192 @@ impl Simulation {
                 a.margin = None;
             }
         }
-        if a.margin.is_none() && a.cash <= 0.0 {
-            a.bankrupt = true;
-            self.result.bankruptcies += 1;
+        // No bankruptcy check here anymore -- that used to be the only place
+        // bankruptcy could ever be declared (margin closed + cash<=0), but it
+        // only ever flattened *this* margin position, never any spot inventory
+        // the same agent separately held (e.g. a grid/momentum agent with both
+        // a primary spot strategy and a leveraged side-bet) -- measured
+        // directly in testing: agents went "bankrupt" via this path with large
+        // spot positions still completely untouched. `run_net_worth_bankruptcy_
+        // sweep`, which runs on the same periodic cadence right after
+        // `run_liquidation_sweep` (and independently after each staggered
+        // `handle_liquidation_slice`, at most one `sweep_interval_secs` later),
+        // is now the single place bankruptcy gets declared, always through the
+        // complete cancel-orders + close-margin + flatten-spot path -- see
+        // `force_liquidate_and_bankrupt`.
+    }
+
+    /// Flattens every nonzero spot holding this agent has, in two stages: a
+    /// real IOC market order first (so a counterparty that exists gets a
+    /// genuinely realistic fill, with normal slippage/impact through
+    /// `Sim::settle`), then force-closes whatever that didn't fill at the
+    /// current mark price directly. The second stage is not optional --
+    /// measured directly in testing, a thin/crashed book can leave an IOC
+    /// order with a zero fill on every single attempt (a short agent
+    /// repeatedly failing to buy back even one unit while its mark-to-market
+    /// loss grew without bound) -- so "sells everything" has to be a
+    /// guarantee that completes within this one call, not a best-effort order
+    /// that might silently never find a counterparty.
+    fn flatten_spot_inventory(&mut self, agent_id: AgentId) {
+        let idx = agent_id as usize;
+        // Collect first: iterating `inventory` borrows `self.agents[idx]`
+        // immutably, but submitting orders below needs `&mut self`.
+        let holdings: Vec<(AssetId, f64)> = self.agents[idx]
+            .inventory
+            .iter()
+            .filter(|&(_, &qty)| qty.abs() > 1e-9)
+            .map(|(&aid, &qty)| (aid, qty))
+            .collect();
+        for (asset_id, qty) in holdings {
+            let side = if qty > 0.0 { Side::Sell } else { Side::Buy };
+            self.apply_submit(
+                agent_id,
+                NewOrderRequest { asset_id, side, order_type: OrderType::Market, tif: TimeInForce::Ioc, post_only: false, price: None, qty: qty.abs() },
+            );
+        }
+        let mark_prices = self.market.mark_price_ema.clone();
+        let leftover: Vec<(AssetId, f64)> = self.agents[idx]
+            .inventory
+            .iter()
+            .filter(|&(_, &qty)| qty.abs() > 1e-9)
+            .map(|(&aid, &qty)| (aid, qty))
+            .collect();
+        for (asset_id, qty) in leftover {
+            let mark = *mark_prices.get(&asset_id).unwrap_or(&0.0);
+            let a = &mut self.agents[idx];
+            a.cash += qty * mark; // qty>0 (long): credits cash as if sold; qty<0 (short): debits cash as if bought back
+            a.inventory.insert(asset_id, 0.0);
+        }
+    }
+
+    /// Cancels every order this agent still has resting in the market, across
+    /// every venue and asset. NOTE: deliberately does not use
+    /// `AgentCommon::open_orders` -- nothing in this codebase actually pushes
+    /// into that field (confirmed by grep: it's only ever initialized empty),
+    /// so it's always an empty vec and relying on it silently cancels
+    /// nothing. Instead this scans each book's own `orders` map directly for
+    /// this agent's ids -- cheap, since there are only a handful of
+    /// venues/assets and each book's order count is bounded. Called once, at
+    /// the moment an agent is marked bankrupt: without this, a stale resting
+    /// order could still get filled by someone else's incoming order later
+    /// and silently reintroduce inventory into an agent
+    /// `flatten_spot_inventory` just guaranteed was flat -- measured directly
+    /// in testing before this was added.
+    fn cancel_all_open_orders(&mut self, agent_id: AgentId) {
+        let n_venues = self.market.n_venues();
+        let n_assets = self.market.n_assets();
+        for venue in 0..n_venues as VenueId {
+            for asset_id in 0..n_assets as AssetId {
+                let order_ids: Vec<OrderId> = self
+                    .market
+                    .book(venue, asset_id)
+                    .orders
+                    .values()
+                    .filter(|o| o.agent_id == agent_id)
+                    .map(|o| o.id)
+                    .collect();
+                for order_id in order_ids {
+                    if let Some(ev) = self.market.cancel(venue, asset_id, order_id, self.now) {
+                        self.push_order_event(ev, venue);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Force-cancels every resting GTC order older than
+    /// `cfg.market.max_resting_order_age_secs`, emitted as an `Expire` order event
+    /// (not `Cancel`, so cancel-to-trade-ratio analysis can tell the two apart).
+    /// Exists because `noise`/`wash_trading` place a fresh GTC order on every wake
+    /// without ever cancelling the previous one if it didn't fill -- unlike
+    /// `market_maker`/`grid`/`human`, which explicitly cancel-and-replace. Over a
+    /// long session that leaves unbounded dead resting liquidity in the book:
+    /// confirmed as the cause of a 2026-10-06 anomaly where one job's
+    /// checkpoint.bin reached 852MB (vs. ~2.6MB normal) and wall-clock time per
+    /// leg climbed steadily while trade volume *fell* -- more and more stale
+    /// orders to scan, fewer of them anywhere near the live price. This is a
+    /// backstop (same category as a real exchange's max-open-orders or
+    /// cancel-on-disconnect protections), not a fix for the underlying bot
+    /// behavior -- see this field's doc comment in `config.rs` for the reasoning
+    /// behind the 3600s default.
+    fn run_order_expiry_sweep(&mut self) {
+        let max_age = self.cfg.market.max_resting_order_age_secs;
+        if max_age <= 0.0 {
+            return;
+        }
+        let now = self.now;
+        let n_venues = self.market.n_venues();
+        let n_assets = self.market.n_assets();
+        for venue in 0..n_venues as VenueId {
+            for asset_id in 0..n_assets as AssetId {
+                let expired_ids: Vec<OrderId> = self
+                    .market
+                    .book(venue, asset_id)
+                    .orders
+                    .values()
+                    .filter(|o| now - o.submitted_at > max_age)
+                    .map(|o| o.id)
+                    .collect();
+                for order_id in expired_ids {
+                    if let Some(mut ev) = self.market.cancel(venue, asset_id, order_id, now) {
+                        ev.kind = OrderEventKind::Expire;
+                        self.push_order_event(ev, venue);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Universal "blew up" handler, called from `run_net_worth_bankruptcy_sweep`
+    /// the tick an agent's equity breaches the 80%-loss threshold, and the
+    /// *only* place bankruptcy is ever declared: force-closes any margin
+    /// position (reusing the same `execute_liquidation_qty` path the ordinary
+    /// margin-liquidation sweep uses -- passing the position's full size closes
+    /// it in one shot, regardless of the agent's own staggered/full liquidation
+    /// style), cancels every resting order (see `cancel_all_open_orders`),
+    /// flattens every spot holding (guaranteed complete -- see
+    /// `flatten_spot_inventory`), and marks the agent bankrupt.
+    fn force_liquidate_and_bankrupt(&mut self, agent_id: AgentId) {
+        let idx = agent_id as usize;
+        if self.agents[idx].bankrupt {
+            return;
+        }
+        self.cancel_all_open_orders(agent_id);
+        if let Some(pos) = self.agents[idx].margin.clone() {
+            self.execute_liquidation_qty(agent_id, pos.asset_id, pos.size);
+        }
+        self.flatten_spot_inventory(agent_id);
+        self.agents[idx].bankrupt = true;
+        self.result.bankruptcies += 1;
+    }
+
+    /// Runs on the same periodic cadence as the margin-liquidation sweep
+    /// (`sweep_interval_secs`). Any non-bankrupt agent whose current equity has
+    /// fallen to <=20% of its initial net worth (an 80% loss, measured against
+    /// the fixed spawn-time baseline -- see `AgentCommon::initial_net_worth`)
+    /// is force-liquidated and marked bankrupt here. Unlike the original
+    /// margin-liquidation-sweep bankruptcy check, this applies to every agent
+    /// -- spot-only bots and human/retail included, not just the margin
+    /// sub-population mid-close -- since ordinary spot settlement
+    /// (`Sim::settle`) never itself checks solvency.
+    fn run_net_worth_bankruptcy_sweep(&mut self) {
+        let mark_prices = self.market.mark_price_ema.clone();
+        let mut newly_breaching: Vec<AgentId> = Vec::new();
+        for idx in 0..self.agents.len() {
+            let agent_id = idx as AgentId;
+            let a = &self.agents[idx];
+            if a.bankrupt {
+                continue;
+            }
+            if a.initial_net_worth <= 0.0 {
+                continue;
+            }
+            if a.equity(&mark_prices) <= 0.2 * a.initial_net_worth {
+                newly_breaching.push(agent_id);
+            }
+        }
+        for agent_id in newly_breaching {
+            self.force_liquidate_and_bankrupt(agent_id);
         }
     }
 
@@ -588,6 +794,13 @@ impl Simulation {
             // sentiment value, same trick as fundamental/mark above -- long-format,
             // no new export file needed.
             self.result.snapshots.push(SnapshotRow { time: self.now, asset_id: aid, venue_id: PRIMARY_VENUE, side: "sentiment", level: 0, price: sentiment, qty: 0.0 });
+            // The old "trend" diagnostic row (one shared crowd-trend line per
+            // asset) no longer applies -- replaced 2026-10-05 by the social-
+            // network signal (`Market::human_signal`), which is per-agent, not
+            // per-asset, so it doesn't fit this per-asset snapshot row
+            // unchanged. Dropped here rather than exporting something
+            // misleading; a proper per-asset view (e.g. mean signal among
+            // agents trading this asset) would be a reasonable follow-up.
         }
     }
 
@@ -610,6 +823,7 @@ impl Simulation {
                     bankrupt: a.bankrupt,
                     has_margin_position: a.margin.is_some(),
                     margin_leverage: a.margin.as_ref().map(|m| m.leverage),
+                    initial_net_worth: a.initial_net_worth,
                 });
             } else {
                 for (&asset_id, &qty) in &a.inventory {
@@ -626,6 +840,7 @@ impl Simulation {
                         bankrupt: a.bankrupt,
                         has_margin_position: a.margin.is_some(),
                         margin_leverage: a.margin.as_ref().map(|m| m.leverage),
+                        initial_net_worth: a.initial_net_worth,
                     });
                 }
             }
@@ -637,7 +852,20 @@ impl Simulation {
 // Population builder
 // ---------------------------------------------------------------------------------
 
-fn build_population(cfg: &ScenarioConfig) -> Result<(Vec<AgentCommon>, Vec<BotStrategy>), String> {
+/// Number of independent "crowd trend" groups humans get split into (2026-10-06
+/// revert, restoring the mechanism that predated the social-network graph -- see
+/// `Market::random_trend`'s doc comment). Best-effort reconstruction: the
+/// original heuristic was never committed to git, so this picks a simple,
+/// clearly-documented rule rather than guessing at an exact-but-unverifiable
+/// original formula -- roughly one group per 50 human agents, bounded to
+/// [1, 20] so a tiny human population still gets at least one shared trend line
+/// and a huge one doesn't fragment into hundreds of near-meaningless groups.
+fn compute_n_trend_groups(cfg: &ScenarioConfig) -> u32 {
+    let n_human: usize = cfg.population.groups.iter().filter(|g| g.bot_type == "human").map(|g| g.count as usize).sum();
+    ((n_human / 50).max(1) as u32).min(20)
+}
+
+fn build_population(cfg: &ScenarioConfig, n_trend_groups: u32) -> Result<(Vec<AgentCommon>, Vec<BotStrategy>), String> {
     let n_assets = cfg.assets.len();
     if n_assets == 0 {
         return Err("scenario must configure at least 1 asset".to_string());
@@ -668,7 +896,7 @@ fn build_population(cfg: &ScenarioConfig) -> Result<(Vec<AgentCommon>, Vec<BotSt
             let venue_b: VenueId = if n_venues > 1 { 1 } else { 0 };
 
             let strat = match group.bot_type.as_str() {
-                "market_maker" => BotStrategy::MarketMaker(market_maker::State::from_params(parse_mm_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
+                "market_maker" => BotStrategy::MarketMaker(market_maker::State::from_params(parse_mm_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params, &mut rng)),
                 "arbitrage" => BotStrategy::Arbitrage(arbitrage::State::from_params(
                     parse_arb_variant(&group.variant)?,
                     asset_a,
@@ -698,7 +926,9 @@ fn build_population(cfg: &ScenarioConfig) -> Result<(Vec<AgentCommon>, Vec<BotSt
                     &params,
                 )),
                 "noise" => BotStrategy::Noise(noise::State::from_params(parse_noise_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
-                "human" => BotStrategy::Human(human::State::from_params(parse_human_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
+                "human" => {
+                    BotStrategy::Human(human::State::from_params(parse_human_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params, n_trend_groups, &mut rng))
+                }
                 other => return Err(format!("unknown bot_type '{other}' in population config")),
             };
 
@@ -728,13 +958,45 @@ fn build_population(cfg: &ScenarioConfig) -> Result<(Vec<AgentCommon>, Vec<BotSt
             // agent's starting budget is pre-converted into inventory at the asset's
             // initial price; the rest stays as cash.
             let mut inventory = FxHashMap::default();
-            if group.bot_type == "noise" {
+            if group.bot_type == "noise" || group.bot_type == "human" {
+                // `human` added 2026-10-04: now that this bot can post resting
+                // limit orders (not just IOC market orders -- see human.rs's
+                // module doc comment), it hits the exact same structural issue
+                // `noise` already solved above -- a 100%-human population
+                // starting with zero inventory anywhere is categorically
+                // buy-only until it organically accumulates holdings (sells are
+                // correctly gated to what's actually held), which isn't a
+                // transient bias here but a permanent deadlock: no sell order of
+                // either kind can ever exist, so no trade can ever occur,
+                // regardless of session length (confirmed in a 20,000s smoke
+                // test -- zero trades, by construction, not by chance).
                 let frac = rng.gen_range(0.2..0.6);
                 let initial_price = cfg.assets[asset_a as usize].initial_price.max(1e-9);
-                let value = cash * frac;
+                let mut value = cash * frac;
+                if group.bot_type == "human" {
+                    // `human`'s own position cap (`max_position_notional`,
+                    // default $4000 -- see human.rs) is far smaller relative to
+                    // typical cash than `noise`'s is: an unconstrained 20-60%-
+                    // of-cash seed would start a meaningful share of human agents
+                    // already pinned at (or past) their own buy cap before the
+                    // session even begins, for no behavioral reason -- just an
+                    // artifact of how much cash they happened to be given. Half
+                    // the cap leaves room for this agent's own signal to still
+                    // move it either direction from the start.
+                    let max_position_notional = params::get_f64(&params, "max_position_notional", 4000.0);
+                    value = value.min(max_position_notional * 0.5);
+                }
                 inventory.insert(asset_a, value / initial_price);
                 cash -= value;
             }
+
+            // cash + any pre-funded inventory (only `noise`, above), valued at each
+            // asset's own initial price -- the fixed baseline the universal 80%-loss
+            // bankruptcy sweep compares current equity against (see
+            // Sim::run_net_worth_bankruptcy_sweep). Computed here, once, from the
+            // same (already-finalized) cash/inventory this agent is actually
+            // constructed with, not re-derived later.
+            let initial_net_worth = cash + inventory.iter().map(|(&aid, &qty)| qty * cfg.assets[aid as usize].initial_price).sum::<f64>();
 
             agents.push(AgentCommon {
                 id: agent_id,
@@ -751,6 +1013,7 @@ fn build_population(cfg: &ScenarioConfig) -> Result<(Vec<AgentCommon>, Vec<BotSt
                 rng,
                 realized_pnl: 0.0,
                 cumulative_volume: 0.0,
+                initial_net_worth,
             });
             strategies.push(strat);
             agent_id += 1;
@@ -823,4 +1086,5 @@ variant_parser!(parse_noise_variant, noise::Variant, {
 });
 variant_parser!(parse_human_variant, human::Variant, {
     "retail" => human::Variant::Retail,
+    "lite" => human::Variant::Lite,
 });

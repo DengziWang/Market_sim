@@ -152,6 +152,7 @@ def run_scenario_in_legs(
     on_leg_saved: Optional[Callable[[LegResult], None]] = None,
     resume: bool = True,
     compute_market_health: bool = True,
+    write_order_events: bool = True,
 ) -> List[LegResult]:
     """Runs a scenario as `n_legs` sequential sessions of `leg_seconds` simulated
     seconds each, saving every leg to its own subdirectory
@@ -271,6 +272,7 @@ def run_scenario_in_legs(
             leg_out_dir,
             scenario_name=scenario_name,
             extra_meta={"leg_index": leg_idx, "n_legs": n_legs, "leg_seconds": leg_seconds},
+            write_order_events=write_order_events,
         )
         if compute_market_health:
             # Local import: market_health.batch_compare imports market_sim.export,

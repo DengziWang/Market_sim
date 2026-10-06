@@ -1,6 +1,43 @@
 //! Market-maker bots: 4.1 in the spec. All four variants requote periodically
 //! (cancel previous quotes, place new two-sided post-only quotes) rather than
 //! reacting tick-by-tick, matching real MM requote cadences (~0.1-1s).
+//!
+//! **Active de-risking (2026-10-05)**: measured in a 41-scenario x 5-seed
+//! sweep that ~86-97% of market_maker agents end the run bankrupt (a drop to
+//! 20% of starting net worth), *every* variant included -- even
+//! `AdaptiveSpread`, the one variant that already widens/withdraws under
+//! volatility. That ruled out "only the naive variants are missing a
+//! defense": the gap is common to all four. Each variant above only ever
+//! adjusts the *next resting quote* (wider spread, skewed center, or no
+//! quote at all) -- none of them can act on a position it has *already*
+//! accumulated. A real market maker that's gotten run over by sustained
+//! directional flow actively crosses the spread to flatten part of the
+//! position; this bot could previously only requote passively and wait for
+//! its own resting ask/bid to get hit, even while the mark price kept moving
+//! further against the inventory it was already holding. The fix below
+//! applies to every variant uniformly, after its own quote logic: once
+//! inventory crosses this agent's own `derisk_inventory_frac` of
+//! `max_inventory`, submit an IOC market order on the de-risking side, sized
+//! to only a small fraction of the excess per wake (`derisk_frac_per_step`).
+//!
+//! First version of this (uniform 0.7 threshold, 0.3 unwind fraction, fired
+//! on skew alone) was measured to make things *worse*, not better: 100% of
+//! market_makers bankrupt by 20,000s of a 150,000s run, vs. 84-96% over the
+//! same window with de-risking disabled (A/B'd on the same seed/scenario).
+//! Root cause: with one shared threshold, agents facing the same market
+//! conditions tend to cross it together, so they all dump/buy in the same
+//! direction at once -- a self-inflicted stampede that pushes price further
+//! against the very position they're trying to reduce, compounding the
+//! original loss with fresh taker-side slippage. Three fixes, all below: (1)
+//! `derisk_inventory_frac` is now drawn once per agent at construction from a
+//! range, not one shared constant, so agents don't all trip the same
+//! threshold simultaneously; (2) `derisk_frac_per_step`'s default is far
+//! smaller (a slow trickle, not a third of the excess every half-second);
+//! (3) de-risking now also requires the position to actually be
+//! *underwater* (current mid worse than `ema_mid`, a slow trailing reference
+//! price, in the direction that hurts this agent's current position) --
+//! merely being skewed is not itself a reason to sell into a move that's
+//! about to reverse.
 
 use rand::Rng;
 
@@ -32,6 +69,27 @@ pub struct State {
     pub vol_window: RollingWindow,
     pub toxicity_window: RollingWindow,
     pub withdrawal_vol_frac: f64,
+    /// Active de-risking threshold, as a fraction of `max_inventory` -- see
+    /// the module doc comment. Below this, inventory is managed only by
+    /// requoting (the original behavior, unchanged); above it (AND only
+    /// while underwater, see `ema_mid`), this agent starts actively crossing
+    /// the spread to reduce the position. Drawn once per agent at
+    /// construction from a range, not a single shared constant -- agents
+    /// facing the same market conditions must not all cross the identical
+    /// threshold at the same moment, which was measured to cause a
+    /// self-inflicted stampede (see module doc comment).
+    pub derisk_inventory_frac: f64,
+    /// How much of the excess (inventory beyond `derisk_inventory_frac`) gets
+    /// actively unwound per wake -- a small fraction, not all of it at once,
+    /// so a single bad step doesn't itself dump a large market order into a
+    /// thin book and move price further against this agent.
+    pub derisk_frac_per_step: f64,
+    /// Slow EMA of mid, the reference de-risking compares the current price
+    /// against to decide whether this agent's position is actually
+    /// underwater (not just skewed) -- see the module doc comment. A long
+    /// position is "underwater" when mid has dropped below this trailing
+    /// average since it was built; a short, when mid has risen above it.
+    pub ema_mid: Option<f64>,
     pub last_mid: Option<f64>,
     pub last_bid_id: Option<OrderId>,
     pub last_ask_id: Option<OrderId>,
@@ -58,11 +116,18 @@ impl State {
     /// price-collapse cascade in testing (see git history) once a cheap asset's
     /// market-maker depth was orders of magnitude too thin relative to other bots'
     /// (also now notional-scaled) order sizes.
-    pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value) -> Self {
+    /// `rng`: used once, here, to draw this specific agent's own
+    /// `derisk_inventory_frac` (see that field's doc comment) from a range --
+    /// the same construction-time RNG `sim.rs`'s `build_population` already
+    /// uses for this agent's starting cash/leverage, so the draw is
+    /// deterministic given a fixed run seed.
+    pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value, rng: &mut impl Rng) -> Self {
         let vol_window_len = params::get_u32(p, "vol_window", 30) as usize;
         let price = initial_price.max(1e-9);
         let order_qty = params::get_f64(p, "order_notional", 3000.0) / price;
         let max_inventory = params::get_f64(p, "max_inventory_notional", 30_000.0) / price;
+        let derisk_frac_min = params::get_f64(p, "derisk_inventory_frac_min", 0.6);
+        let derisk_frac_max = params::get_f64(p, "derisk_inventory_frac_max", 0.9);
         Self {
             variant,
             asset_id,
@@ -77,6 +142,9 @@ impl State {
             vol_window: RollingWindow::new(vol_window_len),
             toxicity_window: RollingWindow::new(vol_window_len),
             withdrawal_vol_frac: params::get_f64(p, "withdrawal_vol_frac", 0.01),
+            derisk_inventory_frac: if derisk_frac_max > derisk_frac_min { rng.gen_range(derisk_frac_min..derisk_frac_max) } else { derisk_frac_min },
+            derisk_frac_per_step: params::get_f64(p, "derisk_frac_per_step", 0.04),
+            ema_mid: None,
             last_mid: None,
             last_bid_id: None,
             last_ask_id: None,
@@ -103,6 +171,20 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         }
     }
     s.last_mid = Some(mid);
+
+    // Slow trailing reference for the de-risking "is this position actually
+    // underwater" check below -- see module doc comment. Time constant tied
+    // to this agent's own `horizon_secs` (already its reservation-price
+    // horizon), not a separate tunable: a requote-interval-scaled discrete
+    // EMA, so it reacts on the same timescale this agent already reasons
+    // about risk on, not tick-by-tick noise.
+    s.ema_mid = Some(match s.ema_mid {
+        None => mid,
+        Some(prev) => {
+            let alpha = s.wake_interval / (s.horizon_secs + s.wake_interval).max(1e-9);
+            prev + alpha * (mid - prev)
+        }
+    });
 
     let sigma = s.vol_window.std().unwrap_or(0.0).max(1e-9);
     let inventory = agent.inventory_of(s.asset_id);
@@ -220,6 +302,38 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             price: Some(ask_price),
             qty: s.order_qty,
         }));
+    }
+
+    // Active de-risking -- see module doc comment. Runs for every variant,
+    // on top of whatever quotes it just posted above: requoting alone only
+    // changes what happens on this agent's *next* fill, it does nothing
+    // about inventory already sitting on the books from past fills. Gated on
+    // actually being underwater (not just skewed): a long only de-risks when
+    // mid has dropped below `ema_mid`, a short only when mid has risen above
+    // it -- merely holding a big position that's currently *working* (price
+    // moved in this agent's favor since it was built) is not a reason to
+    // sell into further upside or buy back a profitable short.
+    let underwater = if inventory > 0.0 {
+        s.ema_mid.map_or(false, |e| mid < e)
+    } else {
+        s.ema_mid.map_or(false, |e| mid > e)
+    };
+    if underwater && inventory_norm.abs() > s.derisk_inventory_frac {
+        let excess_frac = inventory_norm.abs() - s.derisk_inventory_frac;
+        let derisk_qty = (s.max_inventory * excess_frac * s.derisk_frac_per_step).min(inventory.abs());
+        if derisk_qty > 1e-9 {
+            // Long -> sell to reduce; short -> buy to reduce.
+            let side = if inventory > 0.0 { Side::Sell } else { Side::Buy };
+            actions.push(Action::Submit(NewOrderRequest {
+                asset_id: s.asset_id,
+                side,
+                order_type: OrderType::Market,
+                tif: TimeInForce::Ioc,
+                post_only: false,
+                price: None,
+                qty: derisk_qty,
+            }));
+        }
     }
 
     // Jitter the wake slightly (agents don't all requote in perfect lockstep), matching

@@ -61,6 +61,11 @@ pub struct AgentStateRow {
     pub bankrupt: bool,
     pub has_margin_position: bool,
     pub margin_leverage: Option<f64>,
+    /// Fixed spawn-time baseline the universal 80%-loss bankruptcy sweep compares
+    /// `equity` against (bankrupt whenever equity <= 0.2 * initial_net_worth) --
+    /// exported so that check is independently verifiable from this file alone,
+    /// not just trusted.
+    pub initial_net_worth: f64,
 }
 
 #[derive(Default)]

@@ -94,6 +94,7 @@ fn agent_states_dict<'py>(py: Python<'py>, rows: &[AgentStateRow]) -> PyResult<B
     set_numpy_col(&d, "has_margin_position", rows.iter().map(|r| r.has_margin_position).collect::<Vec<_>>())?;
     // See the `price` comment in order_events_dict -- same None -> NaN reasoning.
     set_numpy_col(&d, "margin_leverage", rows.iter().map(|r| r.margin_leverage.unwrap_or(f64::NAN)).collect::<Vec<_>>())?;
+    set_numpy_col(&d, "initial_net_worth", rows.iter().map(|r| r.initial_net_worth).collect::<Vec<_>>())?;
     Ok(d)
 }
 

@@ -153,6 +153,7 @@ pub fn on_order_id(strat: &mut BotStrategy, req: &NewOrderRequest, id: OrderId) 
     match strat {
         BotStrategy::MarketMaker(s) => market_maker::on_order_id(s, req, id),
         BotStrategy::Grid(s) => grid::on_order_id(s, req, id),
+        BotStrategy::Human(s) => human::on_order_id(s, req, id),
         _ => {}
     }
 }
