@@ -97,9 +97,60 @@
 //!     `resting_sell_order`) -- placing a new one on a side cancels whatever this
 //!     agent still had resting on that same side first, so stale orders from a
 //!     check-in long ago never pile up.
+//!   - **"Too smart to fail" fix (2026-10-07)**: measured in the `trendgroups_v4`
+//!     sweep that human agents went bankrupt at essentially 0% while bots failed
+//!     at ~55-70%, across every composition. Root cause wasn't "humans trade
+//!     well" so much as every risk control being far tighter, in relative terms,
+//!     than a real retail trader's: `order_notional`/`max_position_notional` are
+//!     fixed dollar amounts (not scaled to this agent's own capital, which spans
+//!     roughly $1k-$20k in practice), `max_cash_frac_per_trade` caps any one trade
+//!     at 15% of current cash, and "hot hand" sizing *shrinks* bets after losses
+//!     -- the opposite of the loss-chasing/doubling-down that drives most real
+//!     retail blowups. Three new per-agent propensity values (below), each drawn
+//!     independently and uniformly at construction like `personal_trend_weight`
+//!     above, so *some* agents genuinely risk enough to blow up while most stay
+//!     close to the original, well-risk-managed behavior -- not a population-wide
+//!     toggle, since real retail populations aren't uniformly reckless either.
+//!   - **Cash-constrained conviction -> leverage (2026-10-10)**: a fourth
+//!     lever on the same "too smart to fail" problem, but NOT via the
+//!     generic `LeverageCfg` piggyback (`agent.rs`/`sim.rs`) every other
+//!     leveraged bot type uses -- tried that first, and it's wrong for this
+//!     bot specifically. That piggyback opens a position in a *random*
+//!     direction (`agent.rng.gen_bool(0.5)` in
+//!     `liquidation_trader::open_leveraged_position`) on essentially every
+//!     wake once none is already open, sized at a flat fraction of cash --
+//!     completely decoupled from this agent's own signal, and at a scale
+//!     (tens of thousands of dollars per position) wildly out of proportion
+//!     to this bot's own normal trade size (`order_notional` defaults to
+//!     $200). Measured directly: enabling it for humans reliably produced a
+//!     runaway cascade (the random, oversized, directionless flow triggers
+//!     FOMO reactions across the rest of the population, which triggers more
+//!     of the same, compounding) and simulation wall-clock time exploded
+//!     well past normal. A real retail trader doesn't lever up on a coin
+//!     flip; they reach for borrowed money when they *believe* in a
+//!     direction and are out of cash to act on that belief at spot. So
+//!     instead: after the ordinary Buy-side cap above clips `qty` down,
+//!     `shortfall_qty` (`desired_qty - qty`, the part this agent wanted to
+//!     buy but couldn't afford) becomes a candidate for a leveraged top-up,
+//!     gated on two things clearing their own bar at once -- how strongly
+//!     this agent currently believes the direction (`raw_signal`'s own
+//!     magnitude, i.e. its "reputation" for this asset in the sense of how
+//!     much it trusts its own view right now, not a track record) past
+//!     `leverage_signal_threshold`, and a per-agent
+//!     `leverage_risk_appetite` roll (most agents' draw is low, so most
+//!     convicted-and-cash-constrained moments still just... don't get
+//!     leveraged, same as a real population where most retail traders never
+//!     touch margin at all). Same direction as the spot order (never a
+//!     separate bet), sized to exactly the shortfall (never more), and
+//!     routed through the shared `liquidation_trader::
+//!     open_leveraged_position_directed` core (refactored out of the
+//!     piggyback's own entry logic) and the new `Action::SubmitMargin`
+//!     (`agent.rs`) so this one action -- and only this one, not every
+//!     order this agent submits -- takes the margin settlement path.
 
 use rand::Rng;
 
+use super::liquidation_trader;
 use super::StepCtx;
 use crate::agent::{Action, AgentCommon, NewOrderRequest, StepResult};
 use crate::params;
@@ -180,6 +231,53 @@ pub struct State {
     pub pnl_sizing_sensitivity: f64,
     pub max_cash_frac_per_trade: f64,
     pub p_act_given_signal: f64,
+    /// Drawn once per agent, Uniform(1.0, `aggressive_sizing_max`) -- a direct
+    /// multiplier on this agent's own `max_cash_frac_per_trade`/`max_position`,
+    /// same convention as `personal_trend_weight` (a ready-to-use scale, not a
+    /// 0-1 probability needing a separate scale constant). 1.0 (the floor) =
+    /// exactly today's caps; most agents land well below `aggressive_sizing_max`
+    /// since the draw is uniform across the whole range, but a minority land
+    /// high enough to actually risk a large enough share of net worth to go
+    /// bankrupt from trading losses alone -- see module doc comment's "too smart
+    /// to fail" section for why this exists.
+    pub aggressive_sizing_propensity: f64,
+    /// Drawn once per agent, Uniform(0, `revenge_trading_max`). Blends this
+    /// agent's own "hot hand" sizing response away from today's risk-*reducing*
+    /// shrink-after-losses behavior and toward risk-*increasing* "get-even"
+    /// loss-chasing (bet bigger, not smaller, right after a loss) -- 0 = exactly
+    /// today's behavior, 1 = a full reversal (grows by the same magnitude a loss
+    /// would otherwise shrink it).
+    pub revenge_trading_propensity: f64,
+    /// Drawn once per agent, Uniform(0, `price_chase_prob_max`) -- the per-attempt
+    /// probability (rolled fresh each time the situation arises, not fixed per
+    /// agent-level outcome like the two propensities above) that this agent
+    /// impulsively crosses at a bad price with a market order instead of patiently
+    /// posting a resting limit at its own believed value. 0 = never (today's
+    /// always-patient behavior).
+    pub price_chase_prob: f64,
+    /// Drawn once per agent, Uniform(0, `leverage_risk_appetite_max`) -- how
+    /// willing *this* agent is to borrow against its own conviction rather
+    /// than wait/save up, when both `leverage_signal_threshold` (how
+    /// strongly it currently believes the direction, i.e. its own
+    /// `raw_signal`'s magnitude -- "reputation" in the sense of how much it
+    /// currently trusts its own bullish/bearish view, not a track record)
+    /// and this probability clear their bars at once -- see module doc
+    /// comment's "cash-constrained conviction" leverage section. Most agents
+    /// land low (leverage stays rare even among convicted agents); a minority
+    /// land high enough to actually reach for it regularly.
+    pub leverage_risk_appetite: f64,
+    /// Drawn once per agent, Uniform(`leverage_min`, `leverage_max`) -- this
+    /// agent's own leverage multiplier on the rare occasions it does borrow.
+    /// Independent of `leverage_risk_appetite` (how *often* it reaches for
+    /// leverage) -- this is how *much* leverage it reaches for when it does.
+    pub leverage_amount: f64,
+    /// How strongly `raw_signal`'s magnitude must clear the ordinary
+    /// act-at-all dead zone (1.0) before leverage is even considered -- not
+    /// per-agent (unlike the three fields above), since this represents "how
+    /// convicted is convicted enough to borrow," a population-level bar, not
+    /// individual heterogeneity.
+    pub leverage_signal_threshold: f64,
+    pub leverage_maintenance_margin_buffer: f64,
     pub last_price: Option<f64>,
     pub last_wake_time: Option<SimTime>,
     pub last_seen_inventory: f64,
@@ -308,6 +406,74 @@ impl State {
                 if max > 0.0 { rng.gen_range(0.0..max) } else { 0.0 }
             },
             trend_group: if n_trend_groups > 0 { rng.gen_range(0..n_trend_groups) } else { 0 },
+            // See module doc comment's "too smart to fail" section. All three
+            // below default to a nonzero max (always-on, like
+            // `personal_trend_weight` above) so a sweep gets a heterogeneous
+            // minority of genuinely-risky agents without any scenario file
+            // needing to opt in -- but each max is itself tunable per scenario.
+            aggressive_sizing_propensity: {
+                // Calibrated by smoke test against scenarios/human_sweep_lite/
+                // human_50pct.toml (2026-10-10): 4.0 produced 0% human
+                // bankruptcy (the caps were loosened but the underlying desired
+                // trade size, order_notional * (1+intensity) * pnl_size_mult,
+                // rarely got big enough to matter even scaled up 4x); 15.0 blew
+                // up simulation wall-clock time (oversized trades triggering a
+                // cascade of FOMO reactions across the rest of the population --
+                // a feedback loop, not a hang). 8.0 landed in between: a 1.28%
+                // human bankruptcy rate (up from 0%), normal sim runtime, and a
+                // real near-wipeout (one agent's equity measured at $89 against
+                // a starting net worth over $10,000) -- a minority of agents
+                // genuinely blow up, not "every human is risky."
+                let max = params::get_f64(p, "aggressive_sizing_max", 8.0).max(1.0);
+                if max > 1.0 { rng.gen_range(1.0..max) } else { 1.0 }
+            },
+            revenge_trading_propensity: {
+                let max = params::get_f64(p, "revenge_trading_max", 1.0).clamp(0.0, 1.0);
+                if max > 0.0 { rng.gen_range(0.0..max) } else { 0.0 }
+            },
+            price_chase_prob: {
+                let max = params::get_f64(p, "price_chase_prob_max", 0.3).clamp(0.0, 1.0);
+                if max > 0.0 { rng.gen_range(0.0..max) } else { 0.0 }
+            },
+            leverage_risk_appetite: {
+                // Defaulted OFF briefly (2026-10-10), then back ON after
+                // isolating the actual cause of two machine crashes that
+                // first looked leverage-related. What actually happened: a
+                // *single-shot* `run_simulation`-style call keeps every
+                // trade/order-event accumulating in memory for the whole run
+                // and only marshals the complete Rust result into Python
+                // objects at the very end -- for a large, long run that final
+                // marshal is a big one-time spike, independent of leverage
+                // entirely. Measured directly: a leg-based run (10 x 10,000s
+                // legs via `run_scenario_in_legs`, which exports+drops each
+                // leg's result individually instead of accumulating one
+                // giant result) completed this same scenario at full
+                // duration *with* leverage enabled, no crash, memory
+                // oscillating in a bounded sawtooth the whole time (14GB ->
+                // ~11GB -> back to ~14GB each leg) -- and 394/1250 humans
+                // (31.5%) genuinely used leverage at some point, human
+                // bankruptcy landed at 1.92%, well within the same range as
+                // every other run in this file's history, not a runaway
+                // outcome. The earlier single-shot tests that appeared to
+                // implicate leverage were measuring the marshal-spike
+                // artifact, not this mechanism. Lesson for future testing of
+                // this bot (or any large/long scenario): prefer
+                // `run_scenario_in_legs` over a single `run_scenario_file`/
+                // `run_simulation` call once population/duration gets large
+                // -- see `scripts/` sweep tooling, which already does this
+                // for exactly this reason. Default matches the value this
+                // was actually validated at; override `leverage_risk_appetite_max`
+                // in a scenario file to tune it.
+                let max = params::get_f64(p, "leverage_risk_appetite_max", 0.5).clamp(0.0, 1.0);
+                if max > 0.0 { rng.gen_range(0.0..max) } else { 0.0 }
+            },
+            leverage_amount: {
+                let lo = params::get_f64(p, "leverage_min", 1.5).max(1.0);
+                let hi = params::get_f64(p, "leverage_max", 3.0).max(lo + 1e-6);
+                rng.gen_range(lo..hi)
+            },
+            leverage_signal_threshold: params::get_f64(p, "leverage_signal_threshold", 1.5),
+            leverage_maintenance_margin_buffer: params::get_f64(p, "leverage_maintenance_margin_buffer", 0.8),
             resting_buy_order: None,
             resting_sell_order: None,
         }
@@ -488,10 +654,32 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
 
     if acts_this_time {
         let side = if raw_signal > 0.0 { Side::Buy } else { Side::Sell };
-        // "Hot hand": bigger bets after recent wins, smaller/timider after losses.
-        let pnl_size_mult = (1.0 + s.pnl_sizing_sensitivity * s.recent_pnl_frac).clamp(0.2, 2.5);
-        let notional = round_to_nice(s.order_notional * (1.0 + intensity) * pnl_size_mult);
+        // "Hot hand" <-> "revenge trading": interpolates this agent's own P&L
+        // sensitivity from today's risk-*reducing* response (grows after wins,
+        // shrinks after losses) at propensity=0, through indifference at 0.5, to
+        // a full risk-*increasing* reversal (shrinks after wins, grows after
+        // losses -- "get-even" loss-chasing) at propensity=1. See module doc
+        // comment's "too smart to fail" section.
+        let effective_pnl_sensitivity = s.pnl_sizing_sensitivity * (1.0 - 2.0 * s.revenge_trading_propensity);
+        let pnl_size_mult = (1.0 + effective_pnl_sensitivity * s.recent_pnl_frac).clamp(0.2, 2.5);
+        // `aggressive_sizing_propensity` has to scale the *desired* trade size
+        // itself, not just the caps below -- the caps were rarely the binding
+        // constraint to begin with (order_notional * (1+intensity) * pnl_size_mult
+        // tops out well under the original max_position/cash caps already), so
+        // loosening only the ceiling without this left the fix inert (measured:
+        // a smoke test with only the caps loosened still showed 0% human
+        // bankruptcy). This is what actually lets a high-draw agent's single
+        // trade reach a bankruptcy-capable size.
+        let notional = round_to_nice(s.order_notional * (1.0 + intensity) * pnl_size_mult * s.aggressive_sizing_propensity);
         let mut qty = notional / mid.max(1e-9);
+        // Captured before the Buy-side cap below clips `qty` down -- the gap
+        // between the two is "how much of this trade conviction couldn't be
+        // paid for in cash," which is exactly the leverage trigger a few lines
+        // down needs. Meaningless for Sell (never capped the same way, and
+        // leverage here is buy-side-only, same as the existing never-short
+        // rule), but harmless to compute either way.
+        let desired_qty = qty;
+        let mut leverage_action: Option<Action> = None;
 
         match side {
             Side::Sell => {
@@ -521,10 +709,41 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                 qty = qty.min(inventory.max(0.0));
             }
             Side::Buy => {
-                qty = qty.min((s.max_position - inventory).max(0.0));
-                let cash_budget = agent.cash * s.max_cash_frac_per_trade;
+                // `aggressive_sizing_propensity` (>= 1.0, see its field comment)
+                // loosens both caps together for this specific agent -- most
+                // agents' draw is close to the 1.0 floor (today's exact caps),
+                // a minority draw high enough to commit a genuinely bankruptcy-
+                // capable share of their own capital to a single trade.
+                let max_position = s.max_position * s.aggressive_sizing_propensity;
+                let cash_frac = (s.max_cash_frac_per_trade * s.aggressive_sizing_propensity).min(1.0);
+                qty = qty.min((max_position - inventory).max(0.0));
+                let cash_budget = agent.cash * cash_frac;
                 if cash_budget < mid * qty {
                     qty = (cash_budget / mid.max(1e-9)).max(0.0);
+                }
+
+                // Cash-constrained conviction -> leverage (module doc comment's
+                // "cash-constrained conviction" section): this agent wanted
+                // `desired_qty`, strongly believes the direction (magnitude
+                // clears a *higher* bar than the ordinary act-at-all dead
+                // zone -- "reputation" in the sense of how much it currently
+                // trusts its own view, not a track record), is one of the
+                // minority willing to borrow for it at all
+                // (`leverage_risk_appetite`), and spot alone can't cover the
+                // full size -- open a leveraged top-up for exactly the
+                // shortfall, same direction, not a separate unrelated bet.
+                let shortfall_qty = (desired_qty - qty).max(0.0);
+                if shortfall_qty > 1e-9 && magnitude > s.leverage_signal_threshold && agent.rng.gen_bool(s.leverage_risk_appetite) {
+                    leverage_action = liquidation_trader::open_leveraged_position_directed(
+                        agent,
+                        s.asset_id,
+                        Side::Buy,
+                        s.leverage_amount,
+                        shortfall_qty * mid,
+                        s.leverage_maintenance_margin_buffer,
+                        mid,
+                    )
+                    .map(Action::SubmitMargin);
                 }
             }
         }
@@ -595,7 +814,16 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             };
             let use_limit = match best_opposite {
                 None => true,
-                Some(p) => too_far(p),
+                // A price exists but is unattractive -- normally this agent
+                // patiently posts a limit at its own belief instead. A roll
+                // against this agent's own `price_chase_prob` (see module doc
+                // comment's "too smart to fail" section) instead crosses
+                // impulsively at the bad price with a market order, same as a
+                // real panicking/euphoric trader sometimes does. Most agents'
+                // draw is near 0 (today's always-patient behavior); this never
+                // fires at all when `best_opposite` is `None` -- there's nothing
+                // to impulsively chase.
+                Some(p) => too_far(p) && !agent.rng.gen_bool(s.price_chase_prob),
             };
 
             if use_limit {
@@ -631,6 +859,14 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                     qty,
                 }));
             }
+        }
+
+        // Pushed regardless of whether the spot order above was itself
+        // nonzero (see `desired_qty`/`shortfall_qty` above) -- a fully
+        // cash-constrained agent (spot qty clipped all the way to 0) can
+        // still have a real shortfall worth leveraging into.
+        if let Some(a) = leverage_action {
+            actions.push(a);
         }
     }
 

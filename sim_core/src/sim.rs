@@ -294,6 +294,10 @@ impl Simulation {
             match (is_leveraged_bot, is_wash_trading, a) {
                 (true, _, Action::Submit(req)) => self.apply_submit_margin(agent_id, req),
                 (_, true, Action::Submit(req)) => self.apply_submit(agent_id, req),
+                // Per-action margin flag (not bot-type-wide) -- see `Action::SubmitMargin`'s
+                // doc comment: a bot that mixes ordinary and leveraged orders in the same
+                // step marks only the leveraged one.
+                (_, _, Action::SubmitMargin(req)) => self.apply_submit_margin(agent_id, req),
                 (_, _, a) => self.apply_action(agent_id, a),
             }
         }
@@ -355,6 +359,11 @@ impl Simulation {
                     self.apply_submit(agent_id, req);
                 }
             }
+            // Reachable only if some future call site routes a raw `Action` here
+            // without going through the per-action dispatch `step_agent` already
+            // handles (see that match's own `Action::SubmitMargin` arm) -- kept
+            // for exhaustiveness/defensiveness, not a normal path today.
+            Action::SubmitMargin(req) => self.apply_submit_margin(agent_id, req),
         }
     }
 

@@ -85,6 +85,10 @@ pub fn open_leveraged_position(
     maintenance_margin_buffer: f64,
     mid: f64,
 ) -> Option<NewOrderRequest> {
+    // Checked here too (not just in the shared core below) to keep this
+    // function's RNG draw sequence byte-for-byte unchanged from before the
+    // 2026-10-10 refactor -- every existing leveraged-sub-population sweep
+    // stays exactly reproducible.
     if agent.margin.is_some() || agent.bankrupt {
         return None;
     }
@@ -95,6 +99,33 @@ pub fn open_leveraged_position(
     }
     let side = if agent.rng.gen_bool(0.5) { Side::Buy } else { Side::Sell };
     let notional = collateral * leverage;
+    open_leveraged_position_directed(agent, asset_id, side, leverage, notional, maintenance_margin_buffer, mid)
+}
+
+/// Shared core behind `open_leveraged_position` above: debits collateral, sets
+/// `agent.margin`, and builds the sourcing order. Split out (2026-10-10) so a
+/// bot can open a leveraged position *in a direction and size it already
+/// decided for its own reasons* -- e.g. `human.rs`'s "I believe in this and
+/// I'm out of cash to buy more of it at spot" trigger -- rather than only ever
+/// through the random-direction/fixed-fraction entry above, which exists
+/// specifically to produce liquidation events for spec 5.7's cascade dynamics,
+/// not to model a directional conviction.
+pub fn open_leveraged_position_directed(
+    agent: &mut AgentCommon,
+    asset_id: AssetId,
+    side: Side,
+    leverage: f64,
+    notional: f64,
+    maintenance_margin_buffer: f64,
+    mid: f64,
+) -> Option<NewOrderRequest> {
+    if agent.margin.is_some() || agent.bankrupt || notional <= 0.0 || leverage <= 0.0 {
+        return None;
+    }
+    let collateral = notional / leverage.max(1e-9);
+    if collateral <= 1.0 || collateral > agent.cash {
+        return None;
+    }
     let size = notional / mid.max(1e-9);
     // Collateral is debited from cash directly here (not via the fill's price*qty --
     // that's the leveraged notional, not the margin actually posted). The order below

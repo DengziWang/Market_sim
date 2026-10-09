@@ -140,6 +140,16 @@ pub enum Action {
     /// asset's book for the order id on every single cancel (previously
     /// `order_asset_hint`, an O(n_assets) scan -- see git history).
     Cancel(OrderId, AssetId),
+    /// A margin-settlement order sourced from a request this *specific* action
+    /// already decided was a leveraged entry (2026-10-10) -- unlike the
+    /// existing bot-type-wide `is_leveraged_bot` routing in `sim.rs` (every
+    /// order from a `liquidation_trader` is a margin order), this lets a bot
+    /// that mixes ordinary spot orders with occasional leveraged ones in the
+    /// same `step()` call (see `human.rs`'s cash-constrained-conviction
+    /// trigger) mark just the one action that needs the margin settlement
+    /// path, skipping normal latency/mempool staging the same way every other
+    /// margin order does.
+    SubmitMargin(NewOrderRequest),
 }
 
 pub struct StepResult {
