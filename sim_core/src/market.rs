@@ -41,46 +41,68 @@ pub struct Market {
     /// Collective market mood per asset, roughly in [-1, 1]. See
     /// `AssetConfig::sentiment_vol`/`sentiment_theta`'s doc comment.
     pub sentiment: FxHashMap<AssetId, f64>,
-    /// Grouped "crowd trend" lines (2026-10-06 revert: restores the
-    /// mechanism that predated the social-network graph -- see git history
-    /// and this session's notes for why). Every human agent is assigned to
-    /// one of `n_trend_groups` groups at construction time
-    /// (`human::State::trend_group`); each group has its own independent
-    /// Ornstein-Uhlenbeck process per asset, keyed `(asset_id, group)`, so
-    /// agents in the same group all read the literal same number (their
-    /// disagreement comes from `personal_trend_weight`, how much each
-    /// individually leans on it -- not from reading different values), while
-    /// different groups can diverge from each other over time. This is a
-    /// best-effort reconstruction, not a byte-exact restore: the original
-    /// pre-social-network code was never committed to git, so the exact
-    /// update formula/group-count heuristic couldn't be recovered verbatim.
-    pub random_trend: FxHashMap<(AssetId, u32), f64>,
-    pub n_trend_groups: u32,
     pub last_trade_price: FxHashMap<(VenueId, AssetId), f64>,
     pub pending_mempool: Vec<PendingMempoolOrder>,
+    /// **Market-wide recent-return memory (2026-10-14, direct user request)**:
+    /// a rolling window of this asset's own recent log-returns, sampled once
+    /// per `SnapshotTick` (same cadence `tick_mark_and_fundamental` already
+    /// updates `mark_price_ema` on -- see that function), independent of any
+    /// one agent's own wake cadence. Exists so a *newly constructed* agent
+    /// (at initial build, or grafted into an already-running market) can
+    /// seed its own risk-sensing rolling windows from what's actually been
+    /// happening in the market, instead of starting with a blank slate --
+    /// measured directly in `staged_introduction_test`: market_maker agents
+    /// grafted in after momentum/mean_reversion had already been trading for
+    /// 10,000s collapsed *faster* than when everyone started cold together
+    /// (58% bankrupt within 8 minutes of entering vs. ~2% at the same point
+    /// in a simultaneous start), because they had zero sense that the
+    /// market was already "hot." Capacity matches market_maker's own
+    /// default `vol_window` length (30) -- see `MARKET_HISTORY_CAPACITY`.
+    pub recent_log_returns: FxHashMap<AssetId, std::collections::VecDeque<f64>>,
+    /// The previous `SnapshotTick`'s own sample (same "last trade, else mid,
+    /// else initial price" fallback `tick_mark_and_fundamental` already uses
+    /// for `mark_price_ema`), kept separately so `recent_log_returns` holds
+    /// genuine tick-to-tick returns rather than comparing against the
+    /// smoothed EMA.
+    last_tick_sample: FxHashMap<AssetId, f64>,
     next_order_id: OrderId,
     next_payload_id: u64,
 }
 
+/// See `Market::recent_log_returns`'s doc comment.
+const MARKET_HISTORY_CAPACITY: usize = 30;
+
 impl Market {
-    pub fn new(assets: Vec<AssetConfig>, venues: Vec<VenueConfig>, cfg: MarketConfig, fees: FeeConfig, mempool_cfg: MempoolConfig, n_trend_groups: u32) -> Self {
+    /// **Grouped "crowd trend" removed (2026-10-17, direct user request)**:
+    /// used to also take `n_trend_groups: u32` here and seed a
+    /// `random_trend` map, a shared per-group Ornstein-Uhlenbeck line every
+    /// human agent in that group read identically (`human::State::
+    /// trend_group`/`personal_trend_weight`). Removed along with
+    /// `revenge_trading_propensity` (see `human.rs`'s module doc comment)
+    /// after this session's crash investigation identified both as direct
+    /// contributors to correlated human herding: a shared group signal
+    /// means many agents lean the same way at the same moment for a reason
+    /// that has nothing to do with price, which is exactly the kind of
+    /// synchronized push that overwhelms available liquidity. `sentiment`
+    /// above stays -- it's shared too, but read with independent per-agent
+    /// perception noise (`human.rs`'s `perceived_sentiment`), not a bare
+    /// identical number every group member reacts to the same way.
+    pub fn new(assets: Vec<AssetConfig>, venues: Vec<VenueConfig>, cfg: MarketConfig, fees: FeeConfig, mempool_cfg: MempoolConfig) -> Self {
         let mut books = FxHashMap::default();
         let mut mark_price_ema = FxHashMap::default();
         let mut fundamental_value = FxHashMap::default();
         let mut sentiment = FxHashMap::default();
-        let mut random_trend = FxHashMap::default();
         for (vid, _venue) in venues.iter().enumerate() {
             for (aid, asset) in assets.iter().enumerate() {
                 books.insert((vid as VenueId, aid as AssetId), OrderBook::new(aid as AssetId, asset.tick_size, cfg.max_price_move_frac));
             }
         }
+        let mut last_tick_sample = FxHashMap::default();
         for (aid, asset) in assets.iter().enumerate() {
             mark_price_ema.insert(aid as AssetId, asset.initial_price);
             fundamental_value.insert(aid as AssetId, asset.initial_price);
             sentiment.insert(aid as AssetId, 0.0);
-            for group in 0..n_trend_groups {
-                random_trend.insert((aid as AssetId, group), 0.0);
-            }
+            last_tick_sample.insert(aid as AssetId, asset.initial_price);
         }
         Self {
             assets,
@@ -92,10 +114,10 @@ impl Market {
             mark_price_ema,
             fundamental_value,
             sentiment,
-            random_trend,
-            n_trend_groups,
             last_trade_price: FxHashMap::default(),
             pending_mempool: Vec::new(),
+            recent_log_returns: FxHashMap::default(),
+            last_tick_sample,
             next_order_id: 1,
             next_payload_id: 1,
         }
@@ -234,6 +256,18 @@ impl Market {
             let prev = *self.mark_price_ema.get(&aid).unwrap();
             self.mark_price_ema.insert(aid, prev + alpha * (sample - prev));
 
+            // See `Market::recent_log_returns`'s doc comment.
+            let prev_sample = *self.last_tick_sample.get(&aid).unwrap_or(&sample);
+            if prev_sample > 0.0 && sample > 0.0 {
+                let log_ret = (sample / prev_sample).ln();
+                let buf = self.recent_log_returns.entry(aid).or_default();
+                if buf.len() >= MARKET_HISTORY_CAPACITY {
+                    buf.pop_front();
+                }
+                buf.push_back(log_ret);
+            }
+            self.last_tick_sample.insert(aid, sample);
+
             let asset = &self.assets[aid as usize];
             let f_prev = *self.fundamental_value.get(&aid).unwrap();
             let z: f64 = rng.sample(StandardNormal);
@@ -249,29 +283,7 @@ impl Market {
             let z2: f64 = rng.sample(StandardNormal);
             let s_next = s_prev + asset.sentiment_theta * (0.0 - s_prev) * dt + asset.sentiment_vol * dt.sqrt() * z2;
             self.sentiment.insert(aid, s_next.clamp(-1.0, 1.0));
-
-            // Independent draw per (asset, group) -- same OU shape as sentiment, using
-            // the asset's own trend_vol/trend_theta (slower-moving by default, see
-            // config.rs's doc comment on those fields). Each group updates with its
-            // own random draw, so groups diverge from each other over time rather
-            // than moving in lockstep.
-            for group in 0..self.n_trend_groups {
-                let key = (aid, group);
-                let t_prev = *self.random_trend.get(&key).unwrap_or(&0.0);
-                let z3: f64 = rng.sample(StandardNormal);
-                let t_next = t_prev + asset.trend_theta * (0.0 - t_prev) * dt + asset.trend_vol * dt.sqrt() * z3;
-                self.random_trend.insert(key, t_next.clamp(-1.0, 1.0));
-            }
         }
-    }
-
-    /// This group's current crowd-trend value for `asset_id`, roughly in
-    /// [-1, 1] -- see `random_trend`'s doc comment. Every human agent in the
-    /// same group reads the literal same number; it's `human::State::
-    /// personal_trend_weight` that makes agents disagree on how much that
-    /// number should move them.
-    pub fn trend_for(&self, asset_id: AssetId, group: u32) -> f64 {
-        *self.random_trend.get(&(asset_id, group)).unwrap_or(&0.0)
     }
 
     #[allow(clippy::too_many_arguments)]

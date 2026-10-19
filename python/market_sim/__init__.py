@@ -8,9 +8,11 @@ from market_sim.sim_pyo3 import (
     ProgressHandle,
     continue_simulation,
     continue_simulation_cancellable,
+    graft_from_checkpoint,
     run_simulation,
     run_simulation_cancellable,
     run_simulation_from_file,
+    run_warmup_then_graft,
     validate_config,
 )
 from market_sim.runner import (
@@ -35,6 +37,8 @@ __all__ = [
     "CancelToken",
     "ProgressHandle",
     "run_simulation_from_file",
+    "run_warmup_then_graft",
+    "graft_from_checkpoint",
     "validate_config",
     "SimulationRun",
     "run_scenario_file",

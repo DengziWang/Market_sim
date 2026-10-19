@@ -48,21 +48,6 @@ pub struct AssetConfig {
     pub sentiment_vol: f64,
     #[serde(default = "default_sentiment_theta")]
     pub sentiment_theta: f64,
-    /// Same Ornstein-Uhlenbeck shape again, a third independent process: a single
-    /// shared "crowd trend" line that every `human` agent trading this asset reads
-    /// (2026-10-04) -- unlike `sentiment` (also shared, but perceived with
-    /// per-agent noise on top of the same draw), each agent's *sensitivity* to this
-    /// trend is itself randomized once at construction (see
-    /// `human::State::personal_trend_weight`), so the disagreement across agents
-    /// comes from "how much do I let myself be swept up in this" rather than "what
-    /// do I separately think the trend is" -- everyone is reacting to the literal
-    /// same number. Mean-reverts to neutral (0); much slower than sentiment's
-    /// default (see default fns below) since a "trend" that decayed with a ~14s
-    /// half-life like sentiment's own default would never read as a trend at all.
-    #[serde(default = "default_trend_vol")]
-    pub trend_vol: f64,
-    #[serde(default = "default_trend_theta")]
-    pub trend_theta: f64,
 }
 fn default_fundamental_vol() -> f64 {
     0.02
@@ -75,15 +60,6 @@ fn default_sentiment_vol() -> f64 {
 }
 fn default_sentiment_theta() -> f64 {
     0.05
-}
-fn default_trend_vol() -> f64 {
-    0.01
-}
-fn default_trend_theta() -> f64 {
-    // Half-life = ln(2)/theta ~= 1386s (~23 min) -- persists across many of a
-    // human agent's own background check-ins (~20 min apart on average) instead
-    // of decaying before anyone notices it moved.
-    0.0005
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,11 +285,26 @@ pub struct PopulationConfig {
     pub groups: Vec<BotGroupConfig>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportConfig {
     pub out_dir: String,
     #[serde(default)]
     pub write_snapshots: bool,
+    /// 2026-10-15: an event-heavy, low-human-fraction composition can generate
+    /// tens of millions of order events in a single 500s leg; collecting each
+    /// one as an `OrderEventRow` (two heap-allocated strings per row) to hand
+    /// back to Python regardless of whether the caller ever writes it to
+    /// parquet was blowing past 11GB RSS for a single simulation. Defaults to
+    /// `true` (the old, always-collect behavior) for backward compatibility --
+    /// set `false` in scenarios/callers that already pass
+    /// `write_order_events=False` to `export_run` so the engine never
+    /// materializes data nobody asked to keep.
+    #[serde(default = "default_true")]
+    pub write_order_events: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

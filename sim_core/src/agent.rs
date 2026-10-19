@@ -68,6 +68,16 @@ pub struct AgentCommon {
     pub cash: f64,
     pub inventory: FxHashMap<AssetId, f64>,
     pub bankrupt: bool,
+    /// Set only by `Simulation::graft_population` (2026-10-10, sim.rs) on an
+    /// agent's whole prior population when a second population is grafted on
+    /// top of it mid-run (e.g. a zero-intelligence warmup phase handed off to
+    /// the "real" bot population) -- stops this agent from ever being
+    /// stepped again (same early-return shape as `bankrupt`), but leaves its
+    /// cash/inventory/resting orders exactly as they were, unlike bankruptcy
+    /// which force-liquidates. Existing resting orders stay live in the book
+    /// as real starting liquidity for whichever population replaces this
+    /// one; this agent just never acts again.
+    pub dormant: bool,
     pub margin: Option<MarginPosition>,
     pub liquidation_style: LiquidationExecStyle,
     /// Set only for agents in a leveraged sub-population; drives the generic

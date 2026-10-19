@@ -103,11 +103,21 @@ initial_cash_range = [ 20000.0, 80000.0,]
 
 [population.groups.params]
 wake_interval_secs = 0.3
+n_ladder_levels = 5
+ladder_level_spacing_frac = 1.0
+panic_vol_frac = 0.01
+panic_momentum_frac = 0.005
 [[population.groups]]
 bot_type = "market_maker"
 variant = "fixed_offset"
 count = 34
 initial_cash_range = [ 20000.0, 80000.0,]
+
+[population.groups.params]
+n_ladder_levels = 5
+ladder_level_spacing_frac = 1.0
+panic_vol_frac = 0.01
+panic_momentum_frac = 0.005
 
 [[population.groups]]
 bot_type = "market_maker"
@@ -115,11 +125,23 @@ variant = "inventory_skew"
 count = 34
 initial_cash_range = [ 20000.0, 80000.0,]
 
+[population.groups.params]
+n_ladder_levels = 5
+ladder_level_spacing_frac = 1.0
+panic_vol_frac = 0.01
+panic_momentum_frac = 0.005
+
 [[population.groups]]
 bot_type = "market_maker"
 variant = "adaptive_spread"
 count = 34
 initial_cash_range = [ 20000.0, 80000.0,]
+
+[population.groups.params]
+n_ladder_levels = 5
+ladder_level_spacing_frac = 1.0
+panic_vol_frac = 0.01
+panic_momentum_frac = 0.005
 
 [[population.groups]]
 bot_type = "arbitrage"

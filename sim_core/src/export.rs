@@ -72,6 +72,12 @@ pub struct AgentStateRow {
 pub struct SimResult {
     pub trades: Vec<TradeRow>,
     pub order_events: Vec<OrderEventRow>,
+    /// Incremented on every order event regardless of `export.write_order_events`
+    /// -- unlike `order_events` itself (one `OrderEventRow` + two heap-allocated
+    /// strings per event), this is one `u64` add, so the true count stays
+    /// available for `n_order_events` metadata even when collecting the full
+    /// per-event rows is disabled to bound memory on an event-heavy run.
+    pub n_order_events_total: u64,
     pub snapshots: Vec<SnapshotRow>,
     pub agent_states: Vec<AgentStateRow>,
     pub liquidation_events: u64,

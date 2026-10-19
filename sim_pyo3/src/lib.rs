@@ -117,7 +117,7 @@ fn result_to_pyobject(py: Python<'_>, sim: Simulation, result: SimResult, n_agen
     meta.set_item("bankruptcies", result.bankruptcies)?;
     meta.set_item("n_agents", n_agents)?;
     meta.set_item("n_trades", result.trades.len())?;
-    meta.set_item("n_order_events", result.order_events.len())?;
+    meta.set_item("n_order_events", result.n_order_events_total)?;
     meta.set_item("cancelled", result.cancelled)?;
     out.set_item("meta", meta)?;
     Ok(out.into())
@@ -222,6 +222,107 @@ fn run_simulation_cancellable(py: Python<'_>, config_toml: &str, token: &CancelT
     result_to_pyobject(py, sim, result, n_agents)
 }
 
+/// Builds and runs `warmup_cfg_toml` for `warmup_secs`, then hands the resulting
+/// market off to a brand-new population built from `new_cfg_toml`
+/// (`Simulation::graft_population` in sim_core -- see its own doc comment) and
+/// returns a checkpoint of *that* grafted state, ready to be handed to
+/// `continue_simulation`/`continue_simulation_cancellable`/a leg-based driver exactly
+/// like any other checkpoint. Does not run any of the new population's own time --
+/// callers that want that leg-based (bounded memory, exportable per leg) drive the
+/// continuation themselves from the returned checkpoint, the same way they would
+/// after any other `run_simulation`-family call.
+///
+/// Meant for avoiding a real, measured cold-start burst (the whole population's
+/// first wake jittered over the very first second, into a completely empty book) in
+/// the population that matters for analysis: run a cheap zero-intelligence/noise-only
+/// population first to build real trade history and resting liquidity in the actual
+/// order book, then graft the population under study onto that already-warmed-up
+/// market instead of an empty one.
+///
+/// `new_cfg_toml`'s `assets`/`venues`/`market`/`fees`/`mempool`/`liquidation`/
+/// `run.seed` are ignored (the warmup run's `Market`/`ScenarioConfig` own those
+/// already) -- only `new_cfg_toml`'s `population.groups` is read. See
+/// `graft_population`'s own doc comment for the trend-group-count caveat when the
+/// new population includes `human` agents.
+///
+/// Run internally in `chunk_secs`-sized pieces (default 2,500s), each chunk's
+/// `SimResult` dropped immediately after -- same leg-based memory-bounding
+/// principle `run_scenario_in_legs` already uses for the population under
+/// study, just applied to the warmup phase itself, which was NOT leg-based
+/// at first and is measured to need it just as much: a noise population's
+/// default 8s wake interval against ~3,000 agents is on the order of
+/// millions of wake/trade events over a full 25,000s warmup if accumulated
+/// in one `SimResult` -- measured directly, two such warmups running in
+/// parallel pushed a 15GB machine to 1.2GB available / 7.5GB swap used
+/// within 3 minutes, before any leg had even finished. None of this phase's
+/// own trades/order_events are needed afterward (only the final `Simulation`
+/// state, for grafting), so there's no reason to keep accumulating them.
+#[pyfunction]
+#[pyo3(signature = (warmup_cfg_toml, warmup_secs, new_cfg_toml, chunk_secs=2500.0))]
+fn run_warmup_then_graft(py: Python<'_>, warmup_cfg_toml: &str, warmup_secs: f64, new_cfg_toml: &str, chunk_secs: f64) -> PyResult<PyObject> {
+    let mut warmup_cfg = ScenarioConfig::from_toml_str(warmup_cfg_toml).map_err(|e| PyValueError::new_err(format!("warmup config parse error: {e}")))?;
+    let first_chunk = chunk_secs.min(warmup_secs).max(0.0);
+    // `Simulation::build` reads its initial `session_end` from this field --
+    // `session_end` itself is a private `Simulation` field (same reason
+    // `run_scenario_in_legs`, the Python-level equivalent for ordinary legs,
+    // sets `session_seconds` going in rather than fighting the engine's own
+    // min_trades-driven extension logic after the fact).
+    warmup_cfg.run.session_seconds = first_chunk;
+    let new_cfg = ScenarioConfig::from_toml_str(new_cfg_toml).map_err(|e| PyValueError::new_err(format!("new-population config parse error: {e}")))?;
+    let sim = Simulation::build(warmup_cfg).map_err(PyValueError::new_err)?;
+    let mut sim = py.allow_threads(|| {
+        let (sim, result) = sim.run_cancellable_keep_state(None, None);
+        drop(result); // this chunk's trades/order_events/snapshots -- not needed
+        sim
+    });
+    let mut elapsed = first_chunk;
+    while elapsed < warmup_secs {
+        let this_chunk = chunk_secs.min(warmup_secs - elapsed);
+        sim = py.allow_threads(|| {
+            let (sim, result) = sim.resume_keep_state(this_chunk, None, None);
+            drop(result);
+            sim
+        });
+        elapsed += this_chunk;
+    }
+    sim.graft_population(&new_cfg).map_err(PyValueError::new_err)?;
+    let bytes = sim.to_checkpoint_bytes().map_err(PyValueError::new_err)?;
+    // Explicit `PyBytes` wrap -- PyO3's blanket `Vec<u8>` -> Python conversion
+    // produces a `list[int]`, not a `bytes` object, which `continue_simulation`
+    // (and everything else that consumes a checkpoint) expects.
+    Ok(PyBytes::new_bound(py, &bytes).into())
+}
+
+/// Grafts a *new* population onto an existing checkpoint (any checkpoint --
+/// from `run_warmup_then_graft`, `continue_simulation`, or this function
+/// itself), the same `Simulation::graft_population` `run_warmup_then_graft`
+/// uses internally, just exposed standalone so a caller can chain more than
+/// one graft (e.g. "humans trade alone for a while, then one bot type joins,
+/// then another") instead of only the single warmup-then-graft handoff.
+///
+/// Every agent already in the checkpoint is marked dormant exactly as
+/// `graft_population`'s own doc comment describes (never acts again, but
+/// its cash/inventory/resting orders stay live/visible) -- this is *not* a
+/// way to add agents alongside a still-active population; each call retires
+/// the entire current population in favor of a fresh one, carrying forward
+/// only the market's price/order-book state, not individual agent
+/// continuity. Chaining calls to introduce bot types in waves relies on
+/// exactly that carried-forward book state (prices, resting liquidity),
+/// not on any one wave's agents persisting into the next.
+///
+/// `new_cfg_toml`'s `assets`/`venues`/`market`/`fees`/`mempool`/`liquidation`/
+/// `run.seed` are ignored (the checkpoint's own `Market`/`ScenarioConfig`
+/// own those already) -- only `new_cfg_toml`'s `population.groups` is read,
+/// same as `run_warmup_then_graft`.
+#[pyfunction]
+fn graft_from_checkpoint(py: Python<'_>, checkpoint: &[u8], new_cfg_toml: &str) -> PyResult<PyObject> {
+    let new_cfg = ScenarioConfig::from_toml_str(new_cfg_toml).map_err(|e| PyValueError::new_err(format!("new-population config parse error: {e}")))?;
+    let mut sim = Simulation::from_checkpoint_bytes(checkpoint).map_err(PyValueError::new_err)?;
+    sim.graft_population(&new_cfg).map_err(PyValueError::new_err)?;
+    let bytes = sim.to_checkpoint_bytes().map_err(PyValueError::new_err)?;
+    Ok(PyBytes::new_bound(py, &bytes).into())
+}
+
 /// Loads a simulation from a checkpoint produced by a previous `run_simulation`/
 /// `run_simulation_cancellable`/`continue_simulation*` call's `checkpoint` bytes, and
 /// keeps simulating for `additional_seconds` more simulated time from exactly where
@@ -272,6 +373,8 @@ fn sim_pyo3(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_simulation, m)?)?;
     m.add_function(wrap_pyfunction!(run_simulation_from_file, m)?)?;
     m.add_function(wrap_pyfunction!(run_simulation_cancellable, m)?)?;
+    m.add_function(wrap_pyfunction!(run_warmup_then_graft, m)?)?;
+    m.add_function(wrap_pyfunction!(graft_from_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(continue_simulation, m)?)?;
     m.add_function(wrap_pyfunction!(continue_simulation_cancellable, m)?)?;
     m.add_function(wrap_pyfunction!(validate_config, m)?)?;

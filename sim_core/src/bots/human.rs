@@ -60,20 +60,17 @@
 //!     P&L, not just its cash budget.
 //!   - **Round-number bias**: trade notional is rounded to a "nice" number (1/2/5 x
 //!     10^k), not a raw computed float.
-//!   - **Grouped crowd trend (2026-10-06 revert)**: every human agent is
-//!     assigned to one of `n_trend_groups` groups at construction
-//!     (`State::trend_group`, drawn directly from this agent's own
-//!     construction-time RNG). Each group reads its own independent
-//!     `Market::random_trend` line for the asset it trades (see that field's
-//!     doc comment) -- agents in the same group read the literal same
-//!     number, and disagreement comes entirely from `personal_trend_weight`
-//!     (how much each individual leans on it), drawn once per agent so some
-//!     agents are far more swept up in the crowd than others. This replaced
-//!     a brief social-network-graph experiment (2026-10-05/06) that was
-//!     reverted at the user's request; see git history/session notes for
-//!     why, and note this is a best-effort reconstruction of the original
-//!     group mechanism, not a byte-exact restore (the original code was
-//!     never committed).
+//!   - **Grouped crowd trend -- removed (2026-10-06 revert, then removed
+//!     entirely 2026-10-17)**: used to assign every human agent to one of
+//!     `n_trend_groups` groups at construction, each reading its own shared
+//!     `Market::random_trend` line identically (disagreement came only from
+//!     `personal_trend_weight`, how much each agent leaned on it). Removed
+//!     at direct user request after this session's crash investigation
+//!     traced correlated human herding partly to this mechanism: a shared,
+//!     price-independent signal that many agents react to at the literal
+//!     same moment, for a reason that has nothing to do with the market
+//!     itself, is exactly the kind of synchronized push that can overwhelm
+//!     available liquidity. See `market.rs`'s removal note on `Market::new`.
 //!   - **Liquidity-aware order placement (2026-10-04)**: previously this bot
 //!     always submitted an unconditional IOC market order -- accepting *any*
 //!     available price, with no check at all. Now, before submitting, it looks
@@ -88,9 +85,9 @@
 //!     bot types produced exactly zero trades for the entire run (measured,
 //!     not assumed -- see git history). `believed_value` is derived from this
 //!     agent's own `raw_signal` (already personalized: its own perceived
-//!     sentiment noise, its own network neighbors' influence, its own
-//!     `social_weight`), not the engine's raw ground-truth
-//!     `fundamental_value` -- using ground truth directly would mean every agent
+//!     sentiment noise, its own chartist/fundamentalist blend), not the
+//!     engine's raw ground-truth `fundamental_value` -- using ground truth
+//!     directly would mean every agent
 //!     silently agreed on the exact same "fair" price, which contradicts the
 //!     whole point of this bot's per-agent heterogeneity. At most one resting
 //!     buy and one resting sell order per agent at a time (`resting_buy_order`/
@@ -106,11 +103,18 @@
 //!     roughly $1k-$20k in practice), `max_cash_frac_per_trade` caps any one trade
 //!     at 15% of current cash, and "hot hand" sizing *shrinks* bets after losses
 //!     -- the opposite of the loss-chasing/doubling-down that drives most real
-//!     retail blowups. Three new per-agent propensity values (below), each drawn
-//!     independently and uniformly at construction like `personal_trend_weight`
-//!     above, so *some* agents genuinely risk enough to blow up while most stay
-//!     close to the original, well-risk-managed behavior -- not a population-wide
-//!     toggle, since real retail populations aren't uniformly reckless either.
+//!     retail blowups. Originally three new per-agent propensity values (below),
+//!     each drawn independently and uniformly at construction, so *some* agents
+//!     genuinely risk enough to blow up while most stay close to the original,
+//!     well-risk-managed behavior -- not a population-wide toggle, since real
+//!     retail populations aren't uniformly reckless either. Now two:
+//!     `revenge_trading_propensity` (bet *bigger*, not smaller, right after a
+//!     loss) was removed (2026-10-17, direct user request) alongside the
+//!     grouped crowd trend above, for the same reason -- a population-wide
+//!     tendency to double down specifically when already losing is fuel for
+//!     exactly the kind of correlated herding this session's crash
+//!     investigation was chasing, not a source of agent-level heterogeneity
+//!     worth keeping around.
 //!   - **Cash-constrained conviction -> leverage (2026-10-10)**: a fourth
 //!     lever on the same "too smart to fail" problem, but NOT via the
 //!     generic `LeverageCfg` piggyback (`agent.rs`/`sim.rs`) every other
@@ -232,22 +236,15 @@ pub struct State {
     pub max_cash_frac_per_trade: f64,
     pub p_act_given_signal: f64,
     /// Drawn once per agent, Uniform(1.0, `aggressive_sizing_max`) -- a direct
-    /// multiplier on this agent's own `max_cash_frac_per_trade`/`max_position`,
-    /// same convention as `personal_trend_weight` (a ready-to-use scale, not a
-    /// 0-1 probability needing a separate scale constant). 1.0 (the floor) =
+    /// multiplier on this agent's own `max_cash_frac_per_trade`/`max_position`
+    /// (a ready-to-use scale, not a 0-1 probability needing a separate scale
+    /// constant). 1.0 (the floor) =
     /// exactly today's caps; most agents land well below `aggressive_sizing_max`
     /// since the draw is uniform across the whole range, but a minority land
     /// high enough to actually risk a large enough share of net worth to go
     /// bankrupt from trading losses alone -- see module doc comment's "too smart
     /// to fail" section for why this exists.
     pub aggressive_sizing_propensity: f64,
-    /// Drawn once per agent, Uniform(0, `revenge_trading_max`). Blends this
-    /// agent's own "hot hand" sizing response away from today's risk-*reducing*
-    /// shrink-after-losses behavior and toward risk-*increasing* "get-even"
-    /// loss-chasing (bet bigger, not smaller, right after a loss) -- 0 = exactly
-    /// today's behavior, 1 = a full reversal (grows by the same magnitude a loss
-    /// would otherwise shrink it).
-    pub revenge_trading_propensity: f64,
     /// Drawn once per agent, Uniform(0, `price_chase_prob_max`) -- the per-attempt
     /// probability (rolled fresh each time the situation arises, not fixed per
     /// agent-level outcome like the two propensities above) that this agent
@@ -255,6 +252,13 @@ pub struct State {
     /// posting a resting limit at its own believed value. 0 = never (today's
     /// always-patient behavior).
     pub price_chase_prob: f64,
+    /// Drawn once per agent, Uniform(0, `take_good_price_prob_max`) -- the
+    /// per-attempt probability of taking an *attractive* available price
+    /// outright with a market order instead of resting a limit at belief
+    /// (see module doc comment's "General price-impact patience"). 1.0 =
+    /// always takes a good price outright (the old, only behavior); low =
+    /// mostly patient even when the price looks fine.
+    pub take_good_price_prob: f64,
     /// Drawn once per agent, Uniform(0, `leverage_risk_appetite_max`) -- how
     /// willing *this* agent is to borrow against its own conviction rather
     /// than wait/save up, when both `leverage_signal_threshold` (how
@@ -292,27 +296,6 @@ pub struct State {
     pub fundamentalist_fitness: f64,
     pub last_chartist_signal: f64,
     pub last_fundamentalist_signal: f64,
-    /// This group's `Market::random_trend` value that counts as a full "one
-    /// unit" signal, same normalization convention as
-    /// `sentiment_signal_threshold`. A fixed per-variant constant (not
-    /// randomized) -- the heterogeneity across agents comes from
-    /// `personal_trend_weight` below and from which group they landed in,
-    /// not from this.
-    pub personal_trend_signal_threshold: f64,
-    /// How much this agent's group crowd-trend value influences its *own*
-    /// final signal, versus its private market-based signal (price/
-    /// fundamentalist/sentiment blend, which already carries this agent's
-    /// own perception noise -- its "individual random voice"). Drawn once
-    /// per agent, independently, at construction (see `from_params`'s `rng`
-    /// parameter) -- the source of cross-sectional disagreement even among
-    /// agents in the same group: everyone in a group reads the literal same
-    /// trend value but weights it completely differently. 0.0 = this agent
-    /// ignores the crowd entirely; higher = more swept up in it.
-    pub personal_trend_weight: f64,
-    /// Which of `Market::n_trend_groups` groups this agent belongs to (see
-    /// module doc comment) -- fixed at construction, never changes
-    /// afterward.
-    pub trend_group: u32,
     /// This agent's own currently-resting buy limit order, if any: `(order_id,
     /// asset_id)`. See the module doc comment's "Liquidity-aware order
     /// placement" section -- placing a new resting buy cancels whatever's here
@@ -332,15 +315,12 @@ impl State {
 
     /// `initial_price`: converts dollar-notional size params into asset units --
     /// see market_maker.rs's from_params doc comment for why that matters.
-    /// `rng`: used to draw this specific agent's own `trend_group` and
-    /// `personal_trend_weight` (see those fields' doc comments) -- the same
-    /// construction-time RNG `sim.rs`'s `build_population` already uses for this
-    /// agent's starting cash/leverage, so the draw is deterministic given a fixed
-    /// run seed, same as everything else about population construction.
-    /// `n_trend_groups`: passed in by the caller (`sim.rs::build_population`,
-    /// via `compute_n_trend_groups`) rather than recomputed here, so every
-    /// human agent in the same scenario draws from the same group range.
-    pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value, n_trend_groups: u32, rng: &mut impl Rng) -> Self {
+    /// `rng`: used to draw this specific agent's own per-agent propensities (see
+    /// their field comments) -- the same construction-time RNG `sim.rs`'s
+    /// `build_population` already uses for this agent's starting cash/leverage,
+    /// so the draw is deterministic given a fixed run seed, same as everything
+    /// else about population construction.
+    pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value, rng: &mut impl Rng) -> Self {
         let price = initial_price.max(1e-9);
         Self {
             variant,
@@ -393,24 +373,11 @@ impl State {
             fundamentalist_fitness: 0.0,
             last_chartist_signal: 0.0,
             last_fundamentalist_signal: 0.0,
-            personal_trend_signal_threshold: params::get_f64(p, "personal_trend_signal_threshold", 0.2),
-            // Drawn once per agent from Uniform(0, max) -- "differently much", not
-            // a single fixed weight applied identically to every agent (that would
-            // make every human agent lean on the crowd the same amount, which is
-            // just a fixed extra blend term, not genuine heterogeneity). Nonzero max
-            // by default (not opt-in via TOML) -- meant to be an always-on source of
-            // cross-sectional disagreement, not a dormant feature every existing
-            // scenario config would need editing to exercise.
-            personal_trend_weight: {
-                let max = params::get_f64(p, "personal_trend_weight_max", 0.6).clamp(0.0, 1.0);
-                if max > 0.0 { rng.gen_range(0.0..max) } else { 0.0 }
-            },
-            trend_group: if n_trend_groups > 0 { rng.gen_range(0..n_trend_groups) } else { 0 },
-            // See module doc comment's "too smart to fail" section. All three
-            // below default to a nonzero max (always-on, like
-            // `personal_trend_weight` above) so a sweep gets a heterogeneous
-            // minority of genuinely-risky agents without any scenario file
-            // needing to opt in -- but each max is itself tunable per scenario.
+            // See module doc comment's "too smart to fail" section. Both
+            // below default to a nonzero max (always-on) so a sweep gets a
+            // heterogeneous minority of genuinely-risky agents without any
+            // scenario file needing to opt in -- but each max is itself
+            // tunable per scenario.
             aggressive_sizing_propensity: {
                 // Calibrated by smoke test against scenarios/human_sweep_lite/
                 // human_50pct.toml (2026-10-10): 4.0 produced 0% human
@@ -427,12 +394,17 @@ impl State {
                 let max = params::get_f64(p, "aggressive_sizing_max", 8.0).max(1.0);
                 if max > 1.0 { rng.gen_range(1.0..max) } else { 1.0 }
             },
-            revenge_trading_propensity: {
-                let max = params::get_f64(p, "revenge_trading_max", 1.0).clamp(0.0, 1.0);
-                if max > 0.0 { rng.gen_range(0.0..max) } else { 0.0 }
-            },
             price_chase_prob: {
                 let max = params::get_f64(p, "price_chase_prob_max", 0.3).clamp(0.0, 1.0);
+                if max > 0.0 { rng.gen_range(0.0..max) } else { 0.0 }
+            },
+            // Default max 0.3, not e.g. 1.0 (which would silently restore the
+            // old always-take behavior) -- most agents land well under 30%,
+            // so an attractive price gets taken outright only occasionally;
+            // the rest of the time this agent rests a limit at belief instead,
+            // still a real participant, just not the one pushing price.
+            take_good_price_prob: {
+                let max = params::get_f64(p, "take_good_price_prob_max", 0.3).clamp(0.0, 1.0);
                 if max > 0.0 { rng.gen_range(0.0..max) } else { 0.0 }
             },
             leverage_risk_appetite: {
@@ -625,12 +597,11 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     // influence.
     let market_signal = s.price_weight * trend_component + (1.0 - s.price_weight) * sentiment_component;
 
-    // Crowd trend: this agent's group's own shared `Market::random_trend`
-    // line (see module doc comment), normalized the same way every other
-    // signal component is.
-    let group_trend = ctx.market.trend_for(s.asset_id, s.trend_group);
-    let trend_component_group = group_trend / s.personal_trend_signal_threshold.max(1e-9);
-    let raw_signal = (1.0 - s.personal_trend_weight) * market_signal + s.personal_trend_weight * trend_component_group;
+    // Grouped crowd trend removed (2026-10-17, direct user request) -- this
+    // used to blend in a shared `Market::random_trend` line that every agent
+    // in the same group read identically (see `market.rs`'s removal note).
+    // `raw_signal` is now just this agent's own private signal.
+    let raw_signal = market_signal;
     s.last_price = Some(mid);
     s.last_wake_time = Some(ctx.now);
     s.last_chartist_signal = price_component;
@@ -654,14 +625,14 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
 
     if acts_this_time {
         let side = if raw_signal > 0.0 { Side::Buy } else { Side::Sell };
-        // "Hot hand" <-> "revenge trading": interpolates this agent's own P&L
-        // sensitivity from today's risk-*reducing* response (grows after wins,
-        // shrinks after losses) at propensity=0, through indifference at 0.5, to
-        // a full risk-*increasing* reversal (shrinks after wins, grows after
-        // losses -- "get-even" loss-chasing) at propensity=1. See module doc
-        // comment's "too smart to fail" section.
-        let effective_pnl_sensitivity = s.pnl_sizing_sensitivity * (1.0 - 2.0 * s.revenge_trading_propensity);
-        let pnl_size_mult = (1.0 + effective_pnl_sensitivity * s.recent_pnl_frac).clamp(0.2, 2.5);
+        // "Hot hand" sizing: bet size grows after wins, shrinks after losses --
+        // see module doc comment. Revenge-trading ("get-even" loss-chasing,
+        // betting *bigger* after a loss) used to be a per-agent reversal of
+        // this blended in here; removed (2026-10-17, direct user request)
+        // after the crash investigation identified it as a direct amplifier
+        // of correlated human herding -- see market_maker.rs's module doc
+        // comment for the fuller story this was found during.
+        let pnl_size_mult = (1.0 + s.pnl_sizing_sensitivity * s.recent_pnl_frac).clamp(0.2, 2.5);
         // `aggressive_sizing_propensity` has to scale the *desired* trade size
         // itself, not just the caps below -- the caps were rarely the binding
         // constraint to begin with (order_notional * (1+intensity) * pnl_size_mult
@@ -814,16 +785,31 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             };
             let use_limit = match best_opposite {
                 None => true,
-                // A price exists but is unattractive -- normally this agent
-                // patiently posts a limit at its own belief instead. A roll
-                // against this agent's own `price_chase_prob` (see module doc
-                // comment's "too smart to fail" section) instead crosses
-                // impulsively at the bad price with a market order, same as a
-                // real panicking/euphoric trader sometimes does. Most agents'
-                // draw is near 0 (today's always-patient behavior); this never
-                // fires at all when `best_opposite` is `None` -- there's nothing
-                // to impulsively chase.
-                Some(p) => too_far(p) && !agent.rng.gen_bool(s.price_chase_prob),
+                Some(p) if too_far(p) => {
+                    // Unattractive price -- normally this agent patiently posts a
+                    // limit at its own belief instead. A roll against
+                    // `price_chase_prob` (see module doc comment's "too smart to
+                    // fail" section) instead crosses impulsively at the bad price
+                    // with a market order, same as a real panicking/euphoric
+                    // trader sometimes does.
+                    !agent.rng.gen_bool(s.price_chase_prob)
+                }
+                // **General price-impact patience (2026-10-17, direct user
+                // request)**: an *attractive* price used to always be taken
+                // outright with a market order -- correct in the sense that a
+                // real trader doesn't ignore a good deal, but measured to be
+                // this bot's dominant source of its own price impact (far more
+                // common than the `too_far` chase case above, which only fires
+                // when the price already looks bad). Most agents now mostly
+                // rest a limit at their own belief even on a good price instead
+                // of immediately taking it -- still a real trade (it'll likely
+                // fill passively once someone else crosses into it), just not
+                // one *this* agent pushed the price with. A roll against
+                // `take_good_price_prob` still takes it outright sometimes, same
+                // heterogeneity convention as `price_chase_prob` (most agents'
+                // draw is low; a minority stay closer to the old always-take
+                // behavior).
+                Some(_) => !agent.rng.gen_bool(s.take_good_price_prob),
             };
 
             if use_limit {

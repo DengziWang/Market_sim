@@ -64,9 +64,8 @@ fn kind_str(k: OrderEventKind) -> &'static str {
 
 impl Simulation {
     pub fn build(cfg: ScenarioConfig) -> Result<Self, String> {
-        let n_trend_groups = compute_n_trend_groups(&cfg);
-        let market = Market::new(cfg.assets.clone(), cfg.venues.clone(), cfg.market.clone(), cfg.fees.clone(), cfg.mempool.clone(), n_trend_groups);
-        let (agents, strategies) = build_population(&cfg, n_trend_groups)?;
+        let market = Market::new(cfg.assets.clone(), cfg.venues.clone(), cfg.market.clone(), cfg.fees.clone(), cfg.mempool.clone());
+        let (agents, strategies) = build_population(&cfg, 0, &market)?;
         let now = 0.0;
         Ok(Self {
             market,
@@ -152,6 +151,59 @@ impl Simulation {
         self.session_end = self.now + additional_seconds.max(0.0);
         self.events.push(self.session_end, EventKind::EndOfSession);
         self.drain_loop(cancel, progress)
+    }
+
+    /// Hands this simulation's market off from whatever population built it
+    /// so far to a *new* one, mid-run -- e.g. a zero-intelligence warmup
+    /// phase (real trade/price history and resting liquidity already in the
+    /// live order book, built from actual trading rather than an empty book)
+    /// handed off to the "real" bot population once it's ready to go, rather
+    /// than that population's own first wakes being the very first orders
+    /// the book has ever seen (2026-10-10, measured: that cold-start moment
+    /// produces a real, large burst -- the whole population's first wake is
+    /// jittered over just the first second).
+    ///
+    /// Every agent currently in the simulation is marked `dormant` (see that
+    /// field's doc comment in `agent.rs`) -- they never act again, but their
+    /// cash/inventory/resting orders are untouched, so whatever liquidity
+    /// they'd already built stays live in the book as the new population's
+    /// starting point. The new population is appended (never replaces
+    /// existing agent ids/indices -- `build_population`'s own
+    /// `starting_agent_id` keeps the two populations' ids, and hence their
+    /// deterministic per-agent RNG streams via `rng::agent_rng`, from ever
+    /// colliding), and each new agent gets its own first-wake event jittered
+    /// over `GRAFT_WAKE_SPREAD_SECS` from *now* -- deliberately much wider
+    /// than the 1-second window `run_cancellable_keep_state` uses for a fresh
+    /// `build` at t=0: a direct first measurement (300 noise + 296 real
+    /// agents, 500s warmup) showed that even with warm resting liquidity
+    /// already in the book, cramming every new agent's first action into the
+    /// same 1-second window still produced a real burst (2,235 trades in the
+    /// graft's first 5 seconds vs. tens per 5 seconds shortly after) --
+    /// spreading new agents' first wakes out removes that specific cause
+    /// (everyone acting at once), separate from the already-warm book
+    /// removing the *empty-book* cause a fresh start has.
+    ///
+    /// `new_cfg`'s `assets`/`venues`/`market`/`fees`/`mempool`/`liquidation`/
+    /// `run.seed` are ignored -- the already-running `Market` and `self.cfg`
+    /// own those; only `new_cfg.population.groups` is read. (Used to also
+    /// note a trend-group graft fidelity gap here -- moot now that trend
+    /// groups are gone entirely, see `market.rs`'s removal note.)
+    pub fn graft_population(&mut self, new_cfg: &ScenarioConfig) -> Result<(), String> {
+        for agent in self.agents.iter_mut() {
+            agent.dormant = true;
+        }
+        let starting_agent_id = self.agents.len() as AgentId;
+        let (new_agents, new_strategies) = build_population(new_cfg, starting_agent_id, &self.market)?;
+        let n_new = new_strategies.len();
+        self.agents.extend(new_agents);
+        self.strategies.extend(new_strategies);
+        const GRAFT_WAKE_SPREAD_SECS: f64 = 60.0;
+        for i in 0..n_new {
+            let agent_id = starting_agent_id + i as AgentId;
+            let jitter = self.market_rng.gen_range(0.0..GRAFT_WAKE_SPREAD_SECS);
+            self.events.push(self.now + jitter, EventKind::AgentWake { agent_id });
+        }
+        Ok(())
     }
 
     /// Serializes the full simulation state (order books, agents, RNG streams,
@@ -268,7 +320,7 @@ impl Simulation {
 
     fn handle_agent_wake(&mut self, agent_id: AgentId) {
         let idx = agent_id as usize;
-        if self.agents[idx].bankrupt {
+        if self.agents[idx].bankrupt || self.agents[idx].dormant {
             return;
         }
         let ctx = StepCtx { market: &self.market, venue: PRIMARY_VENUE, now: self.now };
@@ -441,6 +493,10 @@ impl Simulation {
     }
 
     fn push_order_event(&mut self, ev: crate::order::OrderEvent, venue_id: VenueId) {
+        self.result.n_order_events_total += 1;
+        if !self.cfg.export.write_order_events {
+            return;
+        }
         self.result.order_events.push(OrderEventRow {
             time: ev.time,
             order_id: ev.order_id,
@@ -861,20 +917,12 @@ impl Simulation {
 // Population builder
 // ---------------------------------------------------------------------------------
 
-/// Number of independent "crowd trend" groups humans get split into (2026-10-06
-/// revert, restoring the mechanism that predated the social-network graph -- see
-/// `Market::random_trend`'s doc comment). Best-effort reconstruction: the
-/// original heuristic was never committed to git, so this picks a simple,
-/// clearly-documented rule rather than guessing at an exact-but-unverifiable
-/// original formula -- roughly one group per 50 human agents, bounded to
-/// [1, 20] so a tiny human population still gets at least one shared trend line
-/// and a huge one doesn't fragment into hundreds of near-meaningless groups.
-fn compute_n_trend_groups(cfg: &ScenarioConfig) -> u32 {
-    let n_human: usize = cfg.population.groups.iter().filter(|g| g.bot_type == "human").map(|g| g.count as usize).sum();
-    ((n_human / 50).max(1) as u32).min(20)
-}
-
-fn build_population(cfg: &ScenarioConfig, n_trend_groups: u32) -> Result<(Vec<AgentCommon>, Vec<BotStrategy>), String> {
+/// `starting_agent_id`: 0 for a normal fresh build (`Simulation::build`'s own
+/// call); nonzero when `graft_population` (below) calls this a second time to
+/// append a new population onto an already-running simulation -- agent ids
+/// (and the per-agent deterministic RNG streams derived from them, see
+/// `rng::agent_rng` below) must never collide with the existing population's.
+fn build_population(cfg: &ScenarioConfig, starting_agent_id: AgentId, market: &Market) -> Result<(Vec<AgentCommon>, Vec<BotStrategy>), String> {
     let n_assets = cfg.assets.len();
     if n_assets == 0 {
         return Err("scenario must configure at least 1 asset".to_string());
@@ -883,7 +931,7 @@ fn build_population(cfg: &ScenarioConfig, n_trend_groups: u32) -> Result<(Vec<Ag
 
     let mut agents = Vec::new();
     let mut strategies = Vec::new();
-    let mut agent_id: AgentId = 0;
+    let mut agent_id: AgentId = starting_agent_id;
 
     for group in &cfg.population.groups {
         let params = group.params_table();
@@ -905,7 +953,17 @@ fn build_population(cfg: &ScenarioConfig, n_trend_groups: u32) -> Result<(Vec<Ag
             let venue_b: VenueId = if n_venues > 1 { 1 } else { 0 };
 
             let strat = match group.bot_type.as_str() {
-                "market_maker" => BotStrategy::MarketMaker(market_maker::State::from_params(parse_mm_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params, &mut rng)),
+                // Every market_maker agent manages every configured asset up to
+                // `max_fundamental_vol` (module doc comment's 2026-10-17 "Asset
+                // eligibility by volatility tier" entry), not one fixed asset
+                // round-robined per agent -- see market_maker.rs's own module doc
+                // comment's "Multi-asset risk allocation". Default `f64::MAX`
+                // reproduces the old unconditional "every asset" behavior exactly.
+                "market_maker" => {
+                    let max_vol = params::get_f64(&params, "max_fundamental_vol", f64::MAX);
+                    let eligible: Vec<AssetId> = (0..n_assets).filter(|&a| cfg.assets[a].fundamental_vol <= max_vol).map(|a| a as AssetId).collect();
+                    BotStrategy::MarketMaker(market_maker::State::from_params(parse_mm_variant(&group.variant)?, eligible, &params, &mut rng, market))
+                }
                 "arbitrage" => BotStrategy::Arbitrage(arbitrage::State::from_params(
                     parse_arb_variant(&group.variant)?,
                     asset_a,
@@ -936,7 +994,7 @@ fn build_population(cfg: &ScenarioConfig, n_trend_groups: u32) -> Result<(Vec<Ag
                 )),
                 "noise" => BotStrategy::Noise(noise::State::from_params(parse_noise_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
                 "human" => {
-                    BotStrategy::Human(human::State::from_params(parse_human_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params, n_trend_groups, &mut rng))
+                    BotStrategy::Human(human::State::from_params(parse_human_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params, &mut rng))
                 }
                 other => return Err(format!("unknown bot_type '{other}' in population config")),
             };
@@ -967,20 +1025,34 @@ fn build_population(cfg: &ScenarioConfig, n_trend_groups: u32) -> Result<(Vec<Ag
             // agent's starting budget is pre-converted into inventory at the asset's
             // initial price; the rest stays as cash.
             let mut inventory = FxHashMap::default();
-            if group.bot_type == "noise" || group.bot_type == "human" {
-                // `human` added 2026-10-04: now that this bot can post resting
-                // limit orders (not just IOC market orders -- see human.rs's
-                // module doc comment), it hits the exact same structural issue
-                // `noise` already solved above -- a 100%-human population
-                // starting with zero inventory anywhere is categorically
-                // buy-only until it organically accumulates holdings (sells are
-                // correctly gated to what's actually held), which isn't a
-                // transient bias here but a permanent deadlock: no sell order of
-                // either kind can ever exist, so no trade can ever occur,
-                // regardless of session length (confirmed in a 20,000s smoke
-                // test -- zero trades, by construction, not by chance).
-                let frac = rng.gen_range(0.2..0.6);
-                let initial_price = cfg.assets[asset_a as usize].initial_price.max(1e-9);
+            // **2026-10-14, direct user request**: every bot type that posts
+            // ordinary spot `Side::Sell` orders as a normal part of its own
+            // strategy (not through the separate margin/leverage mechanism,
+            // which `liquidation_trader` uses exclusively and needs no spot
+            // inventory for) hits the *exact same* structural bug `noise`/
+            // `human` were already fixed for above -- confirmed directly in
+            // `staged_introduction_test`: grafting market_maker/arbitrage/mev
+            // in cold, all at zero inventory, produced +1,732%/+460%/+665%
+            // price spikes in under 500s, because every one of them was
+            // categorically buy-only (sells gated to actual holdings) until
+            // it organically accumulated something to sell. `dca` is
+            // deliberately excluded (a buy-only accumulator by design, not a
+            // bug) and `liquidation_trader` needs no spot seed (its
+            // directional exposure is entirely margin-based).
+            let needs_inventory_seed = matches!(
+                group.bot_type.as_str(),
+                "noise" | "human" | "market_maker" | "grid" | "momentum" | "mean_reversion" | "arbitrage" | "mev"
+            );
+            if needs_inventory_seed {
+                // 2026-10-15, direct user request: raised from 0.2..0.6 -- the
+                // smaller seed still left buy capacity (bounded by cash) well
+                // ahead of sell capacity (bounded by this starting stake), so
+                // the same upward-bias dynamic kept reappearing, just milder.
+                // This is one shared code path for both the initial
+                // population (`Simulation::build`) and every later wave
+                // (`graft_population`), so the larger seed applies to fresh
+                // agents either way, not just at session start.
+                let frac = rng.gen_range(0.5..0.9);
                 let mut value = cash * frac;
                 if group.bot_type == "human" {
                     // `human`'s own position cap (`max_position_notional`,
@@ -995,8 +1067,22 @@ fn build_population(cfg: &ScenarioConfig, n_trend_groups: u32) -> Result<(Vec<Ag
                     let max_position_notional = params::get_f64(&params, "max_position_notional", 4000.0);
                     value = value.min(max_position_notional * 0.5);
                 }
-                inventory.insert(asset_a, value / initial_price);
-                cash -= value;
+                if group.bot_type == "market_maker" {
+                    // Spread evenly across *every* asset this agent manages
+                    // (see market_maker.rs's "Multi-asset risk allocation"),
+                    // not just `asset_a` -- a single-asset seed would leave
+                    // it buy-only on the other 4 assets it also quotes.
+                    let per_asset_value = value / n_assets as f64;
+                    cash -= value;
+                    for aid in 0..n_assets as AssetId {
+                        let initial_price = cfg.assets[aid as usize].initial_price.max(1e-9);
+                        inventory.insert(aid, per_asset_value / initial_price);
+                    }
+                } else {
+                    let initial_price = cfg.assets[asset_a as usize].initial_price.max(1e-9);
+                    inventory.insert(asset_a, value / initial_price);
+                    cash -= value;
+                }
             }
 
             // cash + any pre-funded inventory (only `noise`, above), valued at each
@@ -1012,6 +1098,7 @@ fn build_population(cfg: &ScenarioConfig, n_trend_groups: u32) -> Result<(Vec<Ag
                 cash,
                 inventory,
                 bankrupt: false,
+                dormant: false,
                 margin: None,
                 liquidation_style,
                 leverage_cfg,

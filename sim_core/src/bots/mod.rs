@@ -128,10 +128,10 @@ pub fn step(agent: &mut AgentCommon, strat: &mut BotStrategy, ctx: &StepCtx) -> 
 
 /// The asset a strategy instance primarily trades, used by the generic leveraged
 /// side-bet piggyback in `sim.rs` (spec 5.7: leverage is independent of bot_type).
-/// Multi-asset strategies (arbitrage) leverage their first configured leg.
+/// Multi-asset strategies (arbitrage, market_maker) leverage their first configured leg/asset.
 pub fn primary_asset(strat: &BotStrategy) -> crate::types::AssetId {
     match strat {
-        BotStrategy::MarketMaker(s) => s.asset_id,
+        BotStrategy::MarketMaker(s) => s.assets[0].asset_id,
         BotStrategy::Arbitrage(s) => s.asset_a,
         BotStrategy::Momentum(s) => s.asset_id,
         BotStrategy::MeanReversion(s) => s.asset_id,
