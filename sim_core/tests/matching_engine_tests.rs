@@ -216,6 +216,50 @@ fn fok_precheck_agrees_with_the_circuit_breaker() {
     assert!(result.fills.is_empty(), "FOK must reject rather than partially fill");
 }
 
+fn assert_depth_close(actual: Vec<(f64, f64)>, expected: &[(f64, f64)]) {
+    assert_eq!(actual.len(), expected.len(), "actual={actual:?} expected={expected:?}");
+    for (&(ap, aq), &(ep, eq)) in actual.iter().zip(expected) {
+        assert!((ap - ep).abs() < 1e-6, "price: actual={actual:?} expected={expected:?}");
+        assert!((aq - eq).abs() < 1e-9, "qty: actual={actual:?} expected={expected:?}");
+    }
+}
+
+#[test]
+fn depth_reflects_every_kind_of_book_mutation() {
+    // `depth()` had no direct test coverage before this; walks it through resting,
+    // aggregation at a shared level, cancel, partial fill, and full fill in turn.
+    let mut book = OrderBook::new(0, 0.01, 1e9);
+
+    assert_eq!(book.depth(Side::Buy, 10), vec![]);
+
+    // New resting orders at two price levels.
+    book.submit(limit_order(1, 1, Side::Buy, 10_000, 1.0, TimeInForce::Gtc), 0.0);
+    book.submit(limit_order(2, 2, Side::Buy, 9_999, 2.0, TimeInForce::Gtc), 0.0);
+    assert_depth_close(book.depth(Side::Buy, 10), &[(100.0, 1.0), (99.99, 2.0)]);
+
+    // A second order joining an existing level aggregates into it.
+    book.submit(limit_order(3, 3, Side::Buy, 10_000, 0.5, TimeInForce::Gtc), 0.0);
+    assert_depth_close(book.depth(Side::Buy, 10), &[(100.0, 1.5), (99.99, 2.0)]);
+
+    // Cancelling order 1 leaves only order 3's 0.5 at the top level.
+    book.cancel(1, 1.0);
+    assert_depth_close(book.depth(Side::Buy, 10), &[(100.0, 0.5), (99.99, 2.0)]);
+
+    // A partial fill against the top level reduces it in place.
+    let r = book.submit(market_order(4, 4, Side::Sell, 0.3, TimeInForce::Ioc), 2.0);
+    assert_eq!(r.fills.len(), 1);
+    assert_depth_close(book.depth(Side::Buy, 10), &[(100.0, 0.2), (99.99, 2.0)]);
+
+    // Fully filling what's left at the top level empties it, removing the level.
+    let r = book.submit(market_order(5, 5, Side::Sell, 0.2, TimeInForce::Ioc), 3.0);
+    assert_eq!(r.fills.len(), 1);
+    assert_depth_close(book.depth(Side::Buy, 10), &[(99.99, 2.0)]);
+
+    // `levels` slices correctly either way.
+    assert_depth_close(book.depth(Side::Buy, 1), &[(99.99, 2.0)]);
+    assert_depth_close(book.depth(Side::Buy, 100), &[(99.99, 2.0)]);
+}
+
 #[test]
 fn mid_price_and_spread() {
     let mut book = OrderBook::new(0, 0.01, 1e9);
