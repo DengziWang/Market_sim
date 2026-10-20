@@ -1,24 +1,3 @@
-# =============================================================================
-# Human-fraction sweep point (noise-free design): 37.5% human/retail bots,
-# 2500 agents base (scaled at runtime), 150000s simulated (150 legs x 1000s).
-#
-# Extends the original 18-point sweep (0-30% @ 2.5% steps, 30-80% @ 10% steps)
-# to a uniform 2.5% grid from 0% to 100% (41 points total). Same design as
-# every other point in this directory: human/retail count = round(2500 *
-# 37.5/100) = 938; the remaining 1562 agents are the 8
-# strategic bot types (market_maker, arbitrage, momentum, mean_reversion,
-# grid, dca, liquidation_trader, mev) apportioned via largest-remainder
-# (Hamilton) at the individual population.groups level, using
-# scenarios/realistic_mix.toml's original 206-agent weights (the canonical
-# source -- NOT human_0pct.toml's own already-rounded 2500-baseline counts,
-# which compound rounding error differently) -- validated to exactly
-# reproduce all 18 existing scenario files' group-level counts before being
-# trusted for these new points (2026-09-21).
-#
-# Same seed (1) as every other point in this sweep (per-seed override applied
-# at run time, same as the rest of the sweep).
-# =============================================================================
-
 [[assets]]
 symbol = "BTC"
 tick_size = 0.5
@@ -93,6 +72,7 @@ full_liquidation_fraction = 0.5
 [export]
 out_dir = "runs/human_sweep_lite/human_37_5pct"
 write_snapshots = true
+write_order_events = false
 
 [population]
 [[population.groups]]
@@ -102,11 +82,9 @@ count = 76
 initial_cash_range = [ 20000.0, 80000.0,]
 
 [population.groups.params]
-wake_interval_secs = 0.3
-n_ladder_levels = 5
-ladder_level_spacing_frac = 1.0
 panic_vol_frac = 0.01
 panic_momentum_frac = 0.005
+max_fundamental_vol = 0.021
 [[population.groups]]
 bot_type = "market_maker"
 variant = "fixed_offset"
@@ -114,11 +92,9 @@ count = 76
 initial_cash_range = [ 20000.0, 80000.0,]
 
 [population.groups.params]
-n_ladder_levels = 5
-ladder_level_spacing_frac = 1.0
 panic_vol_frac = 0.01
 panic_momentum_frac = 0.005
-
+max_fundamental_vol = 0.021
 [[population.groups]]
 bot_type = "market_maker"
 variant = "inventory_skew"
@@ -126,11 +102,9 @@ count = 76
 initial_cash_range = [ 20000.0, 80000.0,]
 
 [population.groups.params]
-n_ladder_levels = 5
-ladder_level_spacing_frac = 1.0
 panic_vol_frac = 0.01
 panic_momentum_frac = 0.005
-
+max_fundamental_vol = 0.021
 [[population.groups]]
 bot_type = "market_maker"
 variant = "adaptive_spread"
@@ -138,11 +112,9 @@ count = 76
 initial_cash_range = [ 20000.0, 80000.0,]
 
 [population.groups.params]
-n_ladder_levels = 5
-ladder_level_spacing_frac = 1.0
 panic_vol_frac = 0.01
 panic_momentum_frac = 0.005
-
+max_fundamental_vol = 0.021
 [[population.groups]]
 bot_type = "arbitrage"
 variant = "cross_venue"

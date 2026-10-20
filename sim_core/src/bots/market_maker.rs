@@ -347,6 +347,58 @@
 //! are a dead end here; the direction that worked (depth-collapse) is
 //! participation-side (quote less under detectable stress) instead.**
 //!
+//! **Single order per side, deleted the ladder (2026-10-20)**: direct user
+//! request ("only use one ladder/delete this logic"), after the order-event
+//! cost investigation below found `market_maker`'s 5-level ladder (added
+//! 2026-10-14, see that entry above) was overwhelmingly the dominant source
+//! of this sim's order-event/memory/CPU cost -- isolated alone, it generated
+//! ~75% of all order-event volume in a representative composition, at 8.76
+//! events/agent/sec vs. 0.01-3.65 for every other bot type, simply from
+//! cancelling and replacing all 5 levels, both sides, every 0.3-0.5s wake.
+//! Rather than just default `n_ladder_levels` to 1 (leaving the Vec/resize/
+//! drain machinery, the wait-and-reinforce mechanism, and the empirical-
+//! kappa near/far fill-rate calibration in place as dead weight -- the
+//! empirical-kappa gate in particular is already unconditionally false at
+//! 1 level, since `far_distance_frac` collapses to equal `near_distance_frac`
+//! with no second level to measure), all of that was deleted: `bid_levels`/
+//! `ask_levels: Vec<LadderLevel>` are now plain `bid_level`/`ask_level:
+//! LadderLevel` fields, `n_ladder_levels`/`ladder_level_spacing_frac` are
+//! gone from `State`, and the empirical-kappa fields are gone from both
+//! `State` and `AssetState`.
+//!
+//! Before deleting it, re-ran the 2026-10-14 ladder result properly --
+//! multi-seed, multi-composition, the discipline this file's other entries
+//! already insist on (that original result was a single seed). It didn't
+//! hold up: single-order quoting (this change) *outperforms* the 5-level
+//! ladder on every one of 7 tested seed/composition combinations (human_80pct
+//! seeds 42/7/999, human_40pct seeds 42/7/123), often by a large margin
+//! (market_maker's own equity growth, e.g. seed 42: +2.1% laddered -> +41.5%
+//! single-order). The 2026-10-14 entry's single-seed result was itself
+//! superseded by everything else this file has absorbed since (microprice,
+//! depth-collapse, the `max_fundamental_vol` asset-eligibility fix) --
+//! re-tested properly, the ladder no longer helps and the extra order flow
+//! it generates is pure cost.
+//!
+//! `wake_interval`'s default also moved from a per-variant mix (0.3s for
+//! `SymmetricAvellanedaStoikov`, 0.5s for the other three) to one shared
+//! 2.0s default for every variant -- also multi-seed/multi-composition
+//! validated (the mixed cadence was *not* equivalent: unifying to a single
+//! wake interval, even just 0.5s uniformly, flipped a seed/composition that
+//! was net-negative under the old mixed cadence to strongly positive; 2.0s
+//! tested equally robust across all 7 combinations above and cuts order-
+//! event volume further, since it's the slower of the two full validated
+//! candidates). Agents still desynchronize from each other -- see
+//! `step()`'s own per-wake `+/- 5%` jitter and the initial wake's uniform
+//! `[0,1)` (or `graft_population`'s 60s) stagger -- this only changed the
+//! shared target frequency, not whether agents move in lockstep.
+//!
+//! Net effect measured directly on the worst-case (algo-bot-heavy)
+//! composition: market_maker alone, same scaled population, 200s window --
+//! 1,020,344 order events at 5 ladder levels down to 119,908 at 1 level +
+//! 2.0s wake (-88%), while simultaneously being the single biggest driver of
+//! `market_maker`'s own equity turning net-positive across this whole
+//! session's investigation.
+//!
 //! **Pre-funded starting inventory (2026-10-14)**: direct user request,
 //! same root cause as the price spikes above but structural rather than
 //! behavioral -- `sim.rs`'s `build_population` previously gave every bot
@@ -419,34 +471,12 @@ pub struct AssetState {
     pub momentum_window: RollingWindow,
     pub ema_mid: Option<f64>,
     pub last_mid: Option<f64>,
-    /// One entry per ladder level, index 0 = nearest to `reservation`. Sized
-    /// to `n_ladder_levels` the first time `step()` runs (not at
-    /// construction, which doesn't know it yet relative to `AssetState`).
-    pub bid_levels: Vec<LadderLevel>,
-    pub ask_levels: Vec<LadderLevel>,
-    /// **Wait-and-reinforce (2026-10-14, direct user request)**: once level
-    /// 0 (the nearest level) gets fully eaten through, don't mechanically
-    /// replace it next wake regardless -- check level 1 (the next level
-    /// out) first. If level 1 is *also* actively being eaten into, the
-    /// sweep is still in progress, so stay withheld (replenishing the front
-    /// line into an ongoing sweep just hands over more size at the best
-    /// price while the attack continues). Once level 1 stops being touched,
-    /// the sweep has apparently paused, so reinforce level 0 again. This
-    /// flag is the persistent "currently withholding" state across wakes --
-    /// without it, a single wake's skip would look, next wake, just like
-    /// "nothing was ever placed," and reinforce immediately regardless of
-    /// whether level 1 is still being hit.
-    pub bid_level0_withheld: bool,
-    pub ask_level0_withheld: bool,
-    /// Level index of each `Action::Submit` this agent pushed this wake but
-    /// hasn't yet gotten an `on_order_id` callback for, in the same order
-    /// they were pushed -- `sim.rs` applies/acks actions strictly in the
-    /// order `step()` returned them, so the Nth pending entry here always
-    /// matches the Nth `on_order_id` call for this side. Needed because
-    /// `on_order_id` only receives the request/id, not which ladder level
-    /// it was for.
-    pub bid_pending_levels: std::collections::VecDeque<usize>,
-    pub ask_pending_levels: std::collections::VecDeque<usize>,
+    /// This agent's one resting order each side (2026-10-20, direct user
+    /// request: deleted the ladder -- see module doc comment's "Single
+    /// order per side, deleted the ladder" entry for why multiple levels
+    /// were removed rather than just defaulted to one).
+    pub bid_level: LadderLevel,
+    pub ask_level: LadderLevel,
     /// Fills awaiting markout resolution (module doc comment): `(fill_time,
     /// side, fill_price)`, queued in time order so resolution can just pop
     /// from the front until the next entry isn't old enough yet.
@@ -456,24 +486,6 @@ pub struct AssetState {
     /// fractional so it's comparable across assets at very different price
     /// scales, same reasoning as every other per-asset ratio in this file.
     pub markout_window: RollingWindow,
-    /// **Empirical order-arrival-intensity (kappa) calibration (2026-10-17,
-    /// direct user request)**: `SymmetricAvellanedaStoikov`'s spread formula
-    /// uses `State::k`, a fixed textbook-default order-arrival-decay rate,
-    /// identical for every asset regardless of how this market's own fill
-    /// behavior actually looks. These four track a simple two-point fit
-    /// instead -- EMA fill rate at the nearest ladder level and at the
-    /// farthest one, paired with the distance (fraction of mid) each was
-    /// actually quoted at -- so `k` gets re-derived per asset from this
-    /// agent's own real execution data. `near_fill_rate`/`far_fill_rate`
-    /// start at an uninformative 0.5/0.5 (not a guessed prior) so the first
-    /// real observations aren't fighting a made-up starting point;
-    /// `calibration_n_obs` gates `step()` from trusting the fit at all until
-    /// enough real data has accumulated.
-    pub near_fill_rate: f64,
-    pub far_fill_rate: f64,
-    pub near_distance_frac: f64,
-    pub far_distance_frac: f64,
-    pub calibration_n_obs: u32,
     /// Slow EMA baseline of total resting depth near the touch, each side
     /// (module doc comment's "Depth-collapse panic trigger", idea #5).
     /// Starts at 0.0 (untrusted, see `step()`'s guard) rather than a guessed
@@ -510,27 +522,13 @@ impl AssetState {
             momentum_window: seeded_window(momentum_window_len, history),
             ema_mid: current_price,
             last_mid: current_price,
-            bid_levels: Vec::new(),
-            ask_levels: Vec::new(),
-            bid_level0_withheld: false,
-            ask_level0_withheld: false,
-            bid_pending_levels: std::collections::VecDeque::new(),
-            ask_pending_levels: std::collections::VecDeque::new(),
+            bid_level: LadderLevel::default(),
+            ask_level: LadderLevel::default(),
             // No market history to seed from (unlike vol/toxicity/momentum
             // above) -- markout is about this *agent's own* fills, which
             // don't exist yet for a freshly constructed one either way.
             pending_markouts: std::collections::VecDeque::new(),
             markout_window: RollingWindow::new(markout_window_len),
-            near_fill_rate: 0.5,
-            far_fill_rate: 0.5,
-            // Overwritten before first real use (see step()'s end-of-wake
-            // update) -- these just need to be positive and non-degenerate
-            // so an empirical_k read before the first placement can't divide
-            // by zero; calibration_n_obs=0 means it won't be trusted yet
-            // regardless.
-            near_distance_frac: 0.001,
-            far_distance_frac: 0.002,
-            calibration_n_obs: 0,
             bid_depth_baseline: 0.0,
             ask_depth_baseline: 0.0,
             inventory_drift_ema: 0.0,
@@ -548,37 +546,10 @@ pub struct State {
     pub wake_interval: SimTime,
     pub base_half_spread_frac: f64,
     pub gamma: f64,
-    /// Fallback/prior used whenever a given asset's own empirical fit (see
-    /// `AssetState`'s calibration fields) isn't trusted yet -- not a dead
-    /// field once calibration warms up, since every asset starts there and
-    /// falls back to it again if its own data ever goes degenerate.
+    /// Order-arrival-decay rate used directly in the AS spread formula --
+    /// a fixed textbook default, the same for every asset.
     pub k: f64,
     pub horizon_secs: f64,
-    /// EMA smoothing window (in observations) for `AssetState::near_fill_rate`/
-    /// `far_fill_rate` -- alpha = 2/(window+1), standard EMA convention.
-    pub empirical_k_window: f64,
-    /// Observations required (`AssetState::calibration_n_obs`) before a
-    /// wake trusts its own asset's empirical fit over `k` above -- guards
-    /// against drawing a confident kappa from a handful of noisy fills.
-    pub empirical_k_min_obs: u32,
-    /// Clamp on the fitted kappa itself -- a near/far fill-rate pair that's
-    /// nearly equal (noise) or inverted (far filled more than near, which
-    /// real order-arrival intensity should never do) can otherwise produce
-    /// a wild or negative estimate; clamped to a band around sane real
-    /// values rather than trusted unconditionally.
-    pub empirical_k_min: f64,
-    pub empirical_k_max: f64,
-    /// Defaults false -- measured net-harmful on human_80pct (overall market
-    /// growth +68.0% -> -11.8%, human's own growth +44.9% -> +3.6%, grid
-    /// -58.9% -> -92.5%, market_maker itself unmoved at ~-83%): the fitted
-    /// spread width shapes what gets measured as "near"/"far" fill-rate on
-    /// the *next* wake, which then re-shapes the fit again -- a closed
-    /// feedback loop between quoting and its own training data, not an
-    /// independent empirical signal the way real exchange fill-rate data
-    /// would be. Left in, disabled, for future rework (e.g. calibrating from
-    /// a longer, more smoothed window than one wake's own placement, or
-    /// capping how much the fit can move per recalibration).
-    pub empirical_k_enabled: bool,
     /// Scale on the cross-asset hedge skew (module doc comment's
     /// "Cross-asset hedging") -- 0.0 = no effect (today's behavior, every
     /// asset priced independently of every other one this agent manages).
@@ -650,24 +621,13 @@ pub struct State {
     /// existing active de-risking (further below), which only acts after
     /// the agent is already underwater on a position it already holds.
     pub predictive_size_scale: f64,
-    /// Instead of resting this agent's *entire* per-side size at one price
-    /// (the original behavior, still the default at `n_ladder_levels = 1`),
-    /// split it evenly across this many price levels, stepping further from
-    /// `reservation` each level (see `ladder_level_spacing_frac`). See
-    /// module doc comment's "Laddered quoting + panic withdrawal".
-    pub n_ladder_levels: u32,
-    /// Spacing between ladder levels, in units of this wake's own
-    /// `half_spread` -- level i sits at `half_spread * (1 + i *
-    /// ladder_level_spacing_frac)` from `reservation`. Default 1.0 means
-    /// level 1 is a further `half_spread` beyond level 0, etc.
-    pub ladder_level_spacing_frac: f64,
-    /// Cancel every resting order on *this asset* (the whole ladder, both
-    /// sides) and skip quoting it entirely this wake, when that asset's own
-    /// realized volatility exceeds this fraction of mid. Generalizes
-    /// `AdaptiveSpread`'s existing single-order `withdrawal_vol_frac` to
-    /// every variant, to the whole ladder, and to every asset
-    /// independently. Default disabled (effectively unreachable) so
-    /// existing scenarios are unaffected unless explicitly opted in.
+    /// Cancel this asset's resting bid/ask (both sides) and skip quoting it
+    /// entirely this wake, when that asset's own realized volatility
+    /// exceeds this fraction of mid. Generalizes `AdaptiveSpread`'s
+    /// existing single-order `withdrawal_vol_frac` to every variant and to
+    /// every asset independently. Default disabled (effectively
+    /// unreachable) so existing scenarios are unaffected unless explicitly
+    /// opted in.
     pub panic_vol_frac: f64,
     /// Same panic withdrawal, triggered instead by that asset's own
     /// `momentum_signal` magnitude (direction-agnostic here -- a sustained
@@ -776,7 +736,13 @@ impl State {
                 .into_iter()
                 .map(|aid| AssetState::new(aid, vol_window_len, momentum_window_len, markout_window_len, market))
                 .collect(),
-            wake_interval: params::get_f64(p, "wake_interval_secs", 0.5),
+            // 2.0s default (2026-10-20, direct user request): multi-seed/
+            // multi-composition validated as the best refresh cadence for
+            // single-order quoting (see module doc comment's "Single order
+            // per side, deleted the ladder") -- the old per-variant mix
+            // (AS at 0.3s, everyone else at 0.5s) is gone; every variant now
+            // shares this one default unless a scenario overrides it.
+            wake_interval: params::get_f64(p, "wake_interval_secs", 2.0),
             base_half_spread_frac: params::get_f64(p, "base_half_spread_frac", 0.0008),
             gamma: params::get_f64(p, "gamma", 0.1),
             k: params::get_f64(p, "k", 1.5),
@@ -796,11 +762,6 @@ impl State {
             predictive_skew_scale: params::get_f64(p, "predictive_skew_scale", 0.0),
             predictive_widen_scale: params::get_f64(p, "predictive_widen_scale", 0.0),
             predictive_size_scale: params::get_f64(p, "predictive_size_scale", 0.0),
-            // Default 1 level reproduces the old single-order-per-side
-            // behavior exactly (level 0 = the original bid/ask price, full
-            // size) -- opt into a real ladder via scenario params.
-            n_ladder_levels: params::get_u32(p, "n_ladder_levels", 1).max(1),
-            ladder_level_spacing_frac: params::get_f64(p, "ladder_level_spacing_frac", 1.0),
             // f64::MAX, not e.g. 1.0 -- sigma/momentum_signal are small
             // fractional-per-wake quantities (see their own doc comments),
             // so even a generous-looking disabled sentinel like 1.0 could in
@@ -844,11 +805,6 @@ impl State {
             // longer/smoother window) rather than ripped out.
             markout_widen_scale: params::get_f64(p, "markout_widen_scale", 0.0) * rng.gen_range(0.5..1.5),
             markout_size_scale: params::get_f64(p, "markout_size_scale", 0.0) * rng.gen_range(0.5..1.5),
-            empirical_k_window: params::get_f64(p, "empirical_k_window", 50.0),
-            empirical_k_min_obs: params::get_u32(p, "empirical_k_min_obs", 30),
-            empirical_k_min: params::get_f64(p, "empirical_k_min", 0.1),
-            empirical_k_max: params::get_f64(p, "empirical_k_max", 20.0),
-            empirical_k_enabled: params::get_bool(p, "empirical_k_enabled", false),
             // Defaults 0.0 -- measured net-harmful in isolation on
             // human_80pct: trade count -62% (342k -> 130k), market_maker's
             // own volume share collapsed 32.6% -> 9.9%, equity *unchanged*
@@ -941,26 +897,10 @@ fn asset_correlation(market: &Market, a: AssetId, b: AssetId) -> f64 {
     (cov / (var_x.sqrt() * var_y.sqrt())).clamp(-1.0, 1.0)
 }
 
-/// Is this level's resting order gone or down to (near) nothing -- i.e. has
-/// it been *fully* eaten through since it was placed? `qty_placed <= 0`
-/// (nothing was ever placed there, e.g. a fresh agent or a level that was
-/// withheld last wake) is never "consumed" -- there was nothing to consume.
-fn level_fully_consumed(ctx: &StepCtx, asset_id: AssetId, level: &LadderLevel) -> bool {
-    if level.qty_placed <= 1e-9 {
-        return false;
-    }
-    match level.order_id.and_then(|id| ctx.market.book(ctx.venue, asset_id).orders.get(&id)) {
-        Some(order) => order.remaining() <= level.qty_placed * 0.001,
-        None => true, // removed from the book -- fully filled (or already gone)
-    }
-}
-
-/// Has this level's resting order experienced *any* fill since it was
-/// placed (fully or partially) -- the "is this level currently being eaten
-/// into" check used to decide whether a sweep is still in progress. A
-/// stronger condition than `level_fully_consumed` isn't needed here: even a
-/// partial fill means the attack reached this level, which is already
-/// enough reason to hold off reinforcing the level in front of it.
+/// Has this asset's resting bid/ask experienced *any* fill since it was
+/// placed (fully or partially) -- used for markout tracking (module doc
+/// comment): even a partial fill means the price moved into this order,
+/// which is enough to record a post-trade markout observation for it.
 fn level_being_touched(ctx: &StepCtx, asset_id: AssetId, level: &LadderLevel) -> bool {
     if level.qty_placed <= 1e-9 {
         return false;
@@ -974,108 +914,26 @@ fn level_being_touched(ctx: &StepCtx, asset_id: AssetId, level: &LadderLevel) ->
 pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult {
     let mut actions = Vec::new();
     for asset in s.assets.iter_mut() {
-        // Wait-and-reinforce (see State::bid_level0_withheld's doc comment):
-        // decided here, from this asset's *last* wake's resting orders,
-        // strictly before they get cancelled below -- cancelling first would
-        // make every level look "fully consumed" regardless of whether it
-        // actually got filled or just removed by us.
-        let n_levels = asset.bid_levels.len().max(asset.ask_levels.len());
-        if n_levels >= 2 {
-            let bid_l0_consumed = level_fully_consumed(ctx, asset.asset_id, &asset.bid_levels[0]);
-            let bid_l1_touched = level_being_touched(ctx, asset.asset_id, &asset.bid_levels[1]);
-            asset.bid_level0_withheld = if asset.bid_level0_withheld {
-                bid_l1_touched // stay withheld only while the sweep is still active
-            } else {
-                bid_l0_consumed && bid_l1_touched // only *start* withholding if level 0 just got swept through
-            };
-
-            let ask_l0_consumed = level_fully_consumed(ctx, asset.asset_id, &asset.ask_levels[0]);
-            let ask_l1_touched = level_being_touched(ctx, asset.asset_id, &asset.ask_levels[1]);
-            asset.ask_level0_withheld = if asset.ask_level0_withheld {
-                ask_l1_touched
-            } else {
-                ask_l0_consumed && ask_l1_touched
-            };
-        }
-
         // Markout tracking (module doc comment): record a pending observation
-        // for every level that received any fill since it was placed, before
-        // the drain below erases that information. Each level lives exactly
-        // one wake (the whole ladder is cancelled and replaced every step),
+        // if this asset's resting bid/ask received any fill since it was
+        // placed, before the reset below erases that information. Each
+        // order lives exactly one wake (cancelled and replaced every step),
         // so this can't double-count the same fill across multiple wakes.
-        for level in asset.bid_levels.iter() {
-            if level.qty_placed > 1e-9 && level_being_touched(ctx, asset.asset_id, level) {
-                asset.pending_markouts.push_back((ctx.now, Side::Buy, level.price_placed));
-            }
+        if asset.bid_level.qty_placed > 1e-9 && level_being_touched(ctx, asset.asset_id, &asset.bid_level) {
+            asset.pending_markouts.push_back((ctx.now, Side::Buy, asset.bid_level.price_placed));
         }
-        for level in asset.ask_levels.iter() {
-            if level.qty_placed > 1e-9 && level_being_touched(ctx, asset.asset_id, level) {
-                asset.pending_markouts.push_back((ctx.now, Side::Sell, level.price_placed));
-            }
+        if asset.ask_level.qty_placed > 1e-9 && level_being_touched(ctx, asset.asset_id, &asset.ask_level) {
+            asset.pending_markouts.push_back((ctx.now, Side::Sell, asset.ask_level.price_placed));
         }
 
-        // Empirical kappa calibration (module doc comment): fold this wake's
-        // nearest/farthest level fill-or-not outcome into the EMA trackers,
-        // pooling bid and ask (both sides were quoted at the same symmetric
-        // distances, see this wake's own `half_spread`) into one shared
-        // signal, same as `k` itself is applied symmetrically to both sides
-        // in the AS formula. Averages whichever of {bid, ask} actually had
-        // something placed at that index -- usually both, but a level can be
-        // legitimately empty (cash-constrained, or withheld by wait-and-
-        // reinforce), and an empty level is "no observation," not "no fill."
-        let alpha = 2.0 / (s.empirical_k_window + 1.0);
-        let mut near_sum = 0.0;
-        let mut near_n = 0u32;
-        if let Some(level) = asset.bid_levels.get(0) {
-            if level.qty_placed > 1e-9 {
-                near_sum += level_being_touched(ctx, asset.asset_id, level) as u32 as f64;
-                near_n += 1;
-            }
+        if let Some(id) = asset.bid_level.order_id {
+            actions.push(Action::Cancel(id, asset.asset_id));
         }
-        if let Some(level) = asset.ask_levels.get(0) {
-            if level.qty_placed > 1e-9 {
-                near_sum += level_being_touched(ctx, asset.asset_id, level) as u32 as f64;
-                near_n += 1;
-            }
+        if let Some(id) = asset.ask_level.order_id {
+            actions.push(Action::Cancel(id, asset.asset_id));
         }
-        if near_n > 0 {
-            asset.near_fill_rate += alpha * (near_sum / near_n as f64 - asset.near_fill_rate);
-            asset.calibration_n_obs = asset.calibration_n_obs.saturating_add(1);
-        }
-
-        let last_idx = asset.bid_levels.len().max(asset.ask_levels.len()).saturating_sub(1);
-        if last_idx > 0 {
-            let mut far_sum = 0.0;
-            let mut far_n = 0u32;
-            if let Some(level) = asset.bid_levels.get(last_idx) {
-                if level.qty_placed > 1e-9 {
-                    far_sum += level_being_touched(ctx, asset.asset_id, level) as u32 as f64;
-                    far_n += 1;
-                }
-            }
-            if let Some(level) = asset.ask_levels.get(last_idx) {
-                if level.qty_placed > 1e-9 {
-                    far_sum += level_being_touched(ctx, asset.asset_id, level) as u32 as f64;
-                    far_n += 1;
-                }
-            }
-            if far_n > 0 {
-                asset.far_fill_rate += alpha * (far_sum / far_n as f64 - asset.far_fill_rate);
-            }
-        }
-
-        for level in asset.bid_levels.drain(..) {
-            if let Some(id) = level.order_id {
-                actions.push(Action::Cancel(id, asset.asset_id));
-            }
-        }
-        for level in asset.ask_levels.drain(..) {
-            if let Some(id) = level.order_id {
-                actions.push(Action::Cancel(id, asset.asset_id));
-            }
-        }
-        asset.bid_pending_levels.clear();
-        asset.ask_pending_levels.clear();
+        asset.bid_level = LadderLevel::default();
+        asset.ask_level = LadderLevel::default();
     }
 
     // Pass 1: update every asset's rolling windows/reference price and read
@@ -1294,25 +1152,6 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             0.0
         };
 
-        // Empirical kappa (module doc comment): a simple two-point fit from
-        // this asset's own actually-observed near/far fill rates, trusted
-        // only once `calibration_n_obs` has warmed up and the fit isn't
-        // degenerate (near must have filled measurably more than far --
-        // real order-arrival intensity always decays with distance). Falls
-        // back to the configured `s.k` otherwise, including right up until
-        // the first `empirical_k_min_obs` wakes have actually placed and
-        // resolved a near/far pair.
-        let empirical_k = if s.empirical_k_enabled
-            && asset.calibration_n_obs >= s.empirical_k_min_obs
-            && asset.near_fill_rate > asset.far_fill_rate * 1.05
-            && asset.far_distance_frac > asset.near_distance_frac
-        {
-            let fitted = (asset.near_fill_rate.ln() - asset.far_fill_rate.ln()) / (asset.far_distance_frac - asset.near_distance_frac);
-            fitted.clamp(s.empirical_k_min, s.empirical_k_max)
-        } else {
-            s.k
-        };
-
         let (reservation, half_spread) = match s.variant {
             Variant::SymmetricAvellanedaStoikov => {
                 // Rolling-horizon approximation of Avellaneda-Stoikov (2008): the terminal
@@ -1340,7 +1179,7 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                 // fraction of one -- rescaled so the module's own defaults land in the same
                 // ballpark as fixed_offset's default 0.0008 base half-spread fraction.
                 const K_TERM_SCALE: f64 = 800.0;
-                let spread_frac = s.gamma * sigma.powi(2) * s.horizon_secs + (2.0 / s.gamma) * (1.0 + s.gamma / empirical_k).ln() / K_TERM_SCALE;
+                let spread_frac = s.gamma * sigma.powi(2) * s.horizon_secs + (2.0 / s.gamma) * (1.0 + s.gamma / s.k).ln() / K_TERM_SCALE;
                 (reservation, (spread_frac * mid / 2.0).max(mid * 1e-5))
             }
             Variant::FixedOffset => (micro, mid * s.base_half_spread_frac),
@@ -1493,83 +1332,40 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         let buy_qty = order_qty * buy_taper;
         let sell_qty = order_qty * sell_taper;
 
-        // Laddered quoting (default n_ladder_levels=1 reproduces the old
-        // single-order behavior exactly: one level, at `half_spread * (1 + 0)`
-        // = the original bid_price/ask_price, full buy_qty/sell_qty). See
-        // State::n_ladder_levels' doc comment -- splitting the *same total*
-        // size across levels, not adding extra size per level. `bid_levels`/
-        // `ask_levels` were drained to empty at the top of `step()`; resize
-        // back to this agent's own `n_ladder_levels` now, defaulting every
-        // entry to "nothing placed" -- the loops below only overwrite the
-        // indices they actually submit for for (a level skipped for cash, or
-        // level 0 while withheld, correctly stays "nothing placed" for next
-        // wake's peek).
-        let n_levels = s.n_ladder_levels.max(1);
-        // Empirical kappa calibration (module doc comment): record the
-        // distances this wake is actually quoting level 0 and the farthest
-        // level at, in fraction-of-mid terms -- read back at the *start* of
-        // the next wake (above, before this wake's own placement is known),
-        // paired with whether each got touched. Uses the shared symmetric
-        // `half_spread` (pre de-risking-push skew) since near/far fill-rate
-        // observations above are already pooled across both sides.
-        asset.near_distance_frac = half_spread / mid.max(1e-9);
-        asset.far_distance_frac = (half_spread * (1.0 + (n_levels - 1) as f64 * s.ladder_level_spacing_frac)) / mid.max(1e-9);
-        asset.bid_levels.resize(n_levels as usize, LadderLevel::default());
-        asset.ask_levels.resize(n_levels as usize, LadderLevel::default());
-        let level_buy_qty = buy_qty / n_levels as f64;
-        let level_sell_qty = sell_qty / n_levels as f64;
-        if inventory < max_inventory && level_buy_qty > 1e-9 {
-            for lvl in 0..n_levels as usize {
-                // Wait-and-reinforce (see State::bid_level0_withheld's doc
-                // comment): level 0 only, while a sweep still looks active.
-                if lvl == 0 && asset.bid_level0_withheld {
-                    continue;
-                }
-                let level_half_spread = bid_half_spread * (1.0 + lvl as f64 * s.ladder_level_spacing_frac);
-                let level_price = (reservation - level_half_spread).max(mid * 1e-4);
-                if agent.cash <= level_price * level_buy_qty {
-                    // Deeper levels are *cheaper* (lower price, same qty), so
-                    // unlike a single-order check this can't just bail out
-                    // of the loop -- a level further from mid may still be
-                    // affordable even when this one isn't.
-                    continue;
-                }
-                asset.bid_levels[lvl].qty_placed = level_buy_qty;
-                asset.bid_levels[lvl].price_placed = level_price;
-                asset.bid_pending_levels.push_back(lvl);
+        // Single order per side (2026-10-20, direct user request -- see
+        // module doc comment's "Single order per side, deleted the ladder"):
+        // `asset.bid_level`/`ask_level` were reset to default at the top of
+        // `step()`; this is the only place either gets set again.
+        if inventory < max_inventory && buy_qty > 1e-9 {
+            let bid_price = (reservation - bid_half_spread).max(mid * 1e-4);
+            if agent.cash > bid_price * buy_qty {
+                asset.bid_level.qty_placed = buy_qty;
+                asset.bid_level.price_placed = bid_price;
                 actions.push(Action::Submit(NewOrderRequest {
                     asset_id: asset.asset_id,
                     side: Side::Buy,
                     order_type: OrderType::Limit,
                     tif: TimeInForce::Gtc,
                     post_only: true,
-                    price: Some(level_price),
-                    qty: level_buy_qty,
+                    price: Some(bid_price),
+                    qty: buy_qty,
                 }));
             }
         }
-        if inventory > -max_inventory && level_sell_qty > 1e-9 {
-            for lvl in 0..n_levels as usize {
-                if lvl == 0 && asset.ask_level0_withheld {
-                    continue;
-                }
-                let level_half_spread = ask_half_spread * (1.0 + lvl as f64 * s.ladder_level_spacing_frac);
-                let level_price = (reservation + level_half_spread).max(mid * 1e-4);
-                asset.ask_levels[lvl].qty_placed = level_sell_qty;
-                asset.ask_levels[lvl].price_placed = level_price;
-                asset.ask_pending_levels.push_back(lvl);
-                actions.push(Action::Submit(NewOrderRequest {
-                    asset_id: asset.asset_id,
-                    side: Side::Sell,
-                    order_type: OrderType::Limit,
-                    tif: TimeInForce::Gtc,
-                    post_only: true,
-                    price: Some(level_price),
-                    qty: level_sell_qty,
-                }));
-            }
+        if inventory > -max_inventory && sell_qty > 1e-9 {
+            let ask_price = (reservation + ask_half_spread).max(mid * 1e-4);
+            asset.ask_level.qty_placed = sell_qty;
+            asset.ask_level.price_placed = ask_price;
+            actions.push(Action::Submit(NewOrderRequest {
+                asset_id: asset.asset_id,
+                side: Side::Sell,
+                order_type: OrderType::Limit,
+                tif: TimeInForce::Gtc,
+                post_only: true,
+                price: Some(ask_price),
+                qty: sell_qty,
+            }));
         }
-
     }
 
     // Jitter the wake slightly (agents don't all requote in perfect lockstep), matching
@@ -1580,25 +1376,11 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
 }
 
 /// Called by `sim.rs` after an order from `Action::Submit` gets an id assigned, so the
-/// bot remembers which resting order to cancel on its next requote. `sim.rs` applies
-/// `step()`'s returned actions strictly in order, so the next pending-level entry here
-/// always matches this call -- see `AssetState::bid_pending_levels`' doc comment.
+/// bot remembers which resting order to cancel on its next requote.
 pub fn on_order_id(s: &mut State, req: &NewOrderRequest, id: OrderId) {
     let Some(asset) = s.assets.iter_mut().find(|a| a.asset_id == req.asset_id) else { return };
     match req.side {
-        Side::Buy => {
-            if let Some(lvl) = asset.bid_pending_levels.pop_front() {
-                if let Some(level) = asset.bid_levels.get_mut(lvl) {
-                    level.order_id = Some(id);
-                }
-            }
-        }
-        Side::Sell => {
-            if let Some(lvl) = asset.ask_pending_levels.pop_front() {
-                if let Some(level) = asset.ask_levels.get_mut(lvl) {
-                    level.order_id = Some(id);
-                }
-            }
-        }
+        Side::Buy => asset.bid_level.order_id = Some(id),
+        Side::Sell => asset.ask_level.order_id = Some(id),
     }
 }
