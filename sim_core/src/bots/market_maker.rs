@@ -413,6 +413,38 @@
 //! through the separate margin/leverage mechanism). See `build_population`
 //! in `sim.rs` for the mechanism itself (not duplicated here, since it's
 //! applied before this bot's own `State` is ever constructed).
+//!
+//! **Depth-aware sizing cap (2026-10-20)**: direct user request ("optimize
+//! market_maker further ... especially high human percentages"), following
+//! the liquidation-cascade fix elsewhere in this session -- with that bug
+//! gone, the full 33-cell/200,000s composition sweep still showed
+//! `market_maker` consistently losing in `human_50pct` (3/3 seeds negative)
+//! and `human_90pct` (2/3 seeds negative), via real (non-bug) bankruptcy
+//! concentration events, not gradual erosion. Root cause: every existing
+//! sizing mechanism (fix 1's equity-scaled `max_inventory`, predictive/
+//! markout/drift shrinks) scales this agent's own risk budget off its own
+//! equity or its own recent experience -- never off how much the book it's
+//! actually quoting into can absorb. High-human/thin-population
+//! compositions have far fewer other market_maker/arbitrage/grid agents
+//! resting orders alongside this one, so a budget that's a perfectly
+//! reasonable dollar amount can still dwarf the real book: this agent's own
+//! quotes get swept disproportionately hard (bigger than what a thin book
+//! "expected"), and any de-risking it then needs to do pushes price further
+//! in a book that was already thin. `depth_size_cap_frac` caps
+//! `max_inventory` to this fraction of the thinner side's
+//! `bid_depth_baseline`/`ask_depth_baseline` (idea #5's existing slow EMA of
+//! near-touch depth, reused here as a sizing ceiling, not just a panic
+//! trigger). A/B tested multi-seed on 5 compositions (`human_0pct/40pct/
+//! 50pct/60pct/90pct`, 3 seeds each, 100,000s/200-leg harness): at 0.5, 14 of
+//! 15 cells improved or stayed net-positive -- including two (`human_0pct`
+//! seed 42, `human_90pct` seed 7) that had real bankruptcy events (48-75% of
+//! the population) baseline had been masking as "already fine" at the
+//! original 3-composition validation scope. `human_60pct` is the one
+//! exception: already strongly positive at baseline (+34% avg), the cap
+//! trims that to +20% avg -- still solidly positive, zero bankruptcy either
+//! way, just a smaller margin. Net effect clear enough to promote straight
+//! to the real default (0.5), not leave opt-in at 0.0 the way several
+//! single-composition ideas above were left pending wider validation.
 
 use rand::Rng;
 
@@ -571,6 +603,16 @@ pub struct State {
     pub depth_window: f64,
     /// How many book levels' resting qty to sum for the depth reading.
     pub depth_levels: u32,
+    /// Caps `max_inventory` (asset units) to at most this fraction of the
+    /// *smaller* of `bid_depth_baseline`/`ask_depth_baseline` -- i.e. how much
+    /// typically rests near the touch on the thinner side, not just this
+    /// agent's own equity-scaled risk budget. 0.0 would be a no-op (old
+    /// behavior); see module doc comment's "Depth-aware sizing cap" for why
+    /// the real default is 0.5. Reuses `bid_depth_baseline`/
+    /// `ask_depth_baseline` (idea #5's existing slow EMA of near-touch depth)
+    /// as the ceiling instead of only a panic trigger -- no new signal, just
+    /// a second use of one already measured and already trusted.
+    pub depth_size_cap_frac: f64,
     /// Exponent on sigma before inverting for risk-parity weighting (module
     /// doc comment's "Steeper risk-parity exponent") -- 1.0 reproduces the
     /// original linear inverse-vol weighting; higher shrinks a currently-
@@ -822,6 +864,7 @@ impl State {
             depth_collapse_frac: params::get_f64(p, "depth_collapse_frac", 0.35),
             depth_window: params::get_f64(p, "depth_window", 50.0),
             depth_levels: params::get_u32(p, "depth_levels", 3),
+            depth_size_cap_frac: params::get_f64(p, "depth_size_cap_frac", 0.5),
             risk_aversion_exponent: params::get_f64(p, "risk_aversion_exponent", 1.0),
             drift_window: params::get_f64(p, "drift_window", 200.0),
             drift_threshold: params::get_f64(p, "drift_threshold", 0.3),
@@ -1109,8 +1152,30 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         // reacts once the *current* move has already turned against it.
         let drift_excess = (asset.inventory_drift_ema.abs() - s.drift_threshold).max(0.0);
         let max_inventory = max_inventory * (1.0 - (drift_excess * s.drift_size_scale).min(0.9));
+        // Depth-aware sizing cap (module doc comment, `depth_size_cap_frac`):
+        // never let the equity-sized budget above exceed what the thinner
+        // side of the book typically has resting near the touch. Baseline
+        // readings start at 0.0 (untrusted, same guard `depth_collapsed`
+        // uses) so a freshly constructed agent isn't capped to zero before
+        // it has ever observed the book. Floored at the same
+        // `min_inventory_notional` fix 1 already uses to keep a token
+        // quoting presence rather than going fully dark -- `depth()`
+        // includes this agent's *own* resting orders (same caveat as
+        // microprice/depth-collapse above), so in a market where this
+        // agent is itself most of the near-touch depth (very few other
+        // resting-order bot types), shrinking its own size would shrink the
+        // very baseline the cap is measured against next wake, spiralling
+        // toward zero with nothing to arrest it -- caught by
+        // `checkpoint_test.rs`'s tiny fixed population (3 market_maker
+        // agents, few other resting-order bot types) going fully silent.
+        let depth_cap = asset.bid_depth_baseline.min(asset.ask_depth_baseline);
+        let min_inventory_floor = s.min_inventory_notional / mid.max(1e-9);
+        let max_inventory = if s.depth_size_cap_frac > 0.0 && depth_cap > 1e-9 {
+            max_inventory.min(depth_cap * s.depth_size_cap_frac).max(min_inventory_floor)
+        } else {
+            max_inventory
+        };
         let order_qty = max_inventory * s.order_frac_of_max_inventory;
-
         // Shared by every variant below that reacts to inventory: raw asset units (as
         // `inventory` is) scale inversely with price via `max_inventory`'s own
         // dollar-notional derivation above -- the same risk budget is 0.5 BTC units but

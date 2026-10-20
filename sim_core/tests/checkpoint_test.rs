@@ -88,10 +88,25 @@ fn checkpoint_round_trip_preserves_deterministic_continuation() {
     let (sim, _result) = sim.run_cancellable_keep_state(None, None);
     let bytes = sim.to_checkpoint_bytes().expect("checkpoint must serialize");
 
+    // 300s, not 120s (2026-10-20): this tiny fixed population's resting-bid
+    // depth is chronically near-zero with occasional brief recoveries (CONFIG
+    // has no asset-sizing/eligibility knobs to correct it, unlike the real
+    // scenario files), making trade activity bursty -- confirmed directly
+    // that *this is true of this CONFIG regardless of any later behavioral
+    // change*: trade count in the baseline (pre-market_maker-depth-cap)
+    // trajectory is already flat at 26 across 120/180/240s before jumping to
+    // 260 at 300s, i.e. a ~120s quiet period already existed, just at a
+    // different point in time. A behavior-neutral-on-average change to any
+    // bot elsewhere in the sim (not specific to the depth-aware sizing cap
+    // added the same day) can shift exactly where that quiet period falls
+    // without indicating anything wrong -- which a 120s window is long
+    // enough to land entirely inside, tripping the liveness assert below for
+    // reasons unrelated to what it's meant to catch. 300s has a comfortable
+    // margin in both trajectories (260 vs. 283 trades, measured directly).
     let restored_a = Simulation::from_checkpoint_bytes(&bytes).expect("checkpoint must deserialize");
     let restored_b = Simulation::from_checkpoint_bytes(&bytes).expect("checkpoint must deserialize");
-    let result_a = restored_a.resume(120.0, None);
-    let result_b = restored_b.resume(120.0, None);
+    let result_a = restored_a.resume(300.0, None);
+    let result_b = restored_b.resume(300.0, None);
 
     assert!(!result_a.trades.is_empty(), "resumed leg must produce trades");
     assert_eq!(result_a.trades.len(), result_b.trades.len(), "two restores of the same checkpoint must continue identically");
