@@ -18,6 +18,25 @@ pub struct MarginPosition {
     /// e.g. 0.8 => at 10x a position liquidates around an ~8% adverse move, not 10%.
     pub maintenance_margin_buffer: f64,
     pub collateral: f64,
+    /// How many StaggeredTwap liquidation rounds (see `Sim::run_liquidation_sweep`,
+    /// 2026-10-20 "liquidation cascade" fix) have already run against this position
+    /// while it stayed liquidatable throughout. A round that closes at most 1/4 of
+    /// the remaining size per slice only "tapers off" the way its original design
+    /// intended if the adverse price move causing the liquidation stops -- if it
+    /// doesn't (the quarter-at-a-time close can't keep up), every slice is a fresh
+    /// IOC market order, each one individually bounded by `max_price_move_frac` but
+    /// starting from wherever the previous slice left off, so a position that
+    /// never recovers emits an unbounded sequence of circuit-breaker-bounded hops
+    /// that *compound*: ~15 sequential 15%-capped slices is enough to move price
+    /// 8x in under a second, which is exactly what one BTC leg of the
+    /// `sweep_175k_btceth_mm` run did (130k -> 1,088k, wiping out 97.6% of that
+    /// cell's market_makers). Reset to 0 whenever the position is briefly not
+    /// liquidatable; once it reaches 1 (one full round already tried and the
+    /// position is still liquidatable), `run_liquidation_sweep` escalates straight
+    /// to a single full close instead of scheduling another round -- trading one
+    /// circuit-breaker-bounded price step for what would otherwise be an unbounded
+    /// compounding sequence of them.
+    pub staggered_round: u32,
 }
 
 impl MarginPosition {

@@ -141,6 +141,7 @@ pub fn open_leveraged_position_directed(
         leverage,
         maintenance_margin_buffer,
         collateral,
+        staggered_round: 0,
     });
     Some(NewOrderRequest {
         asset_id,

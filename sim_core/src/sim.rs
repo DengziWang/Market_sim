@@ -574,6 +574,9 @@ impl Simulation {
             let Some(pos) = self.agents[idx].margin.clone() else { continue };
             let mark = *mark_prices.get(&pos.asset_id).unwrap_or(&pos.entry_price);
             if !pos.is_liquidatable(mark) {
+                if let Some(m) = self.agents[idx].margin.as_mut() {
+                    m.staggered_round = 0;
+                }
                 continue;
             }
             let style = self.agents[idx].liquidation_style;
@@ -582,9 +585,24 @@ impl Simulation {
                     self.execute_liquidation_qty(idx as AgentId, pos.asset_id, pos.size);
                 }
                 LiquidationExecStyle::StaggeredTwap { slices } => {
+                    // One round already ran against this exact position and it is
+                    // *still* liquidatable -- the adverse move is outpacing a
+                    // quarter-at-a-time taper, not the ordinary case the staggered
+                    // style is for. Escalate straight to a single full close (same
+                    // as `Full` above) instead of scheduling another round: see
+                    // `MarginPosition::staggered_round`'s doc comment for why
+                    // repeating this indefinitely is a liquidation-cascade bug, not
+                    // a feature.
+                    if pos.staggered_round >= 1 {
+                        self.execute_liquidation_qty(idx as AgentId, pos.asset_id, pos.size);
+                        continue;
+                    }
                     let required = liquidation_trader::required_liquidation_qty(&pos, mark, self.cfg.liquidation.maintenance_margin_buffer, 1.25);
                     if required <= 1e-9 {
                         continue;
+                    }
+                    if let Some(m) = self.agents[idx].margin.as_mut() {
+                        m.staggered_round += 1;
                     }
                     // Slices re-derive what's still needed (bounded to at most 1/4 of
                     // the remaining position each time, see handle_liquidation_slice)
