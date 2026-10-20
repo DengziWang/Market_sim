@@ -2,7 +2,6 @@
 //! event-driven main loop, applies fills/fees/latency/mempool staging, runs the
 //! liquidation sweep, and produces a `SimResult`.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -40,7 +39,7 @@ pub struct Simulation {
     now: SimTime,
     session_end: SimTime,
     last_periodic_tick: SimTime,
-    pending_delayed: HashMap<u64, (AgentId, NewOrderRequest)>,
+    pending_delayed: FxHashMap<u64, (AgentId, NewOrderRequest)>,
     #[serde(skip, default)]
     result: SimResult,
 }
@@ -77,7 +76,7 @@ impl Simulation {
             market_rng: rng::market_rng(0),
             now,
             last_periodic_tick: 0.0,
-            pending_delayed: HashMap::new(),
+            pending_delayed: FxHashMap::default(),
             result: SimResult::default(),
         })
     }

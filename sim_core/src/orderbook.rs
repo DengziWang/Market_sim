@@ -6,10 +6,10 @@
 //! in the book -- that keeps the matching core small while still giving agents the
 //! full cancel/replace *behaviour* they need (e.g. market-maker requoting).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::order::{Fill, Order, OrderEvent, OrderEventKind, OrderStatus};
-use crate::types::{AssetId, OrderId, OrderType, PriceTicks, Side, SimTime, TickSize, TimeInForce};
+use crate::types::{AssetId, FxHashMap, OrderId, OrderType, PriceTicks, Side, SimTime, TickSize, TimeInForce};
 
 #[derive(Debug, Clone, Copy)]
 pub struct MakerFee(pub f64);
@@ -22,7 +22,10 @@ pub struct OrderBook {
     pub tick_size: TickSize,
     pub bids: BTreeMap<PriceTicks, VecDeque<OrderId>>,
     pub asks: BTreeMap<PriceTicks, VecDeque<OrderId>>,
-    pub orders: HashMap<OrderId, Order>,
+    /// `OrderId` lookup on every submit/cancel/match/depth call -- FxHash (see
+    /// `types::FxHashMap`'s doc comment) instead of the default SipHash, which
+    /// profiling showed costing ~9% of total sim CPU time on this map alone.
+    pub orders: FxHashMap<OrderId, Order>,
     /// See `MarketConfig::max_price_move_frac`.
     pub max_price_move_frac: f64,
     next_seq: u64,
@@ -40,7 +43,7 @@ impl OrderBook {
             tick_size: TickSize(tick_size),
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            orders: HashMap::new(),
+            orders: FxHashMap::default(),
             max_price_move_frac: max_price_move_frac.max(0.0),
             next_seq: 0,
         }
