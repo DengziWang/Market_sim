@@ -214,26 +214,6 @@ count = 0
 initial_cash_range = [ 2000.0, 20000.0,]
 
 [[population.groups]]
-bot_type = "liquidation_trader"
-variant = "full"
-count = 0
-initial_cash_range = [ 5000.0, 40000.0,]
-
-[population.groups.params]
-wake_interval_secs = 300.0
-leverage_range = [ 3.0, 20.0,]
-position_frac_of_cash = 0.6
-[[population.groups]]
-bot_type = "liquidation_trader"
-variant = "staggered_twap"
-count = 0
-initial_cash_range = [ 5000.0, 40000.0,]
-
-[population.groups.params]
-wake_interval_secs = 300.0
-leverage_range = [ 3.0, 20.0,]
-position_frac_of_cash = 0.6
-[[population.groups]]
 bot_type = "mev"
 variant = "sandwich"
 count = 0
@@ -263,7 +243,7 @@ size_frac_of_victim = 0.25
 [[population.groups]]
 bot_type = "human"
 variant = "retail"
-count = 2500
+count = 5000
 initial_cash_range = [ 1000.0, 20000.0,]
 
 [population.groups.params]

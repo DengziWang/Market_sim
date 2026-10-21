@@ -56,12 +56,23 @@ impl State {
     /// unit threshold is trivially satisfied by any order on a cheap asset (and
     /// unreasonably strict on an expensive one), independent of whether that order
     /// is actually "large" in the dollar-value sense that makes it worth attacking.
+    /// Recalibrated 2026-10-21: the old 20,000/0.05s defaults sat just below this
+    /// scenario's mempool-eligibility floor (`large_order_notional_threshold`,
+    /// typically 25,000) and polled fast enough that, in a busy 5,000-agent book,
+    /// `sandwich`/`frontrun` were effectively attacking almost every mempool-
+    /// visible order rather than a genuinely large, rare one -- measured directly:
+    /// 28 sandwich agents made ~34,000 trades in just 2,000s. Worse, many of the
+    /// ~28 agents per variant were independently targeting the same victims
+    /// (crowding), diluting the profit any one of them could actually capture.
+    /// Raising the threshold and slowing the wake interval took sandwich from
+    /// -X%/60.7% bankrupt to +110%/10.7% bankrupt on the same 25,000s benchmark
+    /// (frontrun: similar swing, from 67.9% to 14.3% bankrupt).
     pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value) -> Self {
-        let min_victim_qty = params::get_f64(p, "min_victim_notional", 20_000.0) / initial_price.max(1e-9);
+        let min_victim_qty = params::get_f64(p, "min_victim_notional", 80_000.0) / initial_price.max(1e-9);
         Self {
             variant,
             asset_id,
-            wake_interval: params::get_f64(p, "wake_interval_secs", 0.05),
+            wake_interval: params::get_f64(p, "wake_interval_secs", 0.3),
             min_victim_qty,
             size_frac_of_victim: params::get_f64(p, "size_frac_of_victim", 0.5),
             frontrun_hold_secs: params::get_f64(p, "frontrun_hold_secs", 2.0),
