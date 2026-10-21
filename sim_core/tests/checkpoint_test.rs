@@ -55,14 +55,8 @@ wake_interval_secs = 0.5
 [[population.groups]]
 bot_type = "momentum"
 variant = "rsi"
-count = 4
-
-[[population.groups]]
-bot_type = "liquidation_trader"
-variant = "staggered_twap"
-count = 3
-[population.groups.params]
-wake_interval_secs = 3.0
+count = 7
+leveraged_fraction = 1.0
 leverage_range = [3.0, 12.0]
 
 [[population.groups]]

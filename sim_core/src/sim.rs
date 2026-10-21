@@ -325,12 +325,6 @@ impl Simulation {
         let ctx = StepCtx { market: &self.market, venue: PRIMARY_VENUE, now: self.now };
         let StepResult { actions, next_wake } = bots::step(&mut self.agents[idx], &mut self.strategies[idx], &ctx);
 
-        // The dedicated liquidation_trader bot type only ever emits margin-entry
-        // orders (see liquidation_trader::step) -- route them through the margin
-        // settlement path (fee-only; the collateral/position bookkeeping already
-        // happened directly in open_leveraged_position) rather than normal spot
-        // settlement, and skip the latency/mempool staging normal orders get.
-        let is_leveraged_bot = matches!(self.strategies[idx], BotStrategy::LiquidationTrader(_));
         // wash_trading's self-cross (bots/wash_trading.rs) prices its resting leg
         // against the book state *at decision time* and relies on its own IOC leg
         // matching that same resting order immediately afterward. Latency breaks that:
@@ -342,14 +336,13 @@ impl Simulation {
         // staging, the same way margin orders do.
         let is_wash_trading = matches!(self.strategies[idx], BotStrategy::WashTrading(_));
         for a in actions {
-            match (is_leveraged_bot, is_wash_trading, a) {
-                (true, _, Action::Submit(req)) => self.apply_submit_margin(agent_id, req),
-                (_, true, Action::Submit(req)) => self.apply_submit(agent_id, req),
+            match (is_wash_trading, a) {
+                (true, Action::Submit(req)) => self.apply_submit(agent_id, req),
                 // Per-action margin flag (not bot-type-wide) -- see `Action::SubmitMargin`'s
                 // doc comment: a bot that mixes ordinary and leveraged orders in the same
                 // step marks only the leveraged one.
-                (_, _, Action::SubmitMargin(req)) => self.apply_submit_margin(agent_id, req),
-                (_, _, a) => self.apply_action(agent_id, a),
+                (_, Action::SubmitMargin(req)) => self.apply_submit_margin(agent_id, req),
+                (_, a) => self.apply_action(agent_id, a),
             }
         }
 
@@ -833,13 +826,24 @@ impl Simulation {
     /// -- spot-only bots and human/retail included, not just the margin
     /// sub-population mid-close -- since ordinary spot settlement
     /// (`Sim::settle`) never itself checks solvency.
+    ///
+    /// Skips `dormant` agents (2026-10-21 perf fix): a `graft_population` call
+    /// leaves the entire pre-graft population in `self.agents` forever, marked
+    /// dormant -- they never wake or trade again, so there's no reason to keep
+    /// computing `equity()` for them here every `sweep_interval_secs` tick for
+    /// the rest of the run. This is also a correctness fix, not just speed: a
+    /// dormant agent's mark-to-market equity still drifts with price even
+    /// though it can never manage that risk, so without this skip a dormant
+    /// agent can get flagged bankrupt from pure passive drift -- exactly the
+    /// measurement artifact that made every composition-sweep report before
+    /// Sweep XI blend live trading outcomes with frozen warmup leftovers.
     fn run_net_worth_bankruptcy_sweep(&mut self) {
         let mark_prices = self.market.mark_price_ema.clone();
         let mut newly_breaching: Vec<AgentId> = Vec::new();
         for idx in 0..self.agents.len() {
             let agent_id = idx as AgentId;
             let a = &self.agents[idx];
-            if a.bankrupt {
+            if a.bankrupt || a.dormant {
                 continue;
             }
             if a.initial_net_worth <= 0.0 {
@@ -998,9 +1002,6 @@ fn build_population(cfg: &ScenarioConfig, starting_agent_id: AgentId, market: &M
                 "mean_reversion" => BotStrategy::MeanReversion(mean_reversion::State::from_params(parse_mr_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
                 "grid" => BotStrategy::Grid(grid::State::from_params(parse_grid_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
                 "dca" => BotStrategy::Dca(dca::State::from_params(parse_dca_variant(&group.variant)?, asset_a, cfg.run.session_seconds, &params)),
-                "liquidation_trader" => {
-                    BotStrategy::LiquidationTrader(liquidation_trader::State::from_params(parse_liq_variant(&group.variant)?, asset_a, cfg.liquidation.maintenance_margin_buffer, &params))
-                }
                 "mev" => BotStrategy::Mev(mev::State::from_params(parse_mev_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
                 "wash_trading" => BotStrategy::WashTrading(wash_trading::State::from_params(
                     parse_wash_variant(&group.variant)?,
@@ -1016,15 +1017,13 @@ fn build_population(cfg: &ScenarioConfig, starting_agent_id: AgentId, market: &M
                 other => return Err(format!("unknown bot_type '{other}' in population config")),
             };
 
-            let liquidation_style = if let BotStrategy::LiquidationTrader(s) = &strat {
-                s.exec_style(cfg.liquidation.staggered_slices)
-            } else if rng.gen_bool(cfg.liquidation.full_liquidation_fraction.clamp(0.0, 1.0)) {
+            let liquidation_style = if rng.gen_bool(cfg.liquidation.full_liquidation_fraction.clamp(0.0, 1.0)) {
                 LiquidationExecStyle::Full
             } else {
                 LiquidationExecStyle::StaggeredTwap { slices: cfg.liquidation.staggered_slices }
             };
 
-            let leverage_cfg = if group.bot_type != "liquidation_trader" && group.leveraged_fraction > 0.0 && rng.gen_bool(group.leveraged_fraction.clamp(0.0, 1.0)) {
+            let leverage_cfg = if group.leveraged_fraction > 0.0 && rng.gen_bool(group.leveraged_fraction.clamp(0.0, 1.0)) {
                 Some(LeverageCfg {
                     leverage_range: group.leverage_range.unwrap_or((2.0, 10.0)),
                     position_frac_of_cash: 0.3,
@@ -1179,10 +1178,6 @@ variant_parser!(parse_dca_variant, dca::Variant, {
     "time_based" => dca::Variant::TimeBased,
     "value_averaging" => dca::Variant::ValueAveraging,
     "dip_buying" => dca::Variant::DipBuying,
-});
-variant_parser!(parse_liq_variant, liquidation_trader::Variant, {
-    "full" => liquidation_trader::Variant::Full,
-    "staggered_twap" => liquidation_trader::Variant::StaggeredTwap,
 });
 variant_parser!(parse_mev_variant, mev::Variant, {
     "sandwich" => mev::Variant::Sandwich,

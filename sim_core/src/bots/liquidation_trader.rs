@@ -1,82 +1,26 @@
-//! Leveraged directional traders: 5.7 in the spec. This module owns (a) the entry
-//! logic for the population of agents that hold a leveraged margin position, and
-//! (b) the shared partial-liquidation-quantity formula used by the system-wide
-//! liquidation sweep in `sim.rs` (which must apply to *any* agent carrying a margin
-//! position, not just this bot type -- see `AgentCommon::margin` /
-//! `leveraged_fraction` in config).
+//! Shared margin-entry and partial-liquidation-quantity primitives, used by any
+//! agent that can carry a leveraged `MarginPosition` -- the generic
+//! `leveraged_fraction` side-bet piggyback and `human.rs`'s cash-constrained-
+//! conviction top-up today (see `AgentCommon::margin` in `agent.rs`). The
+//! system-wide liquidation sweep in `sim.rs` applies to *any* agent carrying a
+//! margin position, regardless of which bot type opened it.
 //!
-//! The two "variants" here are liquidation *execution* styles (immediate full vs.
-//! staggered/partial TWAP), matching spec 5.7's explicit ask to compare "soft
-//! correction vs. hard cascade" -- the entry-side logic (open a random-side leveraged
-//! bet) is intentionally simple since it exists to *produce* liquidation events for
-//! the cascade dynamics to be studied, not to be a sophisticated directional strategy.
+//! There used to be a dedicated `liquidation_trader` bot type here whose entire
+//! "strategy" was opening a random-direction leveraged bet purely to manufacture
+//! liquidation/cascade events to study (spec 5.7's "soft correction vs. hard
+//! cascade" comparison). Removed 2026-10-21 at the user's request: a bot whose
+//! only behavior is "borrow randomly, then get liquidated" isn't a trading
+//! strategy, and conflated the leverage mechanism itself with that one
+//! degenerate way of using it. The liquidation *execution* styles (`Full` vs.
+//! `StaggeredTwap`) and the quantity formula below are unaffected -- they apply
+//! to whatever agent ends up over-leveraged, dedicated bot type or not.
 
 use rand::Rng;
 
-use super::StepCtx;
-use crate::agent::{Action, AgentCommon, LiquidationExecStyle, MarginPosition, NewOrderRequest, StepResult};
-use crate::params;
-use crate::types::{AssetId, OrderType, Side, SimTime, TimeInForce};
+use crate::agent::{AgentCommon, MarginPosition, NewOrderRequest};
+use crate::types::{AssetId, OrderType, Side, TimeInForce};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Variant {
-    Full,
-    StaggeredTwap,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct State {
-    pub variant: Variant,
-    pub asset_id: AssetId,
-    pub wake_interval: SimTime,
-    pub leverage_range: (f64, f64),
-    pub position_frac_of_cash: f64,
-    pub maintenance_margin_buffer: f64,
-}
-
-impl State {
-    pub fn variant_name(&self) -> &'static str {
-        match self.variant {
-            Variant::Full => "full",
-            Variant::StaggeredTwap => "staggered_twap",
-        }
-    }
-
-    pub fn from_params(variant: Variant, asset_id: AssetId, maintenance_margin_buffer: f64, p: &toml::Value) -> Self {
-        Self {
-            variant,
-            asset_id,
-            wake_interval: params::get_f64(p, "wake_interval_secs", 180.0),
-            leverage_range: params::get_range(p, "leverage_range", (2.0, 20.0)),
-            position_frac_of_cash: params::get_f64(p, "position_frac_of_cash", 0.6),
-            maintenance_margin_buffer,
-        }
-    }
-
-    pub fn exec_style(&self, staggered_slices: u32) -> LiquidationExecStyle {
-        match self.variant {
-            Variant::Full => LiquidationExecStyle::Full,
-            Variant::StaggeredTwap => LiquidationExecStyle::StaggeredTwap { slices: staggered_slices.max(1) },
-        }
-    }
-}
-
-pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult {
-    let mut actions = Vec::new();
-    if agent.bankrupt {
-        return StepResult::sleep_only(None);
-    }
-    if let Some(mid) = ctx.market.mid_price(ctx.venue, s.asset_id) {
-        if let Some(req) = open_leveraged_position(agent, s.asset_id, s.leverage_range, s.position_frac_of_cash, s.maintenance_margin_buffer, mid) {
-            actions.push(Action::Submit(req));
-        }
-    }
-    StepResult { actions, next_wake: Some(ctx.now + s.wake_interval) }
-}
-
-/// Shared by the dedicated `liquidation_trader` bot type and by any other bot type's
-/// leveraged sub-population (spec 5.7: leverage is independent of bot_type). No-op if
-/// the agent already carries a margin position or has insufficient cash.
+/// No-op if the agent already carries a margin position or has insufficient cash.
 pub fn open_leveraged_position(
     agent: &mut AgentCommon,
     asset_id: AssetId,

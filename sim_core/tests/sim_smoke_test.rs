@@ -174,19 +174,17 @@ variant = "dip_buying"
 count = 2
 
 [[population.groups]]
-bot_type = "liquidation_trader"
-variant = "full"
+bot_type = "grid"
+variant = "static"
 count = 3
-[population.groups.params]
-wake_interval_secs = 5.0
+leveraged_fraction = 1.0
 leverage_range = [3.0, 15.0]
 
 [[population.groups]]
-bot_type = "liquidation_trader"
-variant = "staggered_twap"
+bot_type = "dca"
+variant = "time_based"
 count = 3
-[population.groups.params]
-wake_interval_secs = 5.0
+leveraged_fraction = 1.0
 leverage_range = [3.0, 15.0]
 
 [[population.groups]]
