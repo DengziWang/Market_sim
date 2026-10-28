@@ -1,9 +1,47 @@
 //! Mean-reversion bots: 4.4 in the spec (a separate category from momentum).
+//!
+//! **Per-agent parameter jitter (2026-10-25)**: see momentum.rs's module doc
+//! comment for the full reasoning -- `from_params` took no `rng` here either,
+//! so every agent of a given variant+asset was an exact clone sharing one
+//! `window`/`num_std`/`deviation_threshold`/`entry_z`/`exit_z`/`wake_interval`,
+//! reading the same market and reacting in perfect lockstep. Mean-reversion
+//! clones are a subtler version of the same bug as momentum clones: this bot
+//! type is supposed to be the market's counter-pressure against sustained
+//! trends, but a population of identical mean-reverters all enters and exits
+//! at exactly the same z-score/deviation and the same instant, which makes
+//! their own counter-pressure itself a synchronized, bursty push rather than
+//! the smooth, staggered buying-the-dip a real population of value investors
+//! with different convictions about "how far is too far" would provide.
+//!
+//! **Fundamental-value bias for Bollinger/ZScore (2026-10-25, direct user
+//! request: make bots more successful)**: a per-variant growth breakdown at
+//! human_80pct (200-leg full window) showed `ou_fair_value` -- the one
+//! variant here that trades against the sim's ground-truth fundamental
+//! value -- near breakeven (+0.99%), against -30% to -35% for Bollinger and
+//! ZScore, which see only the noisy traded-price series and have no concept
+//! of where price *should* be. The same fix already validated on grid.rs
+//! (see that file's own "Fundamental-value bias" doc comment -- same
+//! mechanism, same reasoning, reused here): blend each variant's own rolling
+//! `mean` with the known fundamental value by `fundamental_bias_frac` before
+//! computing bands/z-score, so a population that still reacts primarily to
+//! the traded price is no longer *blind* to which side of fair value it's
+//! trading on. Continuous, applied to the reference level only -- never
+//! forces an exit, so the disposition/entry-exit logic each variant already
+//! has is untouched.
 
 use super::{RollingWindow, StepCtx};
 use crate::agent::{Action, AgentCommon, NewOrderRequest, StepResult};
 use crate::params;
 use crate::types::{AssetId, OrderType, Side, SimTime, TimeInForce};
+use rand::Rng;
+
+/// Same jitter helper as momentum.rs (not shared via `super` since the two
+/// modules otherwise have no dependency on each other and this is a two-line
+/// function) -- draws `default * Uniform(1-frac, 1+frac)`.
+fn jittered(rng: &mut impl Rng, default: f64, frac: f64) -> f64 {
+    let frac = frac.clamp(0.0, 0.95);
+    default * rng.gen_range((1.0 - frac)..(1.0 + frac))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Variant {
@@ -25,6 +63,11 @@ pub struct State {
     pub entry_z: f64,
     pub exit_z: f64,
     pub in_position: bool,
+    /// Fraction of the rolling-mean/fundamental-value gap that Bollinger's
+    /// and ZScore's own reference level leans toward fundamental value --
+    /// see module doc comment's "Fundamental-value bias" section. Unused by
+    /// OuFairValue, which already trades directly against fundamental value.
+    pub fundamental_bias_frac: f64,
 }
 
 impl State {
@@ -38,21 +81,32 @@ impl State {
 
     /// `initial_price`: see momentum.rs's from_params doc comment -- converts a
     /// dollar-notional default position size into asset units per-asset.
-    pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value) -> Self {
-        let window_n = params::get_u32(p, "window", 20) as usize;
+    /// `rng`: per-agent jitter -- see this file's module doc comment.
+    pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value, rng: &mut impl Rng) -> Self {
+        let window_n = (jittered(rng, params::get_u32(p, "window", 20) as f64, 0.35).round() as usize).max(2);
         let order_qty = params::get_f64(p, "order_notional", 3000.0) / initial_price.max(1e-9);
+        // entry_z jittered first, exit_z derived relative to it (kept comfortably
+        // below so "exit" always means a less extreme reading than "entry" for
+        // every agent, not just on average).
+        let entry_z = jittered(rng, params::get_f64(p, "entry_z", 1.5), 0.3).max(0.5);
+        let exit_z = jittered(rng, params::get_f64(p, "exit_z", 0.3), 0.3).clamp(0.05, entry_z - 0.2);
         Self {
             variant,
             asset_id,
-            wake_interval: params::get_f64(p, "wake_interval_secs", 3.0),
+            // +/-40%: same reasoning as momentum's wake_interval jitter --
+            // desynchronizing *when* this variant's agents act matters as much
+            // as *how* they read the signal.
+            wake_interval: jittered(rng, params::get_f64(p, "wake_interval_secs", 3.0), 0.4).max(0.5),
             order_qty,
             allow_short: params::get_bool(p, "allow_short", true),
             window: RollingWindow::new(window_n),
-            num_std: params::get_f64(p, "num_std", 2.0),
-            deviation_threshold: params::get_f64(p, "deviation_threshold", 0.01),
-            entry_z: params::get_f64(p, "entry_z", 1.5),
-            exit_z: params::get_f64(p, "exit_z", 0.3),
+            num_std: jittered(rng, params::get_f64(p, "num_std", 2.0), 0.3).max(0.5),
+            deviation_threshold: jittered(rng, params::get_f64(p, "deviation_threshold", 0.01), 0.3).max(1e-4),
+            entry_z,
+            exit_z,
             in_position: false,
+            // 0.3: same modest-lean default as grid.rs's own fundamental_bias_frac.
+            fundamental_bias_frac: params::get_f64(p, "fundamental_bias_frac", 0.3),
         }
     }
 }
@@ -85,8 +139,11 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     match s.variant {
         Variant::Bollinger => {
             s.window.push(mid);
-            if let (Some(mean), Some(std)) = (s.window.mean(), s.window.std()) {
+            if let (Some(raw_mean), Some(std)) = (s.window.mean(), s.window.std()) {
                 if s.window.is_full() && std > 1e-9 {
+                    // Fundamental-value bias -- see module doc comment.
+                    let fair = *ctx.market.fundamental_value.get(&s.asset_id).unwrap_or(&raw_mean);
+                    let mean = raw_mean + s.fundamental_bias_frac * (fair - raw_mean);
                     let upper = mean + s.num_std * std;
                     let lower = mean - s.num_std * std;
                     let target = if mid > upper {
@@ -124,8 +181,11 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         }
         Variant::ZScore => {
             s.window.push(mid);
-            if let (Some(mean), Some(std)) = (s.window.mean(), s.window.std()) {
+            if let (Some(raw_mean), Some(std)) = (s.window.mean(), s.window.std()) {
                 if s.window.is_full() && std > 1e-9 {
+                    // Fundamental-value bias -- see module doc comment.
+                    let fair = *ctx.market.fundamental_value.get(&s.asset_id).unwrap_or(&raw_mean);
+                    let mean = raw_mean + s.fundamental_bias_frac * (fair - raw_mean);
                     let z = (mid - mean) / std;
                     if !s.in_position && z > s.entry_z {
                         if let Some(a) = rebalance(s.asset_id, inventory, if s.allow_short { -max_pos } else { 0.0 }) {

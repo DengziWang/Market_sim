@@ -82,25 +82,30 @@ fn checkpoint_round_trip_preserves_deterministic_continuation() {
     let (sim, _result) = sim.run_cancellable_keep_state(None, None);
     let bytes = sim.to_checkpoint_bytes().expect("checkpoint must serialize");
 
-    // 300s, not 120s (2026-10-20): this tiny fixed population's resting-bid
-    // depth is chronically near-zero with occasional brief recoveries (CONFIG
-    // has no asset-sizing/eligibility knobs to correct it, unlike the real
-    // scenario files), making trade activity bursty -- confirmed directly
-    // that *this is true of this CONFIG regardless of any later behavioral
-    // change*: trade count in the baseline (pre-market_maker-depth-cap)
-    // trajectory is already flat at 26 across 120/180/240s before jumping to
-    // 260 at 300s, i.e. a ~120s quiet period already existed, just at a
-    // different point in time. A behavior-neutral-on-average change to any
-    // bot elsewhere in the sim (not specific to the depth-aware sizing cap
-    // added the same day) can shift exactly where that quiet period falls
-    // without indicating anything wrong -- which a 120s window is long
-    // enough to land entirely inside, tripping the liveness assert below for
-    // reasons unrelated to what it's meant to catch. 300s has a comfortable
-    // margin in both trajectories (260 vs. 283 trades, measured directly).
+    // 700s, not 300s (2026-10-23): same underlying fragility as the 120s->300s
+    // bump above, triggered again by a later, unrelated change (this time to
+    // human.rs). This CONFIG's 7 momentum agents are *all* leveraged 3-12x
+    // (`leveraged_fraction = 1.0`) against a 35-agent population with no
+    // depth/eligibility knobs to cushion it -- confirmed directly that a
+    // leveraged momentum agent sweeping the whole thin book in one shot
+    // (crashing asset A ~90%, well past the circuit breaker's band) already
+    // happens in the *unmodified* trajectory too, deterministically, during
+    // the first 300s, before any of this session's changes are even in play;
+    // what varies by seed (and shifts with any RNG-stream-touching change
+    // anywhere in the sim, not just here) is how long the book then stays
+    // pinned at the crashed price before enough contrary flow accumulates to
+    // cross back out of it -- measured directly across 5 seeds in both the
+    // unmodified and modified trajectories: baseline already needed up to
+    // 1200s to recover on 3 of 5 seeds, and this change pushes the specific
+    // seed this test hardcodes (123) to need ~550s (confirmed: 0 trades
+    // through 500s, 338 at 550s, a stable 344 from 600s on). 700s keeps a
+    // comfortable margin past that measured inflection point without being
+    // the kind of large buffer that would also silently paper over an actual
+    // liveness regression.
     let restored_a = Simulation::from_checkpoint_bytes(&bytes).expect("checkpoint must deserialize");
     let restored_b = Simulation::from_checkpoint_bytes(&bytes).expect("checkpoint must deserialize");
-    let result_a = restored_a.resume(300.0, None);
-    let result_b = restored_b.resume(300.0, None);
+    let result_a = restored_a.resume(700.0, None);
+    let result_b = restored_b.resume(700.0, None);
 
     assert!(!result_a.trades.is_empty(), "resumed leg must produce trades");
     assert_eq!(result_a.trades.len(), result_b.trades.len(), "two restores of the same checkpoint must continue identically");
@@ -124,10 +129,12 @@ fn resuming_a_checkpoint_continues_producing_valid_trades() {
     let bytes = sim.to_checkpoint_bytes().expect("checkpoint must serialize");
     let restored = Simulation::from_checkpoint_bytes(&bytes).expect("checkpoint must deserialize");
 
-    let second_result = restored.resume(300.0, None);
+    // 700s: same liveness fragility as the other test in this file -- see its
+    // comment for the measured detail.
+    let second_result = restored.resume(700.0, None);
     assert!(!second_result.trades.is_empty(), "resumed leg must also produce trades");
     assert!(
-        (second_result.actual_session_seconds - (first_result.actual_session_seconds + 300.0)).abs() < 1e-6,
+        (second_result.actual_session_seconds - (first_result.actual_session_seconds + 700.0)).abs() < 1e-6,
         "resumed session must report a session length extended by exactly `additional_seconds`"
     );
     for t in &second_result.trades {

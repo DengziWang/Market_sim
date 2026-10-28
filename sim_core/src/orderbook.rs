@@ -172,18 +172,15 @@ impl OrderBook {
 
     /// Total resting quantity reachable by an incoming order of `side` at/within
     /// `limit_ticks` (None = unbounded, i.e. a market order): used for the FOK
-    /// pre-check without mutating the book.
-    fn reachable_liquidity(&self, side: Side, limit_ticks: Option<PriceTicks>) -> f64 {
+    /// pre-check without mutating the book. `reference_ticks` is `submit`'s own
+    /// circuit-breaker reference, passed in rather than recomputed here -- must
+    /// agree with the actual matching loop's, or a FOK order's pre-check could
+    /// see liquidity here that actual matching would then refuse to cross,
+    /// breaking FOK's all-or-nothing guarantee.
+    fn reachable_liquidity(&self, side: Side, limit_ticks: Option<PriceTicks>, reference_ticks: Option<PriceTicks>) -> f64 {
         let opposite = match side {
             Side::Buy => &self.asks,
             Side::Sell => &self.bids,
-        };
-        // Must agree with submit()'s circuit-breaker band, or a FOK order's pre-check
-        // could see liquidity here that actual matching would then refuse to cross,
-        // breaking FOK's all-or-nothing guarantee.
-        let reference_ticks = match side {
-            Side::Buy => self.best_ask_ticks(),
-            Side::Sell => self.best_bid_ticks(),
         };
         let limit_ticks = match reference_ticks {
             Some(reference) => {
@@ -229,7 +226,25 @@ impl OrderBook {
     /// Submit a new order. `order_id` must already be globally unique (assigned by
     /// the caller/Market) and `order.seq` is assigned here for time priority.
     #[allow(clippy::too_many_arguments)]
-    pub fn submit(&mut self, mut order: Order, time: SimTime) -> SubmitResult {
+    /// `mark_price`: the circuit breaker's reference (see `MarketConfig::
+    /// max_price_move_frac`'s doc comment) -- `Market::submit` passes its own
+    /// continuously-EMA-smoothed `mark_price_ema` for this asset, `None` before
+    /// the first one exists. Deliberately NOT a value `OrderBook` computes or
+    /// caches itself: a periodic, order-book-local reference (tried and reverted
+    /// 2026-10-24, direct user request -- "fine tune the simulation so the worth
+    /// of the stocks... represent the real world") lets whichever side of the
+    /// book trades more *often* (in this engine's population, buys, since every
+    /// agent starts with zero inventory and has to buy before it can ever sell)
+    /// saturate its own side of the band quickly, then sit capped for the rest
+    /// of the window while the rarer, uncapped side drifts the price down
+    /// unopposed -- measured directly: every one of 7 otherwise-varied seeds
+    /// ground 57-95% lower within a ~2.78-hour window with that design, a
+    /// uniform, structural ratchet, not genuine variation. A continuously-
+    /// adapting EMA reference (the same style real exchanges use for mark-price
+    /// protection bands) can't get stuck favoring one side -- it drifts toward
+    /// wherever price actually trades, in either direction, so there's no
+    /// window during which one side is "spent" and the other isn't.
+    pub fn submit(&mut self, mut order: Order, time: SimTime, mark_price: Option<f64>) -> SubmitResult {
         let mut events = Vec::new();
         let mut fills = Vec::new();
 
@@ -247,6 +262,13 @@ impl OrderBook {
             price_ticks: order.price_ticks,
             qty: order.qty,
         });
+
+        // Circuit breaker reference: see `submit`'s own doc comment and
+        // `MarketConfig::max_price_move_frac`'s for why this is the continuously
+        // EMA-smoothed mark price, not a value derived from the book itself.
+        // Computed before the FOK pre-check too, so both agree on the same band
+        // (`reachable_liquidity`'s own doc comment).
+        let reference_ticks: Option<PriceTicks> = mark_price.map(|p| self.tick_size.to_ticks(p));
 
         // Post-only: reject outright if it would cross.
         if order.post_only {
@@ -270,7 +292,7 @@ impl OrderBook {
 
         // FOK pre-check: must be fully fillable right now, or reject with zero fills.
         if order.tif == TimeInForce::Fok {
-            let available = self.reachable_liquidity(order.side, order.price_ticks);
+            let available = self.reachable_liquidity(order.side, order.price_ticks, reference_ticks);
             if available + 1e-12 < order.qty {
                 order.status = OrderStatus::Rejected;
                 events.push(OrderEvent {
@@ -288,14 +310,6 @@ impl OrderBook {
         }
 
         let opposite_side = order.side.opposite();
-        // Circuit breaker reference: the best opposing price this order started
-        // matching against (not the book's best at each step of its own sweep, which
-        // would let the band "walk" outward with the order itself and defeat the
-        // point). See `MarketConfig::max_price_move_frac`.
-        let reference_ticks: Option<PriceTicks> = match order.side {
-            Side::Buy => self.best_ask_ticks(),
-            Side::Sell => self.best_bid_ticks(),
-        };
 
         loop {
             if order.remaining() <= 1e-12 {

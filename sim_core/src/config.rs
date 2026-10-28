@@ -29,11 +29,23 @@ pub struct AssetConfig {
     pub symbol: String,
     pub tick_size: f64,
     pub initial_price: f64,
-    /// Annualized-style volatility parameter driving the latent fundamental-value
-    /// process (Ornstein-Uhlenbeck) that fundamentalist/mean-reversion bots and the
-    /// price-efficiency metrics (deviation from known fundamental) reference.
+    /// True annualized volatility (0.70 = "70% per year", read exactly like a real
+    /// quant would) driving the latent fundamental-value process (Ornstein-
+    /// Uhlenbeck) that fundamentalist/mean-reversion bots and the price-efficiency
+    /// metrics (deviation from known fundamental) reference -- `market.rs`'s
+    /// `tick_mark_and_fundamental` converts its own `dt` (seconds) to a
+    /// year-fraction before applying this, so this value means what its name says
+    /// regardless of how often the engine happens to tick. Calibrate against real
+    /// historical annualized vol for the asset class, not an arbitrary small
+    /// number -- e.g. BTC's realized vol has typically run ~0.5-0.9 across recent
+    /// years, with smaller/newer tokens running higher.
     #[serde(default = "default_fundamental_vol")]
     pub fundamental_vol: f64,
+    /// Annualized mean-reversion speed (1/year) toward `initial_price` -- e.g.
+    /// 0.1 is a ~7-year half-life, i.e. essentially no visible pull back to
+    /// `initial_price` within any single simulated run of realistic length, which
+    /// is intentional: real asset "fundamental value" doesn't meaningfully snap
+    /// back to some historical reference price within hours or days either.
     #[serde(default = "default_fundamental_theta")]
     pub fundamental_theta: f64,
     /// Same Ornstein-Uhlenbeck shape as the fundamental-value process, but modeling
@@ -50,7 +62,10 @@ pub struct AssetConfig {
     pub sentiment_theta: f64,
 }
 fn default_fundamental_vol() -> f64 {
-    0.02
+    // 0.8 = 80% annualized -- a generic mid-cap-crypto-like figure, used only
+    // when a scenario omits this per-asset (every current scenario file sets
+    // its own, calibrated per symbol -- see each `[[assets]]` block).
+    0.8
 }
 fn default_fundamental_theta() -> f64 {
     0.1
@@ -82,18 +97,107 @@ pub struct MarketConfig {
     pub snapshot_depth_levels: usize,
     #[serde(default = "default_mark_halflife")]
     pub mark_price_ema_halflife_secs: f64,
-    /// Circuit breaker: the largest fraction a single order's matching is allowed to
-    /// move price away from the best opposing price it started against. Once matching
-    /// would cross that band, the order stops taking further liquidity there (an IOC/
-    /// market order's unfilled remainder is discarded as usual; a limit order's
-    /// remainder rests per its TIF) rather than sweeping arbitrarily deep into a thin
-    /// book. Real exchanges have an equivalent (price bands / fat-finger protection);
-    /// without one here, a single large order hitting a thinly-quoted asset could
-    /// move its printed price by 10-1000x in one fill regardless of how reasonably
-    /// any individual bot's order size was chosen. Set very large (e.g. 1e9) to
-    /// effectively disable this as its own research variable.
+    /// Circuit breaker: the largest fraction price is allowed to move, away from
+    /// the current `circuit_breaker_ema` (see that field's own doc comment),
+    /// within one order's own matching. Once matching would cross that band, the
+    /// order stops taking further liquidity there (an IOC/market order's
+    /// unfilled remainder is discarded as usual; a limit order's remainder rests
+    /// per its TIF) rather than sweeping arbitrarily deep into a thin book. Real
+    /// exchanges have an equivalent (price bands / limit-up-limit-down /
+    /// fat-finger protection, e.g. Binance's mark-price-based "price
+    /// protection"); without one here, a single large order hitting a
+    /// thinly-quoted asset could move its printed price by 10-1000x in one fill
+    /// regardless of how reasonably any individual bot's order size was chosen.
+    /// Set very large (e.g. 1e9) to effectively disable this as its own research
+    /// variable.
+    ///
+    /// The reference has been, in order (2026-10-24, direct user request: "fine
+    /// tune the simulation so the worth of the stocks... represent the real
+    /// world" -- each of the first three tried and measured, not just reasoned
+    /// about, before landing on the fourth):
+    ///
+    /// 1. The best opposing price at the start of *this order's own* matching --
+    ///    correctly bounded any single order's own sweep, but let many separate
+    ///    orders arriving in quick succession each reset the reference right
+    ///    where the previous one left off, compounding past the band with
+    ///    nothing capping the sum. Measured: a human_80pct run printed a
+    ///    9,577 -> 31,566 BTC move (+230%) within one 500s window, a burst of
+    ///    `momentum`/`mean_reversion` takers arriving right as `market_maker`'s
+    ///    own depth-collapse panic trigger had pulled its quotes.
+    /// 2. A periodic window-local anchor, refreshed every N seconds -- stopped
+    ///    the single-window burst, but introduced a *worse*, structural bug:
+    ///    whichever side of the book trades more often in this engine's
+    ///    population (buys, since every agent starts at zero inventory and must
+    ///    buy before it can ever sell) saturates its own side of the band
+    ///    quickly and then sits capped for the rest of the window, while the
+    ///    rarer, un-saturated side keeps drifting the price unopposed. Measured:
+    ///    every one of 7 otherwise-varied seeds ground 57-95% lower within one
+    ///    ~2.78-hour window, a uniform structural ratchet, not genuine
+    ///    variation.
+    /// 3. The existing `mark_price_ema` -- a continuously-smoothed reference
+    ///    that drifts toward wherever price trades, in *either* direction, every
+    ///    tick, so it can't get permanently stuck favoring one side the way (2)
+    ///    did. Direction came back genuinely mixed across seeds, confirming that
+    ///    bug was fixed -- but `mark_price_ema_halflife_secs`'s default (30s) is
+    ///    tuned for its *other* consumers and fully catches up to any sustained
+    ///    move within a single ~500s leg (500s is ~17 halflives), so it ended up
+    ///    barely resisting a cascade at all. Measured: single-leg moves of
+    ///    146-294% came right back, nearly as bad as (1).
+    /// 4. (current) `circuit_breaker_ema` -- its own series, same exponential-
+    ///    smoothing mechanics as `mark_price_ema` but with a much longer
+    ///    `price_protection_ema_halflife_secs`, so it keeps (3)'s fix (never
+    ///    permanently stuck, drifts in either direction) while actually
+    ///    resisting a cascade for most of a session instead of fully catching up
+    ///    within one leg.
     #[serde(default = "default_max_price_move_frac")]
     pub max_price_move_frac: f64,
+    /// Halflife (seconds) for `circuit_breaker_ema`, the circuit breaker's own
+    /// reference series -- see `Market::circuit_breaker_ema`'s and
+    /// `max_price_move_frac`'s doc comments for why this must be a *separate*
+    /// halflife from `mark_price_ema_halflife_secs`. Two failure modes bound
+    /// this value from either side, both measured directly (2026-10-24, direct
+    /// user request: "fine tune the simulation so the worth of the stocks...
+    /// represent the real world"), not just reasoned about:
+    ///
+    /// - **Too short, and it barely resists a cascade at all.** The naive
+    ///   "catches up to at most X% of a sustained move within one leg" framing
+    ///   (`1 - 0.5^(leg_secs/halflife)`) undersells how far price can still
+    ///   move: the EMA chases a *moving* target (each new trade can itself move
+    ///   the sample it's chasing, within the band), so a steady run of
+    ///   separate, individually-legal trades can still compound further within
+    ///   one leg than that formula suggests. Measured even at 1800s
+    ///   (`1 - 0.5^(500/1800) ≈ 0.16` "expected"): single-leg moves up to 294%
+    ///   still occurred.
+    /// - **Too long, and a genuine repricing can permanently lock the market
+    ///   up**, not just get resisted. Tried 7200s on the theory that longer is
+    ///   strictly safer -- instead, once some real (if large) mid-price move
+    ///   happened, the reference was too slow to ever catch up within the rest
+    ///   of a run: every subsequent order that would have crossed failed the
+    ///   band check against a reference stuck far behind, and since nothing
+    ///   could trade, the reference had nothing to update toward either.
+    ///   Measured: a pure-bot run traded completely normally through the first
+    ///   leg, then printed exactly zero trades for the rest of a 10,000s
+    ///   window. This is a different, worse problem than slow resistance --
+    ///   it's an unbounded lockout.
+    ///
+    /// 3600s (1 hour) is a middle ground between those two failure modes, not a
+    /// value with its own clean derivation -- picked by measuring actual
+    /// outcomes, not just the catch-up formula, since (per above) that formula
+    /// alone doesn't reliably predict either failure mode. 600s avoided the
+    /// lockout but gave `human_80pct` almost no resistance at all (every one of
+    /// 7 seeds crashed 80-90%, a uniform structural ratchet rather than genuine
+    /// variation); 7200s avoided that but reintroduced the lockout on a
+    /// pure-bot run. 3600s avoided both failure modes on both compositions in
+    /// direct testing: pure-bot ran with modest, mixed-sign moves and no
+    /// lockout; `human_80pct` showed moves in the -25% to -58% range (still a
+    /// one-sided bias worth further investigation, but single-leg moves mostly
+    /// 2-15% rather than the 60-300%+ seen at other halflives). The remaining
+    /// single-leg compounding risk this doesn't fully close is mitigated at
+    /// its main source instead: market_maker.rs's one-sided-book bug (see its
+    /// own "One-sided book from fully-tapered inventory" doc comment entry),
+    /// which produced the most extreme of the measured moves.
+    #[serde(default = "default_price_protection_ema_halflife")]
+    pub price_protection_ema_halflife_secs: f64,
     /// A resting GTC limit order older than this (by `now - submitted_at`) is
     /// force-cancelled (emitted as an `Expire` order event, not `Cancel`) the next
     /// time the expiry sweep runs. Several bot types (noise, wash_trading) place a
@@ -126,6 +230,9 @@ fn default_mark_halflife() -> f64 {
 fn default_max_price_move_frac() -> f64 {
     0.15
 }
+fn default_price_protection_ema_halflife() -> f64 {
+    3600.0
+}
 fn default_max_resting_order_age() -> f64 {
     3600.0
 }
@@ -136,6 +243,7 @@ impl Default for MarketConfig {
             snapshot_depth_levels: default_snapshot_depth(),
             mark_price_ema_halflife_secs: default_mark_halflife(),
             max_price_move_frac: default_max_price_move_frac(),
+            price_protection_ema_halflife_secs: default_price_protection_ema_halflife(),
             max_resting_order_age_secs: default_max_resting_order_age(),
         }
     }

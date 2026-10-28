@@ -2,35 +2,35 @@
 symbol = "BTC"
 tick_size = 0.5
 initial_price = 60000.0
-fundamental_vol = 0.015
+fundamental_vol = 0.70
 fundamental_theta = 0.08
 
 [[assets]]
 symbol = "ETH"
 tick_size = 0.05
 initial_price = 3000.0
-fundamental_vol = 0.02
+fundamental_vol = 0.85
 fundamental_theta = 0.08
 
 [[assets]]
 symbol = "SOL"
 tick_size = 0.01
 initial_price = 150.0
-fundamental_vol = 0.03
+fundamental_vol = 1.05
 fundamental_theta = 0.1
 
 [[assets]]
 symbol = "XRP"
 tick_size = 0.0001
 initial_price = 0.6
-fundamental_vol = 0.025
+fundamental_vol = 0.90
 fundamental_theta = 0.1
 
 [[assets]]
 symbol = "DOGE"
 tick_size = 1e-5
 initial_price = 0.15
-fundamental_vol = 0.04
+fundamental_vol = 1.20
 fundamental_theta = 0.12
 
 [[venues]]
@@ -81,7 +81,7 @@ count = 46
 initial_cash_range = [ 20000.0, 80000.0,]
 
 [population.groups.params]
-max_fundamental_vol = 0.021
+max_fundamental_vol = 1.5
 [[population.groups]]
 bot_type = "market_maker"
 variant = "fixed_offset"
@@ -89,7 +89,7 @@ count = 46
 initial_cash_range = [ 20000.0, 80000.0,]
 
 [population.groups.params]
-max_fundamental_vol = 0.021
+max_fundamental_vol = 1.5
 [[population.groups]]
 bot_type = "market_maker"
 variant = "inventory_skew"
@@ -97,7 +97,7 @@ count = 46
 initial_cash_range = [ 20000.0, 80000.0,]
 
 [population.groups.params]
-max_fundamental_vol = 0.021
+max_fundamental_vol = 1.5
 [[population.groups]]
 bot_type = "market_maker"
 variant = "adaptive_spread"
@@ -105,7 +105,7 @@ count = 46
 initial_cash_range = [ 20000.0, 80000.0,]
 
 [population.groups.params]
-max_fundamental_vol = 0.021
+max_fundamental_vol = 1.5
 [[population.groups]]
 bot_type = "arbitrage"
 variant = "cross_venue"

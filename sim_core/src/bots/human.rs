@@ -30,6 +30,173 @@
 //!     strategy paid off, the more the agent leans into it. This replaces what used
 //!     to be a single fixed momentum-only price component with something that can
 //!     genuinely flip character mid-run, the way real retail sentiment does.
+//!   - **...but biased, not accurate, self-scoring (2026-10-22)**: Brock-Hommes'
+//!     own model tracks fitness as a plain decayed average of realized payoff --
+//!     correct for modeling a population of boundedly-rational-but-honest
+//!     forecasters, wrong for modeling a single retail trader's notoriously poor
+//!     introspective access to their *own* track record (direct user feedback:
+//!     "I believe the agent is too rational... it learns from what worked well" --
+//!     accurately scoring which of two mental strategies has been paying off is
+//!     itself a rational-agent behavior, not a bias). Two real documented biases
+//!     replace the plain decay: **salience** (a big, vivid move dominates memory
+//!     far more than a quiet accurate running average would -- "flashbulb memory"
+//!     -- so the effective learning rate scales up with the size of the realized
+//!     move, not a fixed 0.3 regardless) and **confirmation bias** (evidence that
+//!     confirms whichever strategy this agent is *currently* leaning toward is
+//!     absorbed at the normal rate; evidence that the current lean was wrong is
+//!     absorbed much more slowly -- people update faster toward "I was right" than
+//!     "I was wrong"). Net effect: fitness tracking is now a noisy, self-reinforcing
+//!     impression of "what's been working," not an accurate scorecard -- an agent
+//!     can keep leaning chartist for a while after fundamentalist would objectively
+//!     have paid off better, exactly the kind of sticky, poorly-calibrated belief
+//!     revision a real person shows and a fitness-maximizing agent wouldn't. See
+//!     `fitness_learning_rate`/`salience_sensitivity`/`salience_cap`/
+//!     `confirmation_bias_strength`'s field comments and the update site in
+//!     `step()` for the mechanics.
+//!   - **Spontaneous profit-taking, independent of any signal (2026-10-22)**:
+//!     every bias above, including the disposition effect just below, only ever
+//!     fired as a *modifier* on a trade this agent was already about to make
+//!     because `raw_signal` cleared the act-at-all dead zone -- on a flat tape
+//!     (no real momentum, no mean-reversion gap, calm sentiment) the agent never
+//!     acts at all, so a real open gain just sits there forever (direct user
+//!     feedback: "humans also sell when they have a perfectly straight line").
+//!     Real disposition-effect selling isn't contingent on a fresh technical
+//!     signal; it's driven by the unrealized gain itself -- "it's up, lock it
+//!     in" doesn't need a reason. `spontaneous_take_profit` in `step()` rolls
+//!     independently of `intensity`/`raw_signal` entirely, using the same CPT
+//!     value of the unrealized gain (see below) to scale a per-wake probability
+//!     of a plain take-profit sell; see `spontaneous_profit_taking_rate`'s field
+//!     comment. Never fires on a loss (that's "hold and hope," not a reason to
+//!     act), and never overrides a real opposing signal -- it only fills the gap
+//!     *between* signal-driven wakes.
+//!   - **More extreme profit-taking at large gains (2026-10-25, direct user
+//!     request)**: the plain CPT value above is *concave* in the raw gain
+//!     (`cpt_alpha` < 1 by Tversky & Kahneman's own estimate), which actually
+//!     compresses the probability gap between a modest winner and a huge one --
+//!     a 5% gain and a 50% gain don't differ nearly as much in take-profit odds
+//!     as the size difference alone would suggest. `spontaneous_profit_convexity`
+//!     raises the CPT value to a power > 1 before it scales the roll, pulling
+//!     that gap back open and past linear: a small gain becomes genuinely rare to
+//!     act on, while a large one gets realized almost for certain within a wake
+//!     or two -- see that field's own comment for the worked examples.
+//!   - **Chartist vs. contrarian sub-switching (2026-10-23)**: measured directly
+//!     (a diversity test over a real run) that the typical human agent's own
+//!     trades were 90-96% one-sided, with ~44-50% of agents never once switching
+//!     direction in a ~17-hour window, and that the population as a whole was
+//!     84.7% one-sided per leg at the median -- direct feedback: "this is not
+//!     realistic." A first attempt (an EMA-smoothed "sticky" chartist view,
+//!     replaced by this section) measurably made both numbers *worse*, not
+//!     better -- smoothing an individual agent's own noisy momentum reading only
+//!     filters out the reversals that would have made its own trading two-sided,
+//!     while every agent was still tracking the same underlying tape, just more
+//!     slowly, so it didn't create any actual *disagreement* between agents
+//!     either. The real lesson from Lux & Marchesi (1999, *Nature* 397; 2000,
+//!     *Int. J. Theoretical and Applied Finance* 3) isn't that chartists are
+//!     sticky -- Brock-Hommes' chartist-vs-fundamentalist switch above is already
+//!     that -- it's that chartists themselves split into sub-groups that
+//!     genuinely disagree: optimists who keep believing a move continues, and
+//!     pessimists who bet it reverses, with the population's own split evolving
+//!     by which sub-strategy has actually been paying off. This reuses that
+//!     exact already-working machinery (the same salience/confirmation-bias
+//!     fitness update and logistic blend as the chartist-vs-fundamentalist
+//!     switch, just one level deeper): a new `contrarian_fitness` tracks how
+//!     well *betting against* last wake's momentum signal would have scored
+//!     (`-last_chartist_signal.signum() * raw_return`, the exact mirror image of
+//!     `chartist_fitness`'s own payoff), and a logistic blend of
+//!     `contrarian_fitness - chartist_fitness` decides, per agent per wake, how
+//!     much of this agent's chartist reading flips against the raw momentum
+//!     signal rather than following it. Because fitness evolves from each
+//!     agent's own idiosyncratic wake timing and is sticky under confirmation
+//!     bias once established, agents genuinely diverge -- some settle into
+//!     "ride the trend," others into "fade it," and either can flip an
+//!     individual agent's own trading two-sided over time, which plain
+//!     persistence never could. Retail-only, like the switch it extends (`Lite`
+//!     keeps using the raw, unmodified `price_component`) -- deliberately *not*
+//!     coupled across agents at all (no shared population-level opinion state),
+//!     to avoid reintroducing the shared `random_trend` herding amplifier
+//!     removed above (2026-10-17).
+//!   - **Realization utility near a position's own high (2026-10-23)**: the
+//!     spontaneous profit-taking roll above only ever cared about raw unrealized
+//!     gain relative to entry price. Barberis & Xiong (2012, *Journal of
+//!     Financial Economics* 104) document that real selling clusters specifically
+//!     near an investor's own historical high *since opening the position* --
+//!     "realization utility," a direct utility kick from locking in a gain right
+//!     at its best point, not just a function of the gain's size. `step()` tracks
+//!     `position_high_water_mark` (the running high of `mid` since the current
+//!     position was opened, resetting whenever the agent goes flat, same
+//!     lifecycle as `avg_entry_price`) and adds an extra boost to the
+//!     spontaneous-sell probability when price is at or near that high --
+//!     on top of, not instead of, the existing unrealized-gain term. This is
+//!     what lets a sustained rally get interrupted by real profit-taking right
+//!     near its local peaks, not just whenever the cumulative gain happens to be
+//!     large; see `realization_utility_scale`/`realization_utility_window`'s
+//!     field comments.
+//!   - **Rising-trend profit-taking override + fast-crash panic selling
+//!     (2026-10-24)**: direct user feedback -- "when a human is on a rising
+//!     stock they should sometimes sell. Also if stocks fall really fast
+//!     they should sell." Two gaps the biases above didn't cover: (1) every
+//!     bias so far that can turn a would-be *buy* into a sell
+//!     (`spontaneous_take_profit`) only ever fires on a *quiet* wake, i.e.
+//!     one where the signal path didn't already decide to buy -- a strongly
+//!     bullish signal always bought more, with nothing modeling a trader who
+//!     sells *into* a rally instead of chasing it further ("sell the rip").
+//!     `rising_profit_take_prob_scale`/`rising_profit_take_max_prob` fix this
+//!     directly: whenever the ordinary signal path was about to buy and this
+//!     agent is sitting on an open gain, roll a probability (scaled by the
+//!     same CPT value of the unrealized gain used everywhere else in this
+//!     file, capped so it never dominates buying outright) to flip that buy
+//!     into a profit-take sell instead. (2) the disposition effect below is
+//!     specifically "hold and hope" on a loss -- by design, the deeper the
+//!     loss, the *less* eager this agent is to sell, which is realistic for
+//!     an ordinary bad day but wrong for a real crash: capitulation selling
+//!     is a documented override of that exact hold instinct once a drop is
+//!     sharp and fast enough, not just "a sell signal that happens to be
+//!     bigger." `panic_sell` is computed independently of the ordinary
+//!     signal-acts roll (so it can act through a wake inertia would normally
+//!     have skipped) off `price_component` -- the raw, belief-independent
+//!     price move, not this agent's own chartist/contrarian-adjusted
+//!     reading, since panic is a reaction to what the tape actually did, not
+//!     to this agent's own theory about it -- once the drop clears a higher
+//!     bar than the ordinary alert dead zone (`panic_sell_signal_multiple`)
+//!     *and* the fall is still actively in progress (`prev_price_component`
+//!     was also negative -- a revision made the same day, direct user
+//!     request: "only do if it's really bad and the falling hasn't stopped
+//!     yet", since a single severe wake could just as easily be a move that
+//!     already bottomed out and started recovering by the time this agent
+//!     next checks in -- panicking into a bounce isn't the behavior being
+//!     modeled). When it fires, it forces the side to Sell regardless of what the
+//!     ordinary signal said (even a contrarian "buy the dip" read) and
+//!     applies `panic_sell_qty_mult` on top of, not instead of, the usual
+//!     sizing -- bypassing the loss-hold suppression below rather than
+//!     feeding into it, since the whole point is that panic overrides "hold
+//!     and hope" rather than being a more extreme version of it.
+//!   - **Slow-bleed capitulation (2026-10-25)**: measured directly (a diversity
+//!     sweep after the fundamental-vol/market_maker-coverage/depth-collapse engine
+//!     fixes) that humans still trade overwhelmingly one-sided -- and, cross-
+//!     checking against which compositions got worse, specifically the ones with
+//!     net-negative growth. The mechanism: `panic_sell` above only fires for an
+//!     acute, fast, *ongoing* crash (`panic_sell_signal_multiple` clears a high bar
+//!     this wake *and* last wake), and the disposition effect's "hold and hope"
+//!     only ever *shrinks* a sell this agent was already about to make -- neither
+//!     one gives an agent stuck on the wrong side of a slow, grinding decline (no
+//!     single wake severe enough to panic over, but a real, sustained loss) any
+//!     way to ever sell, if its own raw_signal (e.g. a fundamentalist-leaning
+//!     agent reading "it's cheap, buy more" through the whole decline) never once
+//!     points Sell. That agent's entire trade history for the rest of the run is
+//!     100% buys -- not because it's rationally averaging down forever, but
+//!     because nothing in this file lets a real person's patience for a bad
+//!     position run out gradually, only acutely (panic) or never (hold and hope).
+//!     Real retail capitulation after a prolonged drawdown -- "I can't watch this
+//!     anymore" -- is exactly this gradual-exhaustion case, documented separately
+//!     from panic selling in the disposition-effect literature. `wakes_underwater`
+//!     (new state, reset whenever the agent goes flat or the position returns to a
+//!     gain) counts consecutive wakes spent at an unrealized loss; past
+//!     `capitulation_fatigue_threshold_wakes`, a `capitulation_sell` trigger --
+//!     independent of `raw_signal`'s direction, same construction as `panic_sell`
+//!     -- fires with probability scaling in the *excess* wake count, and, like
+//!     `panic_sell_qty_mult`, applies `capitulation_qty_mult` to override (not feed
+//!     into) the ordinary loss-hold suppression, since the whole point is that the
+//!     hold instinct is what's finally giving out.
 //!   - **Disposition effect via Cumulative Prospect Theory (2026-09-13)**: hold
 //!     losers too long, sell winners too early -- probably the most robust
 //!     documented bias in retail trading (Odean 1998). Previously modeled as two
@@ -287,13 +454,161 @@ pub struct State {
     pub last_seen_inventory: f64,
     pub avg_entry_price: Option<f64>,
     pub recent_pnl_frac: f64,
-    /// Rolling, decayed fitness (realized hypothetical payoff) of the chartist and
-    /// fundamentalist signals -- see the module doc comment's Brock-Hommes section.
-    /// Updated each wake from what actually happened since the *previous* one, using
-    /// `last_chartist_signal`/`last_fundamentalist_signal` (that previous wake's
-    /// signals, i.e. what each strategy "predicted" then).
+    /// Running high of `mid` since the current position was opened (module doc
+    /// comment's "Realization utility" section) -- `None` while flat, same
+    /// lifecycle as `avg_entry_price`. Updated every wake in `step()`.
+    pub position_high_water_mark: Option<f64>,
+    /// Scale on the extra spontaneous-sell urge from being at/near
+    /// `position_high_water_mark` (see `step()`'s `spontaneous_take_profit`
+    /// roll). 0 = this reference point is ignored entirely (old behavior: only
+    /// raw unrealized gain from entry matters).
+    pub realization_utility_scale: f64,
+    /// How far below `position_high_water_mark` (as a fraction of it) still
+    /// counts as "near" it for the realization-utility boost -- 0.15 means the
+    /// boost fades out linearly between the high itself and 15% below it, then
+    /// contributes nothing further down. Calibrates the *width* of "near a new
+    /// high," not whether the effect exists at all (`realization_utility_scale`
+    /// does that).
+    pub realization_utility_window: f64,
+    /// Per-wake probability *scale* for the signal-independent profit-taking urge
+    /// (module doc comment's "Spontaneous profit-taking" section) -- the actual
+    /// roll each wake is `(this * cpt_value(unrealized_gain)).clamp(0, 1)`, so a
+    /// bigger open gain makes the urge fire more often, not just this flat rate
+    /// every time. Only ever considered when the signal-driven path this wake
+    /// didn't already act (see `step()`), and only for a gain (`cpt_value >= 0`)
+    /// -- a loss has no spontaneous-sell counterpart, consistent with "hold and
+    /// hope" being the whole point of the loss side of the disposition effect.
+    /// 0 = this bias is off entirely (old behavior: profit-taking only ever rides
+    /// along with a real signal).
+    pub spontaneous_profit_taking_rate: f64,
+    /// Module doc comment's "More extreme profit-taking at large gains" section:
+    /// exponent applied to the CPT value before it scales the spontaneous
+    /// take-profit probability. 1.0 = old behavior (linear in `v`, itself already
+    /// concave in the raw gain via `cpt_alpha`); higher = the probability grows
+    /// faster than the gain itself, concentrating realized profit-taking onto
+    /// genuinely large winners rather than spreading it evenly across any gain.
+    pub spontaneous_profit_convexity: f64,
+    /// Module doc comment's "Rising-trend profit-taking override" section:
+    /// scale on how much the current unrealized gain's CPT value (the same
+    /// one used by the disposition effect below) converts into a per-wake
+    /// probability of flipping an otherwise-buy signal into a profit-take
+    /// sell instead. 0 = this override never fires (old behavior: a bullish
+    /// signal always buys).
+    pub rising_profit_take_prob_scale: f64,
+    /// Ceiling on the probability above -- without one, a large enough gain
+    /// could make this override near-certain, which would mean this agent
+    /// effectively never buys into its own winners again, not "sometimes
+    /// sells into strength."
+    pub rising_profit_take_max_prob: f64,
+    /// Module doc comment's "fast-crash panic selling" section: how many
+    /// multiples of `price_signal_threshold`-normalized return
+    /// (`price_component`) a drop must clear, beyond the ordinary act-at-all
+    /// dead zone (1.0), before it counts as a "crash" worth panicking over --
+    /// not just an everyday down move, which the ordinary signal path
+    /// (disposition-suppressed) already handles. Deliberately a high bar
+    /// (2026-10-24 revision, direct user request -- "only do if it's really
+    /// bad"): panic selling is reserved for genuinely severe drops, not a
+    /// slightly-bigger-than-usual one.
+    pub panic_sell_signal_multiple: f64,
+    /// Previous wake's `price_component` (module doc comment's "fast-crash
+    /// panic selling" section, 2026-10-24 revision) -- lets `step()` check
+    /// whether a fall is still actively in progress across two consecutive
+    /// check-ins, not just whether this single wake's move was severe. Reset
+    /// implicitly to 0.0 at construction (no prior wake yet).
+    pub prev_price_component: f64,
+    /// Scale on how far the drop clears `panic_sell_signal_multiple` (the
+    /// "crash excess") that converts into this wake's panic-sell
+    /// probability. 0 = panic selling never fires (old behavior: losses are
+    /// only ever sold via the disposition-suppressed ordinary signal path).
+    pub panic_sell_prob_scale: f64,
+    /// Multiplier applied to the sell quantity once panic selling fires, on
+    /// top of (applied after, not instead of) the ordinary CPT-based sizing
+    /// -- this is what makes panic selling an *override* of "hold and hope"
+    /// rather than just another input into it. 1.0 = no extra dump beyond
+    /// whatever the normal sizing already produced.
+    pub panic_sell_qty_mult: f64,
+    /// Module doc comment's "Slow-bleed capitulation" section: consecutive wakes
+    /// spent with an open position at an unrealized loss (CPT value < 0). Reset to
+    /// 0 whenever the agent goes flat or the position's CPT value is >= 0 (back to
+    /// even or in a gain) -- this tracks *duration of an unbroken bad stretch*,
+    /// not a lifetime count.
+    pub wakes_underwater: u32,
+    /// How many consecutive underwater wakes (`wakes_underwater`) before fatigue
+    /// starts contributing to a capitulation-sell probability at all -- below
+    /// this, "hold and hope" is still the whole story, same as before this
+    /// mechanism existed. Calibrated in wakes, not seconds, since this agent's own
+    /// check-in cadence already varies (background vs. alert wakes).
+    pub capitulation_fatigue_threshold_wakes: f64,
+    /// Scale on how far `wakes_underwater` clears the threshold above (the
+    /// "fatigue excess") that converts into this wake's capitulation-sell
+    /// probability -- same shape as `panic_sell_prob_scale` for the acute case.
+    /// 0 = this bias never fires (old behavior: a slow bleed can be held forever).
+    pub capitulation_fatigue_prob_scale: f64,
+    /// Multiplier applied to the sell quantity once capitulation fires, overriding
+    /// (not feeding into) the ordinary loss-hold suppression just like
+    /// `panic_sell_qty_mult` -- the point of this mechanism is specifically that
+    /// the hold instinct runs out, so applying the hold-and-hope shrink on top
+    /// would defeat it.
+    pub capitulation_qty_mult: f64,
+    /// Rolling, *biased* fitness (realized hypothetical payoff) of the chartist and
+    /// fundamentalist signals -- see the module doc comment's "biased, not accurate,
+    /// self-scoring" section. Updated each wake from what actually happened since
+    /// the *previous* one, using `last_chartist_signal`/`last_fundamentalist_signal`
+    /// (that previous wake's signals, i.e. what each strategy "predicted" then).
     pub chartist_fitness: f64,
     pub fundamentalist_fitness: f64,
+    /// Rolling, *biased* fitness of betting *against* last wake's chartist
+    /// signal -- module doc comment's "Chartist vs. contrarian sub-switching"
+    /// section. Updated by the exact same salience/confirmation-bias mechanism
+    /// as `chartist_fitness`/`fundamentalist_fitness` just above, sharing the
+    /// same `confirmation_bias_strength` too -- tried a separate, weaker value
+    /// for this switch specifically (2026-10-23), reasoning that a loser
+    /// should catch back up faster; confirmed directly it made every diversity
+    /// measure worse, not better (a less-biased updater converges *faster*
+    /// onto whichever sub-strategy is objectively winning the market's current
+    /// trend, concentrating the population rather than spreading it). The bias
+    /// staying strong is what keeps genuine disagreement alive. With the
+    /// mirror-image payoff (`-last_chartist_signal.signum() * raw_return`), a
+    /// logistic blend of this against `chartist_fitness` decides, per wake,
+    /// how much this agent's chartist reading flips against the raw momentum
+    /// signal rather than following it -- see the blend site in `step()`.
+    ///
+    /// Initialized to a tiny per-agent random value, Uniform(
+    /// -`contrarian_initial_bias`, `contrarian_initial_bias`), *not* a flat
+    /// 0.0 -- both fitnesses start at 0 so a hard tie needs breaking somehow,
+    /// and always breaking it the same way (confirmed directly: tie always
+    /// favored trend-follow) gave trend-following a population-wide first-mover
+    /// advantage that confirmation bias then locked in almost permanently, no
+    /// matter how well contrarian would objectively have scored. A random
+    /// per-agent nudge means roughly half the population starts slightly
+    /// contrarian-leaning instead, which is what actually produced the
+    /// population-level diversity this mechanism exists for; see `step()`'s
+    /// `leans_trend_follow` for where the tie still has to resolve somehow.
+    pub contrarian_fitness: f64,
+    /// Base learning rate for the fitness update at *unit* salience and on
+    /// *confirming* evidence -- the old, plain Brock-Hommes decay used a fixed 0.3
+    /// unconditionally; this is that same baseline, now the starting point before
+    /// `salience`/`confirmation_bias_strength` scale it up or down per update.
+    pub fitness_learning_rate: f64,
+    /// How much a *vivid* (large-magnitude) realized move amplifies this update's
+    /// learning rate above the baseline -- "flashbulb memory": a single dramatic
+    /// win/loss should dominate this agent's impression of which strategy is
+    /// working far more than a smooth, size-blind average would. 0 = size never
+    /// matters (back to plain Brock-Hommes); higher = more of the agent's belief
+    /// about "what's working" comes from its single most dramatic recent outcome.
+    pub salience_sensitivity: f64,
+    /// Ceiling on the salience multiplier above -- without one, a single extreme
+    /// move could push the effective learning rate past 1.0, which would flip the
+    /// *sign* of retained old fitness in the convex combination below (nonsense,
+    /// not "very forgetful").
+    pub salience_cap: f64,
+    /// Multiplier applied to this update's learning rate when the realized payoff
+    /// *contradicts* whichever strategy this agent is currently leaning toward
+    /// (`chartist_fitness >= fundamentalist_fitness` or the reverse) -- see the
+    /// module doc comment. 1.0 = symmetric/rational (equally fast to learn you were
+    /// right or wrong, the original Brock-Hommes behavior); lower = genuine
+    /// confirmation bias, slower to accept the current lean was the wrong one.
+    pub confirmation_bias_strength: f64,
     pub last_chartist_signal: f64,
     pub last_fundamentalist_signal: f64,
     /// This agent's own currently-resting buy limit order, if any: `(order_id,
@@ -369,8 +684,98 @@ impl State {
             last_seen_inventory: 0.0,
             avg_entry_price: None,
             recent_pnl_frac: 0.0,
+            position_high_water_mark: None,
+            // Default 0.12: right at a position's own post-entry high, this
+            // adds a flat +0.12 to the spontaneous-sell roll probability --
+            // comparable to what a large (50%+) unrealized gain already
+            // contributes via the CPT term alone, which is the point: being at
+            // a new high should feel like roughly as strong a reason to lock
+            // in as a big raw gain does, per Barberis & Xiong.
+            realization_utility_scale: params::get_f64(p, "realization_utility_scale", 0.12),
+            realization_utility_window: params::get_f64(p, "realization_utility_window", 0.15),
+            // Default 0.25 (raised from 0.15, 2026-10-25, alongside the new
+            // convexity exponent below): calibrated so the *50%-gain* case stays
+            // anchored at roughly the same ~9% per wake this already had, while
+            // convexity does the work of pulling small and huge gains apart from
+            // that anchor in opposite directions -- see
+            // `spontaneous_profit_convexity`'s own comment for the worked
+            // examples at the low and high end.
+            spontaneous_profit_taking_rate: params::get_f64(p, "spontaneous_profit_taking_rate", 0.25),
+            // Default 1.8: with the 0.25 rate above, a modest 5% open gain
+            // (cpt_value ~0.07) now fires only ~0.2% of the time (down from ~1%)
+            // -- genuinely rare, consistent with "a small gain alone isn't a
+            // reason to sell." A 50% gain (cpt_value ~0.54) stays anchored at
+            // ~9%, matching the old un-convex behavior there by construction. A
+            // 100% gain (cpt_value 1.0) jumps to 25% per wake, and a 200% gain
+            // (cpt_value ~1.84) to ~75% -- a genuinely outsized winner gets
+            // realized within one or two wakes almost for certain, modeling real
+            // profit-taking euphoria on a huge run rather than a flat per-percent
+            // rate that treats a 20% gain and a 200% gain as differing only
+            // linearly.
+            spontaneous_profit_convexity: params::get_f64(p, "spontaneous_profit_convexity", 1.8),
+            // Default 0.25: at a modest 5% open gain (cpt_value ~0.07) that's
+            // roughly a 1.75% chance per qualifying buy-signal wake of
+            // selling into strength instead; at a large 50% gain (cpt_value
+            // ~0.59) it's ~15% -- noticeable but still the minority outcome,
+            // same calibration philosophy as `spontaneous_profit_taking_rate`.
+            rising_profit_take_prob_scale: params::get_f64(p, "rising_profit_take_prob_scale", 0.25),
+            // Default 0.45: even at an extreme gain, this agent still buys
+            // into its own winner more often than not -- this is "sometimes
+            // sells into strength," not "stops buying winners."
+            rising_profit_take_max_prob: params::get_f64(p, "rising_profit_take_max_prob", 0.45).clamp(0.0, 1.0),
+            // Default 4.0 (raised from an earlier 2.5, 2026-10-24, direct
+            // user request -- "only do if it's really bad"): well past the
+            // ordinary alert dead zone (1.0), and past where the earlier
+            // default sat too -- panic is reserved for a drop that's
+            // genuinely severe, not just sharper/faster than the everyday
+            // moves the ordinary signal path already reacts to.
+            panic_sell_signal_multiple: params::get_f64(p, "panic_sell_signal_multiple", 4.0),
+            prev_price_component: 0.0,
+            // Default 0.3: one full unit of crash excess beyond the
+            // multiple above gives a 30% chance this wake; two units, 60%;
+            // clamped at 1.0 beyond that -- a real crash doesn't guarantee
+            // this specific agent sells on this specific wake, but makes it
+            // likely within a few.
+            panic_sell_prob_scale: params::get_f64(p, "panic_sell_prob_scale", 0.3),
+            // Default 2.0: once panicking, this agent dumps roughly twice
+            // what the ordinary signal-driven sizing alone would have sold
+            // -- a real capitulation sale, not a slightly-larger-than-usual
+            // one.
+            panic_sell_qty_mult: params::get_f64(p, "panic_sell_qty_mult", 2.0).max(1.0),
+            wakes_underwater: 0,
+            // Default 20: at this agent's own average check-in interval
+            // (`background_wake_min`/`max`'s midpoint, ~21.5 min at the defaults
+            // above), 20 straight underwater wakes is roughly 7 hours of sustained
+            // paper loss with no relief -- long enough that this is a real
+            // prolonged drawdown, not just an ordinary bad afternoon the acute
+            // `panic_sell` dead zone already leaves alone.
+            capitulation_fatigue_threshold_wakes: params::get_f64(p, "capitulation_fatigue_threshold_wakes", 20.0),
+            // Default 0.05: linear in the fatigue excess, reaching a 100% roll at
+            // 20 wakes past the threshold above -- a real person's patience runs
+            // out gradually over the following days, not all at once the moment
+            // the threshold clears.
+            capitulation_fatigue_prob_scale: params::get_f64(p, "capitulation_fatigue_prob_scale", 0.05),
+            // Default 1.5: more modest than panic_sell_qty_mult's 2.0 -- this is
+            // "finally giving up on a slow bleed," not a frantic crash dump.
+            capitulation_qty_mult: params::get_f64(p, "capitulation_qty_mult", 1.5).max(1.0),
             chartist_fitness: 0.0,
             fundamentalist_fitness: 0.0,
+            contrarian_fitness: {
+                let eps = params::get_f64(p, "contrarian_initial_bias", 0.02).abs();
+                if eps > 0.0 { rng.gen_range(-eps..eps) } else { 0.0 }
+            },
+            fitness_learning_rate: params::get_f64(p, "fitness_learning_rate", 0.3),
+            // Calibrated so a "big" move (2x price_signal_threshold) roughly
+            // doubles the confirming-evidence learning rate (0.3 -> ~0.6):
+            // noticeably more vivid-move-dominated than plain Brock-Hommes
+            // without being able to single-move overwrite all prior fitness.
+            salience_sensitivity: params::get_f64(p, "salience_sensitivity", 1.5),
+            salience_cap: params::get_f64(p, "salience_cap", 3.0),
+            // Default 0.35: disconfirming evidence is absorbed roughly a third
+            // as fast as confirming evidence -- a real, sticky bias, not a
+            // rounding-error-sized one, but not so extreme the agent never
+            // revises a wrong lean either.
+            confirmation_bias_strength: params::get_f64(p, "confirmation_bias_strength", 0.35),
             last_chartist_signal: 0.0,
             last_fundamentalist_signal: 0.0,
             // See module doc comment's "too smart to fail" section. Both
@@ -516,6 +921,24 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         }
     }
     s.last_seen_inventory = inventory;
+    // Realization-utility reference point (module doc comment): tracks the
+    // running high of `mid` for as long as this position stays open, reset
+    // once the agent goes flat so the next position starts its own high fresh
+    // -- same lifecycle as `avg_entry_price` just above.
+    s.position_high_water_mark = if inventory > 1e-9 {
+        Some(mid.max(s.position_high_water_mark.unwrap_or(mid)))
+    } else {
+        None
+    };
+
+    // Slow-bleed capitulation tracking (module doc comment): counts consecutive
+    // wakes spent holding a position at an unrealized loss. Reset (not just
+    // decayed) the moment the agent goes flat or the position is back to even or
+    // better -- this measures an unbroken bad stretch, so any relief clears it,
+    // the same lifecycle as `avg_entry_price`/`position_high_water_mark` above.
+    let currently_underwater = inventory > 1e-9
+        && s.avg_entry_price.is_some_and(|entry| mid < entry);
+    s.wakes_underwater = if currently_underwater { s.wakes_underwater + 1 } else { 0 };
 
     // Realized return since last check-in, time-normalized the same way regardless
     // of which downstream use it feeds (chartist signal below, and the Brock-Hommes
@@ -529,20 +952,54 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     let elapsed = ctx.now - s.last_wake_time.unwrap_or(ctx.now);
     let time_norm = (elapsed / reference_interval.max(1e-9)).sqrt().max(0.3);
 
-    // Brock & Hommes (1998) fitness update: score last wake's chartist and
-    // fundamentalist signals against what the price *actually* did since then. A
-    // signal that correctly anticipated the direction of `raw_return` gets a
-    // positive contribution (scaled by the return's own magnitude, so being right
-    // about a big move matters more than being right about noise); decayed like
-    // `recent_pnl_frac` above so this tracks recent form, not a lifetime average --
-    // consistent with Brock-Hommes' own emphasis on fast strategy-switching being
-    // what drives the endogenous bubble/crash dynamics their model produces.
+    // Biased fitness update (module doc comment's "biased, not accurate,
+    // self-scoring" section): score last wake's chartist and fundamentalist
+    // signals against what the price *actually* did since then, same as plain
+    // Brock-Hommes -- but absorbed at a *variable* rate, not the original fixed
+    // 0.3, so the result is a sticky, salience-skewed impression rather than an
+    // accurate running tally.
     //
     // `Variant::Lite` skips this update entirely (and the logistic blend below) --
     // see the variant doc comment for why.
     if s.variant == Variant::Retail {
-        s.chartist_fitness = 0.7 * s.chartist_fitness + 0.3 * (s.last_chartist_signal.signum() * raw_return);
-        s.fundamentalist_fitness = 0.7 * s.fundamentalist_fitness + 0.3 * (s.last_fundamentalist_signal.signum() * raw_return);
+        let leans_chartist = s.chartist_fitness >= s.fundamentalist_fitness;
+        let chartist_payoff = s.last_chartist_signal.signum() * raw_return;
+        let fundamentalist_payoff = s.last_fundamentalist_signal.signum() * raw_return;
+        // Mirror image of `chartist_payoff` by construction (module doc
+        // comment's "Chartist vs. contrarian sub-switching" section): betting
+        // against last wake's chartist signal scores exactly the opposite of
+        // betting with it.
+        let contrarian_payoff = -chartist_payoff;
+        let leans_trend_follow = s.chartist_fitness >= s.contrarian_fitness;
+
+        // Salience: this update's realized move, relative to this agent's own
+        // "one unit" price-signal threshold, scales the learning rate up the
+        // more dramatic it was -- a quiet move teaches almost nothing new, a
+        // big one can dominate the agent's whole impression at once.
+        let salience = |payoff: f64| 1.0 + s.salience_sensitivity * (payoff.abs() / s.price_signal_threshold.max(1e-9)).min(s.salience_cap);
+
+        // Confirmation bias: full-rate learning when this payoff confirms
+        // whichever strategy the agent is *currently* leaning toward;
+        // discounted when it says the current lean was wrong.
+        let confirms_chartist = leans_chartist == (chartist_payoff >= 0.0);
+        let confirms_fundamentalist = !leans_chartist == (fundamentalist_payoff >= 0.0);
+        let chartist_rate = (s.fitness_learning_rate * salience(chartist_payoff) * if confirms_chartist { 1.0 } else { s.confirmation_bias_strength }).clamp(0.0, 0.95);
+        let fundamentalist_rate = (s.fitness_learning_rate * salience(fundamentalist_payoff) * if confirms_fundamentalist { 1.0 } else { s.confirmation_bias_strength }).clamp(0.0, 0.95);
+
+        s.chartist_fitness = (1.0 - chartist_rate) * s.chartist_fitness + chartist_rate * chartist_payoff;
+        s.fundamentalist_fitness = (1.0 - fundamentalist_rate) * s.fundamentalist_fitness + fundamentalist_rate * fundamentalist_payoff;
+
+        // Same salience/confirmation-bias update, one level deeper: whether
+        // *this* agent currently leans trend-following or contrarian (not
+        // chartist-vs-fundamentalist -- a separate, independent lean; an agent
+        // can trust momentum-type reasoning over value reasoning while also
+        // thinking the current move specifically is due to reverse). Only
+        // `contrarian_fitness` is new state here -- `chartist_fitness` already
+        // *is* "how well trend-following has paid off," updated above at
+        // `chartist_rate`, so it's reused as-is rather than updated twice.
+        let confirms_contrarian = !leans_trend_follow == (contrarian_payoff >= 0.0);
+        let contrarian_rate = (s.fitness_learning_rate * salience(contrarian_payoff) * if confirms_contrarian { 1.0 } else { s.confirmation_bias_strength }).clamp(0.0, 0.95);
+        s.contrarian_fitness = (1.0 - contrarian_rate) * s.contrarian_fitness + contrarian_rate * contrarian_payoff;
     }
 
     // Chartist (momentum) component: "it's been going up, so it'll keep going up."
@@ -562,7 +1019,25 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     // separate proxy signal with no principled anchor.
     let fair_value = *ctx.market.fundamental_value.get(&s.asset_id).unwrap_or(&mid);
     let deviation = (mid - fair_value) / fair_value.max(1e-9);
-    let fundamentalist_component = -deviation / s.fundamentalist_signal_threshold.max(1e-9);
+    // Capped (2026-10-28): unlike `price_component` above, whose input (a recent
+    // return) is naturally bounded by how far price can move in one wake,
+    // `deviation` has no such ceiling -- once `mid` has already drifted far from
+    // `fair_value` (e.g. after a prior leg traded at this bot's own 0.5x-2x
+    // `believed_value` clamp, see that clamp's doc comment below), dividing a
+    // 50%+ deviation by the tiny default `fundamentalist_signal_threshold`
+    // (0.02) produces a component in the tens, which alone is then enough to
+    // slam the *next* wake's `believed_value` straight to the opposite clamp
+    // extreme -- turning what should be gentle mean-reversion into a
+    // self-sustaining overshoot. Confirmed directly: a `human_27_5pct` leg
+    // where no bots happened to trade saw humans alone clear 19 trades at
+    // ~0.5x fair value, the clamp bound, with no single-trade or circuit-
+    // breaker anomaly behind it -- just this term pushing belief there on its
+    // own. Only the magnitude is capped, not the sign, and the uncapped
+    // `fundamentalist_component` computed here is still what feeds
+    // `last_fundamentalist_signal` for Brock-Hommes fitness tracking below
+    // (via its `.signum()`, which this cap can't change) -- this only tames how
+    // hard a single already-large deviation can push *this* wake's own belief.
+    let fundamentalist_component = (-deviation / s.fundamentalist_signal_threshold.max(1e-9)).clamp(-8.0, 8.0);
 
     // Logistic blend of the two by fitness difference (Brock-Hommes' "intensity of
     // choice" applied to a 2-strategy case simplifies to a sigmoid of the fitness
@@ -581,7 +1056,32 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         }
         Variant::Lite => s.lite_blend_weight,
     };
-    let trend_component = chartist_weight * price_component + (1.0 - chartist_weight) * fundamentalist_component;
+
+    // Chartist vs. contrarian sub-blend (module doc comment's "Chartist vs.
+    // contrarian sub-switching" section) -- how much this agent's own momentum
+    // reading flips against `price_component` rather than following it.
+    // *Not* the same symmetric logistic shape as the blend just above: that
+    // blend picks between two genuinely independent strategies, so a 50/50 tie
+    // is a sensible "average them" default. Trend-follow and contrarian here
+    // are exact opposites of the same reading, so a naive 50/50 blend between
+    // them cancels to exactly zero -- which would silently erase the momentum
+    // signal for every agent at its fitness-neutral starting point (both at
+    // 0.0, confirmed directly: broke a disposition-effect test depending on a
+    // real sell signal from a fresh, never-stepped agent). Contrarian weight
+    // instead ramps up from 0 (pure trend-follow, the original, unmodified
+    // default, matching the Lite-variant behavior below) only once
+    // `contrarian_fitness` genuinely overtakes `chartist_fitness`, saturating
+    // toward 1 (full flip) as that lead grows -- never engaged while
+    // trend-following is still winning or tied.
+    let chartist_signal = match s.variant {
+        Variant::Retail => {
+            let contrarian_gap = s.intensity_of_choice * (s.contrarian_fitness - s.chartist_fitness);
+            let contrarian_weight = (1.0 / (1.0 + (-contrarian_gap).exp()) - 0.5).max(0.0) * 2.0;
+            (1.0 - 2.0 * contrarian_weight) * price_component
+        }
+        Variant::Lite => price_component,
+    };
+    let trend_component = chartist_weight * chartist_signal + (1.0 - chartist_weight) * fundamentalist_component;
 
     // Mood component: the latent, price-independent sentiment process, read with
     // individual perception noise (no two people read "the mood" identically) and
@@ -606,6 +1106,14 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     s.last_wake_time = Some(ctx.now);
     s.last_chartist_signal = price_component;
     s.last_fundamentalist_signal = fundamentalist_component;
+    // Fast-crash panic selling (module doc comment) needs to know whether the
+    // fall was already underway *before* this wake, not just whether this
+    // wake's own move was severe -- captured into a local before this wake's
+    // `price_component` overwrites it, so the "still falling" check below
+    // compares two genuinely separate sample points rather than one value
+    // against itself.
+    let prior_price_component = s.prev_price_component;
+    s.prev_price_component = price_component;
 
     // Convex (not linear) response with a dead zone: no reaction below the combined
     // threshold, then intensity grows faster than the signal itself past it --
@@ -621,10 +1129,112 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     let intensity = excess.powf(s.fomo_exponent).min(1.2);
     // Inertia: noticing a signal doesn't mean acting on it -- rolled once per wake,
     // not per potential trade, so it's a real "decided not to today", not a size cut.
-    let acts_this_time = intensity > 0.0 && agent.rng.gen_bool(s.p_act_given_signal);
+    let signal_acts = intensity > 0.0 && agent.rng.gen_bool(s.p_act_given_signal);
+
+    // Spontaneous profit-taking (module doc comment's "Spontaneous profit-taking"
+    // section): only considered when the signal path above *didn't* already give
+    // this wake a reason to act -- this fills the gap on an otherwise flat/quiet
+    // tape, it doesn't pile onto a wake that's already trading. Fires purely off
+    // the unrealized gain on the current position, never a loss (CPT value < 0
+    // is "hold and hope," not a trigger to act).
+    let spontaneous_take_profit = !signal_acts
+        && s.avg_entry_price.is_some_and(|entry| {
+            let r = (mid - entry) / entry.max(1e-9);
+            let v = cpt_value(r, s.cpt_alpha, s.cpt_beta, s.cpt_lambda);
+            // Realization utility (module doc comment's "Realization utility
+            // near a position's own high" section): an extra, additive urge to
+            // sell specifically near this position's `position_high_water_mark`
+            // -- on top of, not instead of, the plain unrealized-gain term just
+            // above. Fades linearly to 0 once price has pulled back
+            // `realization_utility_window` below that high.
+            let near_high = s.position_high_water_mark.map_or(0.0, |hwm| {
+                let pullback = ((hwm - mid) / hwm.max(1e-9)).max(0.0);
+                (1.0 - (pullback / s.realization_utility_window.max(1e-9)).min(1.0)) * s.realization_utility_scale
+            });
+            // Convexity on top of the plain CPT value (module doc comment's
+            // "More extreme profit-taking at large gains" section, 2026-10-25):
+            // `v` alone is already *concave* in the raw gain (`cpt_alpha` < 1),
+            // which compresses the probability gap between a modest and a huge
+            // winner. Raising it to `spontaneous_profit_convexity` (> 1) widens
+            // that gap back out and past linear -- a modest 5-20% gain fires only
+            // rarely, while a genuinely large winner (triple digits) becomes a
+            // near-certainty to realize *some* of within a few wakes, matching
+            // real profit-taking euphoria on outsized winners rather than a flat
+            // per-percent-of-gain rate.
+            let scaled_v = v.max(0.0).powf(s.spontaneous_profit_convexity);
+            v > 0.0 && agent.rng.gen_bool((s.spontaneous_profit_taking_rate * scaled_v + near_high).clamp(0.0, 1.0))
+        });
+
+    // Fast-crash panic selling (module doc comment's "Rising-trend profit-taking
+    // override + fast-crash panic selling" section): computed independently of
+    // `signal_acts`, like `spontaneous_take_profit`, so a sharp enough drop can
+    // push this agent to act through a wake the ordinary inertia roll would
+    // otherwise have skipped. Uses `price_component` -- the raw, belief-
+    // independent price move -- not this agent's own chartist/contrarian-
+    // adjusted reading, since panic reacts to what the tape actually did, not
+    // to this agent's theory about it. Requires an open long position (never
+    // short, same rule as everywhere else in this file).
+    //
+    // Two gates, both required (2026-10-24 revision, direct user request --
+    // "only do if it's really bad and the falling hasn't stopped yet"):
+    // `panic_sell_signal_multiple` alone already picks out a genuinely severe
+    // move (well past the ordinary alert dead zone), but a single severe wake
+    // could just as easily be a move that already bottomed out and started
+    // recovering by the time this agent notices -- panicking into a bounce
+    // isn't the behavior being modeled. `prior_price_component < 0.0` requires
+    // the *previous* wake's move to also have been a fall, so this only fires
+    // while the decline is still actively in progress across consecutive
+    // check-ins, not off one dramatic-but-possibly-already-over data point.
+    let panic_sell = inventory > 1e-9 && prior_price_component < 0.0 && {
+        let crash_excess = (-price_component - s.panic_sell_signal_multiple).max(0.0);
+        crash_excess > 0.0 && agent.rng.gen_bool((s.panic_sell_prob_scale * crash_excess).clamp(0.0, 1.0))
+    };
+
+    // Slow-bleed capitulation (module doc comment): the chronic counterpart to
+    // `panic_sell`'s acute one. Independent of `raw_signal`'s direction, same
+    // construction as `panic_sell`/`spontaneous_take_profit` -- so an agent whose
+    // own signal has stayed stubbornly bullish through a long, grinding decline
+    // (e.g. a fundamentalist reading "it's cheap, buy more" the whole way down)
+    // still gets a way out eventually, not an infinite hold. Gated on
+    // `wakes_underwater` alone (duration), not this wake's price move at all --
+    // unlike panic_sell, a slow bleed by definition has no single severe wake to
+    // react to.
+    let capitulation_sell = inventory > 1e-9 && {
+        let fatigue_excess = (s.wakes_underwater as f64 - s.capitulation_fatigue_threshold_wakes).max(0.0);
+        fatigue_excess > 0.0 && agent.rng.gen_bool((s.capitulation_fatigue_prob_scale * fatigue_excess).clamp(0.0, 1.0))
+    };
+
+    let acts_this_time = signal_acts || spontaneous_take_profit || panic_sell || capitulation_sell;
 
     if acts_this_time {
-        let side = if raw_signal > 0.0 { Side::Buy } else { Side::Sell };
+        // `spontaneous_take_profit`/`panic_sell`/`capitulation_sell` only ever
+        // reach here on their own terms (independent of `signal_acts`, see
+        // above), so there's no real `raw_signal` direction to defer to -- all
+        // three are always a sell, by construction (module doc comment).
+        let mut side = if spontaneous_take_profit || panic_sell || capitulation_sell {
+            Side::Sell
+        } else if raw_signal > 0.0 {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
+
+        // Rising-trend profit-taking override (module doc comment): even
+        // when the ordinary signal path was about to buy more, sometimes
+        // sell into strength instead -- only considered when this wasn't
+        // already forced to Sell by the two cases above, and only when
+        // there's an actual open gain to take.
+        if side == Side::Buy {
+            if let Some(entry) = s.avg_entry_price {
+                if inventory > 1e-9 {
+                    let r = (mid - entry) / entry.max(1e-9);
+                    let v = cpt_value(r, s.cpt_alpha, s.cpt_beta, s.cpt_lambda);
+                    if v > 0.0 && agent.rng.gen_bool((s.rising_profit_take_prob_scale * v).min(s.rising_profit_take_max_prob)) {
+                        side = Side::Sell;
+                    }
+                }
+            }
+        }
         // "Hot hand" sizing: bet size grows after wins, shrinks after losses --
         // see module doc comment. Revenge-trading ("get-even" loss-chasing,
         // betting *bigger* after a loss) used to be a per-agent reversal of
@@ -672,6 +1282,20 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                         1.0 / (1.0 + s.cpt_loss_hold_scale * (-v))
                     };
                     qty *= sell_mult;
+                }
+                if panic_sell {
+                    // Panic selling overrides the disposition hold-and-hope
+                    // suppression just applied above, rather than feeding into
+                    // it -- see module doc comment's "fast-crash panic selling"
+                    // section.
+                    qty *= s.panic_sell_qty_mult;
+                }
+                if capitulation_sell {
+                    // Same override reasoning as panic_sell just above --
+                    // module doc comment's "Slow-bleed capitulation" section.
+                    // Independent of (stacks with, in the rare case both fire
+                    // the same wake) panic_sell's own multiplier.
+                    qty *= s.capitulation_qty_mult;
                 }
                 // Never short: real retail traders overwhelmingly don't, and (like
                 // noise.rs) an unconstrained sell here would be unlimited,
@@ -747,14 +1371,32 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             // best bid when no ask exists at all. Clamping relative to `mid` in
             // that regime bounds each new belief relative to the *previous*
             // ratchet-up, not to anything stable -- compounding over hundreds of
-            // wake-ups into a runaway spiral (observed: up to ~130x the asset's
-            // starting price in a 20,000s smoke test). `fair_value` is the one
-            // process in this engine that's provably immune to being corrupted
-            // by trading activity itself (see market.rs's doc comment), so
-            // anchoring the clamp to it bounds the worst case regardless of how
-            // far a one-sided book has already drifted -- while the *base*
+            // wake-ups into a runaway spiral. `fair_value` is the one process in
+            // this engine that's provably immune to being corrupted by trading
+            // activity itself (see market.rs's doc comment), so anchoring the
+            // clamp to it bounds the worst case regardless of how far a
+            // one-sided book has already drifted -- while the *base*
             // computation still uses `mid`, so this agent's own signal still
             // moves the belief around within that band.
+            //
+            // Tried tightening this band to (0.8, 1.25) (2026-10-24, direct
+            // user request: "fine tune the simulation so the worth of the
+            // stocks... represent the real world") on the theory that the
+            // original (0.5, 2.0) was only ever loose enough to matter
+            // because it was sized against a since-fixed bug in `market.rs`'s
+            // `tick_mark_and_fundamental` that made `fair_value` ~5,600x more
+            // volatile than intended. Measured directly instead of assumed:
+            // it made things *worse*, not better -- 7 otherwise-identical
+            // human_80pct seeds that previously split between big up-moves
+            // and big down-moves all turned into big up-moves (30-99%) with
+            // the tighter band. Root cause isn't this clamp: every agent in
+            // this engine (human and most bot types) starts with zero
+            // inventory and only cash, so the entire population's earliest
+            // trades are structurally forced to be buys -- a population-wide
+            // bootstrap bias this clamp can't address and that a 25,000s
+            // warmup apparently doesn't fully work off. Left at the original
+            // (0.5, 2.0) pending an actual fix at the source (e.g. seeding
+            // non-zero starting inventory) rather than papering over it here.
             let believed_value = (mid * (1.0 + raw_signal * s.price_signal_threshold)).clamp(fair_value * 0.5, fair_value * 2.0);
             let book = ctx.market.book(ctx.venue, s.asset_id);
             let best_opposite = match side {

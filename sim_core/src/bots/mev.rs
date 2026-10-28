@@ -7,10 +7,10 @@
 //! spread population -- real sandwich activity is heavily concentrated in a few
 //! dominant bots.
 
-use super::StepCtx;
+use super::{RiskGovernor, StepCtx};
 use crate::agent::{Action, AgentCommon, NewOrderRequest, StepResult};
 use crate::params;
-use crate::types::{AssetId, OrderType, Side, SimTime, TimeInForce};
+use crate::types::{AssetId, FxHashMap, OrderType, Side, SimTime, TimeInForce};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Variant {
@@ -40,6 +40,8 @@ pub struct State {
     pub frontrun_close_side: Option<Side>,
     pub frontrun_qty: f64,
     pub seen_payloads: Vec<u64>,
+    /// Self de-risking on drawdown -- see `RiskGovernor`'s doc comment.
+    pub risk: RiskGovernor,
 }
 
 impl State {
@@ -81,6 +83,7 @@ impl State {
             frontrun_close_side: None,
             frontrun_qty: 0.0,
             seen_payloads: Vec::new(),
+            risk: RiskGovernor::from_params(p),
         }
     }
 
@@ -107,6 +110,23 @@ fn market_order(asset_id: AssetId, side: Side, qty: f64) -> Action {
 pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult {
     let mut actions = Vec::new();
 
+    // Self de-risking (see `RiskGovernor`'s doc comment): gates *new* attacks, not
+    // closing a position already in flight -- sandwich/frontrun holds are brief
+    // (micro-seconds to `frontrun_hold_secs`), so letting an in-progress close
+    // finish is not the open-ended risk a flattening gate exists for. If the mid
+    // price is briefly unavailable, don't let that spuriously trip the governor --
+    // poll with an effectively-infinite equity so only an already-running cooldown
+    // still applies.
+    let equity = match ctx.market.mid_price(ctx.venue, s.asset_id) {
+        Some(p) => {
+            let mut mark_prices = FxHashMap::default();
+            mark_prices.insert(s.asset_id, p);
+            agent.equity(&mark_prices)
+        }
+        None => f64::MAX,
+    };
+    let allowed = s.risk.poll(equity, agent.initial_net_worth, ctx.now);
+
     match s.variant {
         Variant::Sandwich => {
             if let Some(p) = s.pending_sandwich.take() {
@@ -115,7 +135,7 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                 } else {
                     s.pending_sandwich = Some(p);
                 }
-            } else {
+            } else if allowed {
                 let victim = ctx
                     .market
                     .visible_mempool(ctx.now)
@@ -124,7 +144,7 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                     .cloned();
                 if let Some(v) = victim {
                     s.mark_seen(v.payload_id);
-                    let qty = v.qty * s.size_frac_of_victim;
+                    let qty = v.qty * s.size_frac_of_victim * s.risk.size_multiplier;
                     actions.push(market_order(s.asset_id, v.side, qty));
                     s.pending_sandwich = Some(PendingSandwich {
                         payload_id: v.payload_id,
@@ -142,7 +162,7 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                     s.frontrun_close_at = None;
                     s.frontrun_close_side = None;
                 }
-            } else {
+            } else if allowed {
                 let victim = ctx
                     .market
                     .visible_mempool(ctx.now)
@@ -151,7 +171,7 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                     .cloned();
                 if let Some(v) = victim {
                     s.mark_seen(v.payload_id);
-                    let qty = v.qty * s.size_frac_of_victim;
+                    let qty = v.qty * s.size_frac_of_victim * s.risk.size_multiplier;
                     actions.push(market_order(s.asset_id, v.side, qty));
                     s.frontrun_close_at = Some(ctx.now + s.frontrun_hold_secs);
                     s.frontrun_close_side = Some(v.side.opposite());
@@ -160,17 +180,19 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             }
         }
         Variant::Backrun => {
-            let hit = ctx
-                .market
-                .pending_mempool
-                .iter()
-                .find(|o| o.asset_id == s.asset_id && o.execute_at <= ctx.now && !s.seen_payloads.contains(&o.payload_id))
-                .cloned();
-            if let Some(v) = hit {
-                s.mark_seen(v.payload_id);
-                // No front leg: exploit the price impact *after* the large order has
-                // landed, trading in the same direction (pure impact/arbitrage capture).
-                actions.push(market_order(s.asset_id, v.side, v.qty * s.size_frac_of_victim));
+            if allowed {
+                let hit = ctx
+                    .market
+                    .pending_mempool
+                    .iter()
+                    .find(|o| o.asset_id == s.asset_id && o.execute_at <= ctx.now && !s.seen_payloads.contains(&o.payload_id))
+                    .cloned();
+                if let Some(v) = hit {
+                    s.mark_seen(v.payload_id);
+                    // No front leg: exploit the price impact *after* the large order has
+                    // landed, trading in the same direction (pure impact/arbitrage capture).
+                    actions.push(market_order(s.asset_id, v.side, v.qty * s.size_frac_of_victim * s.risk.size_multiplier));
+                }
             }
         }
     }

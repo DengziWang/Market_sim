@@ -980,6 +980,26 @@ fn build_population(cfg: &ScenarioConfig, starting_agent_id: AgentId, market: &M
                 // round-robined per agent -- see market_maker.rs's own module doc
                 // comment's "Multi-asset risk allocation". Default `f64::MAX`
                 // reproduces the old unconditional "every asset" behavior exactly.
+                //
+                // Scenario value raised 0.021 -> 0.87 -> 1.5 (2026-10-24, same session
+                // as the `fundamental_vol` unit fix in `market.rs`/`config.rs`): the old
+                // 0.021 cutoff, under the old raw-seconds `fundamental_vol` scale, let
+                // through exactly BTC/ETH and excluded SOL/XRP/DOGE. Rescaling
+                // `fundamental_vol` to true annualized units (BTC 0.70 .. DOGE 1.20)
+                // without rescaling this cutoff reproduced the *same* BTC/ETH-only
+                // eligibility by accident, not by design -- and under real volatility
+                // that's catastrophic: SOL/XRP/DOGE, with zero market-maker coverage
+                // at all, ran away to 8-9x their starting price every pure-bot run
+                // (Sweep XVIII, human_0pct, both seeds), landing just under the
+                // `far_from_fundamental` 50x sanity band in `Market::submit` (market.rs)
+                // rather than near any organic equilibrium -- the one-sided-book
+                // pathology (see `market_maker.rs`'s taper-floor fix) with no floor at
+                // all once market_maker drops out entirely. 1.5 covers every asset in
+                // every current scenario (max configured `fundamental_vol` is DOGE's
+                // 1.20); market_maker's own existing risk-parity position sizing
+                // (`risk_aversion_exponent`, inverse-vol weighting) already shrinks its
+                // size on the volatile assets this re-admits, so this does not bypass
+                // risk control, only the blunt binary cutoff that had none.
                 "market_maker" => {
                     let max_vol = params::get_f64(&params, "max_fundamental_vol", f64::MAX);
                     let eligible: Vec<AssetId> = (0..n_assets).filter(|&a| cfg.assets[a].fundamental_vol <= max_vol).map(|a| a as AssetId).collect();
@@ -998,8 +1018,8 @@ fn build_population(cfg: &ScenarioConfig, starting_agent_id: AgentId, market: &M
                     cash,
                     &params,
                 )),
-                "momentum" => BotStrategy::Momentum(momentum::State::from_params(parse_momentum_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
-                "mean_reversion" => BotStrategy::MeanReversion(mean_reversion::State::from_params(parse_mr_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
+                "momentum" => BotStrategy::Momentum(momentum::State::from_params(parse_momentum_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params, &mut rng)),
+                "mean_reversion" => BotStrategy::MeanReversion(mean_reversion::State::from_params(parse_mr_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params, &mut rng)),
                 "grid" => BotStrategy::Grid(grid::State::from_params(parse_grid_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),
                 "dca" => BotStrategy::Dca(dca::State::from_params(parse_dca_variant(&group.variant)?, asset_a, cfg.run.session_seconds, &params)),
                 "mev" => BotStrategy::Mev(mev::State::from_params(parse_mev_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params)),

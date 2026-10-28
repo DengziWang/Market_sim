@@ -13,35 +13,35 @@
 symbol = "BTC"
 tick_size = 0.5
 initial_price = 60000.0
-fundamental_vol = 0.015
+fundamental_vol = 0.70
 fundamental_theta = 0.08
 
 [[assets]]
 symbol = "ETH"
 tick_size = 0.05
 initial_price = 3000.0
-fundamental_vol = 0.02
+fundamental_vol = 0.85
 fundamental_theta = 0.08
 
 [[assets]]
 symbol = "SOL"
 tick_size = 0.01
 initial_price = 150.0
-fundamental_vol = 0.03
+fundamental_vol = 1.05
 fundamental_theta = 0.1
 
 [[assets]]
 symbol = "XRP"
 tick_size = 0.0001
 initial_price = 0.6
-fundamental_vol = 0.025
+fundamental_vol = 0.90
 fundamental_theta = 0.1
 
 [[assets]]
 symbol = "DOGE"
 tick_size = 1e-5
 initial_price = 0.15
-fundamental_vol = 0.04
+fundamental_vol = 1.20
 fundamental_theta = 0.12
 
 [[venues]]

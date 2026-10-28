@@ -8,10 +8,10 @@
 //! `peg_ratio` relationship; the bot trades all 3 legs (IOC, leg risk minimized by
 //! sizing to the smallest available leg) whenever that relationship drifts.
 
-use super::StepCtx;
+use super::{RiskGovernor, StepCtx};
 use crate::agent::{Action, AgentCommon, NewOrderRequest, StepResult};
 use crate::params;
-use crate::types::{AssetId, OrderType, Side, SimTime, TimeInForce, VenueId};
+use crate::types::{AssetId, FxHashMap, OrderType, Side, SimTime, TimeInForce, VenueId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Variant {
@@ -66,6 +66,8 @@ pub struct State {
     /// correct only for the short-spread entry, so unwinding a long-spread position
     /// silently doubled it instead of closing it (2026-10-21 bug fix).
     pub position_sign: f64,
+    /// Self de-risking on drawdown -- see `RiskGovernor`'s doc comment.
+    pub risk: RiskGovernor,
 }
 
 impl State {
@@ -184,6 +186,7 @@ impl State {
             stop_z: params::get_f64(p, "stop_z", 4.0),
             in_position: false,
             position_sign: 0.0,
+            risk: RiskGovernor::from_params(p),
         }
     }
 }
@@ -233,21 +236,32 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             // leg below. Read the book's own (fallback-free) mid price instead, and
             // simply don't trade while venue_b has no genuine resting liquidity.
             if let (Some(pa), Some(pb)) = (ctx.market.mid_price(s.venue_a, s.asset_a), ctx.market.book(s.venue_b, s.asset_a).mid_price()) {
-                let qty = s.qty_a;
+                let current = agent.inventory_of(s.asset_a);
+                let mut mark_prices = FxHashMap::default();
+                mark_prices.insert(s.asset_a, pa);
+                let equity = agent.equity(&mark_prices);
+                let allowed = s.risk.poll(equity, agent.initial_net_worth, ctx.now);
+                let qty = s.qty_a * s.risk.size_multiplier;
                 let diff = pb - pa;
                 let cost = pa * s.transfer_cost_frac;
-                let current = agent.inventory_of(s.asset_a);
                 // Target flips sign with which venue is cheaper, but stays 0 (no
                 // legitimate signal) once the gap is inside transfer cost -- and
                 // rebalance() only trades the *delta* to get there, so a persistent
                 // gap does not cause repeated re-entry (both venues assumed
-                // pre-funded, i.e. no real-time asset transfer modeled).
-                let target = if diff.abs() > cost {
-                    if diff > 0.0 { qty } else { -qty }
-                } else {
+                // pre-funded, i.e. no real-time asset transfer modeled). Also 0 while
+                // de-risked (`allowed` false): a drawdown trip flattens the position
+                // instead of continuing to add to it.
+                let target = if !allowed || diff.abs() <= cost {
                     0.0
+                } else if diff > 0.0 {
+                    qty
+                } else {
+                    -qty
                 };
-                if agent.cash > pa.max(pb) * qty {
+                // A flatten (reducing |position|) is never blocked by the cash gate
+                // below -- only *adding* exposure needs headroom.
+                let is_flatten = target.abs() < current.abs();
+                if is_flatten || agent.cash > pa.max(pb) * qty {
                     if let Some(a) = rebalance(s.asset_a, current, target) {
                         actions.push(a);
                     }
@@ -262,29 +276,35 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             ) {
                 let implied_c = pa / pb.max(1e-9) * s.peg_ratio;
                 let deviation = (pc - implied_c) / implied_c.max(1e-9);
+                let mut mark_prices = FxHashMap::default();
+                mark_prices.insert(s.asset_a, pa);
+                mark_prices.insert(s.asset_b, pb);
+                mark_prices.insert(s.asset_c, pc);
+                let equity = agent.equity(&mark_prices);
+                let allowed = s.risk.poll(equity, agent.initial_net_worth, ctx.now);
                 // Each leg's *unit* quantity is fixed (see qty_a/b/c's doc comment),
                 // derived from the same dollar notional at each asset's own reference
                 // price, so the three legs are dollar-hedged against each other at
                 // that reference -- not exactly at the live price, but far safer than
                 // recomputing from a price this very trade might be moving.
-                let sign = if deviation.abs() > s.peg_stop_threshold {
-                    // Past the stop: treat a deviation this large as the peg
-                    // relationship itself having drifted, not a dislocation to
-                    // fade, and flatten instead of continuing to bet against it.
+                let sign = if !allowed || deviation.abs() > s.peg_stop_threshold {
+                    // Past the stop (or de-risked): treat this as a position to
+                    // flatten, not a dislocation to keep fading.
                     0.0
                 } else if deviation.abs() > s.peg_deviation_threshold {
                     if deviation > 0.0 { -1.0 } else { 1.0 }
                 } else {
                     0.0
                 };
-                let target_c = sign * s.qty_c;
-                let target_a = -sign * s.qty_a; // opposite leg of the same cycle
-                let target_b = sign * s.qty_b;
+                let target_c = sign * s.qty_c * s.risk.size_multiplier;
+                let target_a = -sign * s.qty_a * s.risk.size_multiplier; // opposite leg of the same cycle
+                let target_b = sign * s.qty_b * s.risk.size_multiplier;
                 // Crude solvency gate: each leg is worth roughly `order_notional`
                 // (qty_x * price_x), so require a multiple of headroom above one
                 // leg's worth rather than trying to net the (partially offsetting)
-                // buy/sell legs exactly.
-                if agent.cash > 3.0 * s.qty_a * pa {
+                // buy/sell legs exactly. Bypassed while de-risked, since `sign` is
+                // already forced to 0 there and every leg below is a pure flatten.
+                if !allowed || agent.cash > 3.0 * s.qty_a * pa {
                     if let Some(a) = rebalance(s.asset_c, agent.inventory_of(s.asset_c), target_c) {
                         actions.push(a);
                     }
@@ -299,7 +319,12 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         }
         Variant::StatArbPairs => {
             if let (Some(pa), Some(pb)) = (ctx.market.mid_price(ctx.venue, s.asset_a), ctx.market.mid_price(ctx.venue, s.asset_b)) {
-                let qty_a = s.qty_a;
+                let mut mark_prices = FxHashMap::default();
+                mark_prices.insert(s.asset_a, pa);
+                mark_prices.insert(s.asset_b, pb);
+                let equity = agent.equity(&mark_prices);
+                let allowed = s.risk.poll(equity, agent.initial_net_worth, ctx.now);
+                let qty_a = s.qty_a * s.risk.size_multiplier;
                 // Dollar-match the hedge leg, not unit-match it (2026-10-21 fix):
                 // `qty_a` is a unit count sized in *asset_a's* units at construction
                 // (order_notional / price_a) -- reusing that same number of units
@@ -324,17 +349,21 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                         // mean-reverting relationship between two independently-
                         // modeled assets -- bail rather than hold indefinitely.
                         let stop_hit = s.in_position && z.abs() > s.stop_z;
-                        if !s.in_position && z > s.entry_z {
+                        // De-risked: treat an open position as something to close
+                        // regardless of where z currently sits, and don't open a new
+                        // one no matter how strong the signal looks.
+                        let forced_exit = s.in_position && !allowed;
+                        if !s.in_position && allowed && z > s.entry_z {
                             actions.push(ioc(s.asset_a, Side::Sell, qty_a));
                             actions.push(ioc(s.asset_b, Side::Buy, qty_b));
                             s.in_position = true;
                             s.position_sign = -1.0;
-                        } else if !s.in_position && z < -s.entry_z {
+                        } else if !s.in_position && allowed && z < -s.entry_z {
                             actions.push(ioc(s.asset_a, Side::Buy, qty_a));
                             actions.push(ioc(s.asset_b, Side::Sell, qty_b));
                             s.in_position = true;
                             s.position_sign = 1.0;
-                        } else if s.in_position && (z.abs() < s.exit_z || stop_hit) {
+                        } else if s.in_position && (z.abs() < s.exit_z || stop_hit || forced_exit) {
                             // Unwind by trading the *opposite* of how this position
                             // was entered, not an always-the-same-direction close --
                             // see `position_sign`'s doc comment for the bug this fixes.
@@ -354,7 +383,17 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         }
         Variant::LatencyArb => {
             if let Some(p) = ctx.market.mid_price(ctx.venue, s.asset_a) {
-                if let Some(prev) = s.last_seen_price {
+                let mut mark_prices = FxHashMap::default();
+                mark_prices.insert(s.asset_a, p);
+                let equity = agent.equity(&mark_prices);
+                let allowed = s.risk.poll(equity, agent.initial_net_worth, ctx.now);
+                if !allowed {
+                    // De-risked: flatten whatever is open rather than wait for the
+                    // next jump signal.
+                    if let Some(a) = rebalance(s.asset_a, agent.inventory_of(s.asset_a), 0.0) {
+                        actions.push(a);
+                    }
+                } else if let Some(prev) = s.last_seen_price {
                     let ret = (p - prev) / prev.max(1e-9);
                     // Cooldown (2026-10-21 fix): measured directly on this scenario,
                     // this bot was re-triggering on ordinary tick-to-tick bid-ask
@@ -374,7 +413,8 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                         // order_qty via rebalance(), not fired unconditionally every
                         // wake: its own trades otherwise could look like a fresh
                         // "jump" and re-trigger itself indefinitely in one direction.
-                        let target = if ret > 0.0 { s.qty_a } else { -s.qty_a };
+                        let qty = s.qty_a * s.risk.size_multiplier;
+                        let target = if ret > 0.0 { qty } else { -qty };
                         if let Some(a) = rebalance(s.asset_a, agent.inventory_of(s.asset_a), target) {
                             actions.push(a);
                             s.last_trade_at = Some(ctx.now);

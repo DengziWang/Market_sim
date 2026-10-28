@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 
 use crate::agent::{AgentCommon, NewOrderRequest, StepResult};
 use crate::market::Market;
+use crate::params;
 use crate::types::{OrderId, SimTime, VenueId};
 
 /// Small fixed-capacity rolling buffer of samples, used by every indicator-based bot
@@ -65,6 +66,62 @@ impl RollingWindow {
     }
     pub fn len(&self) -> usize {
         self.buf.len()
+    }
+}
+
+/// Self risk-management for the "structural" strategies (arbitrage, mev): a real
+/// arbitrageur or MEV searcher cuts size, or stops trading altogether, after
+/// sustained losses rather than keep betting the same size into capital that's
+/// disappearing. Without this, these bots kept firing full-size trades right up to
+/// the engine's forced-liquidation floor (`run_net_worth_bankruptcy_sweep`, 20% of
+/// `initial_net_worth`) -- which is what let several variants post strongly
+/// positive *average* growth alongside implausibly high bankruptcy rates
+/// (2026-10-22: stat_arb_pairs +219%/49.2% bankrupt, frontrun +105%/34.7%,
+/// sandwich +102%/37.1% on the full 5,000-agent sweep). A bot that actually
+/// de-risks on its own drawdown should rarely need the engine's floor to stop it.
+///
+/// Trips once equity falls to `derisk_threshold_frac` of the agent's starting net
+/// worth: halves its own position-size multiplier (floor 1/8th) and pauses opening
+/// *new* positions for `cooldown_secs`, while still allowing the caller to flatten
+/// whatever is already open. This is sticky, not a one-shot warning -- getting cut
+/// down to a smaller size is itself the lesson, mirroring a risk desk that reduces
+/// a strategy's allocation after it blows through a loss limit rather than
+/// restoring it to full size the moment the drawdown technically clears.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RiskGovernor {
+    pub derisk_threshold_frac: f64,
+    pub cooldown_secs: SimTime,
+    pub size_multiplier: f64,
+    pub paused_until: Option<SimTime>,
+}
+
+impl RiskGovernor {
+    pub fn from_params(p: &toml::Value) -> Self {
+        Self {
+            derisk_threshold_frac: params::get_f64(p, "derisk_threshold_frac", 0.5),
+            cooldown_secs: params::get_f64(p, "derisk_cooldown_secs", 1800.0),
+            size_multiplier: 1.0,
+            paused_until: None,
+        }
+    }
+
+    /// Returns whether new positions may be opened this wake. The caller is
+    /// responsible for flattening any already-open position when this returns
+    /// `false` -- the governor only gates new entries, it never silently abandons
+    /// existing exposure.
+    pub fn poll(&mut self, equity: f64, initial_net_worth: f64, now: SimTime) -> bool {
+        if let Some(until) = self.paused_until {
+            if now < until {
+                return false;
+            }
+            self.paused_until = None;
+        }
+        if initial_net_worth > 1e-9 && equity <= self.derisk_threshold_frac * initial_net_worth {
+            self.size_multiplier = (self.size_multiplier * 0.5).max(0.125);
+            self.paused_until = Some(now + self.cooldown_secs);
+            return false;
+        }
+        true
     }
 }
 

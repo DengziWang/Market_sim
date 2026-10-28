@@ -524,6 +524,10 @@ pub struct AssetState {
     /// prior -- the first real reading sets it.
     pub bid_depth_baseline: f64,
     pub ask_depth_baseline: f64,
+    /// Consecutive wakes this asset has read `depth_collapsed` (module doc
+    /// comment's "Bounded re-anchor") -- resets to 0 the moment depth is no
+    /// longer collapsed.
+    pub depth_collapsed_wakes: u32,
     /// Slow EMA of this asset's own `inventory_norm` (module doc comment's
     /// "Sustained-drift extra de-risking") -- starts at 0.0 (freshly
     /// constructed agent has no position yet either way).
@@ -563,6 +567,7 @@ impl AssetState {
             markout_window: RollingWindow::new(markout_window_len),
             bid_depth_baseline: 0.0,
             ask_depth_baseline: 0.0,
+            depth_collapsed_wakes: 0,
             inventory_drift_ema: 0.0,
         }
     }
@@ -598,6 +603,19 @@ pub struct State {
     /// convention as `panic_vol_frac`'s `f64::MAX`, just inverted since this
     /// is a ratio, not an absolute level.
     pub depth_collapse_frac: f64,
+    /// Consecutive wakes an asset may stay `depth_collapsed` before this
+    /// agent force-reanchors `bid_depth_baseline`/`ask_depth_baseline` to
+    /// the current (still thin) reading and resumes quoting -- see the
+    /// "Bounded re-anchor" comment at this field's one call site for why a
+    /// permanent trigger with no escape caused a real, measured permanent
+    /// market freeze on a liquidity-floor-less (no `noise`/`human`)
+    /// composition. Default 50 wakes (~100s at the 2.0s default
+    /// `wake_interval`, far short of one 500s leg) -- short enough that a
+    /// composition with any independent order flow recovers the old way
+    /// (depth naturally returns before the counter trips) and this never
+    /// engages, long enough that a momentary panic-withdrawal still behaves
+    /// exactly as before.
+    pub depth_collapse_max_wakes: f64,
     /// EMA window (in wakes) for `AssetState::bid_depth_baseline`/
     /// `ask_depth_baseline`.
     pub depth_window: f64,
@@ -739,6 +757,31 @@ pub struct State {
     /// asset this agent is structurally getting picked off on, not just
     /// price itself wider. Capped like `predictive_size_scale`.
     pub markout_size_scale: f64,
+    /// **Fundamental-value reservation anchor (2026-10-27, direct user
+    /// request: "market_maker should be one of the best bots at realistic
+    /// [50-80%] human ratios")**: every variant's reservation price was
+    /// anchored purely on `micro`/`mid` -- *market-observed* signals, with
+    /// no pull toward the asset's true (simulation-known) fundamental
+    /// value, unlike `grid.rs`'s and edge `mean_reversion`'s own
+    /// `fundamental_bias_frac`, which measurably cut `grid`'s bankruptcy by
+    /// leaning its quotes back toward fair value instead of chasing wherever
+    /// the noisy traded price currently sits. `center` (below) blends
+    /// `micro` toward `fair` by this fraction before any variant computes
+    /// its reservation from it -- a market_maker whose quotes are pulled
+    /// toward fair value doesn't accumulate as large a one-sided position
+    /// during a sustained move away from it (the same "loss-timing
+    /// investigation" pattern this file's history keeps tracing: the whole
+    /// fleet drifting the same way on a price swing away from fundamentals),
+    /// since its own bid/ask center lags the move rather than tracking it
+    /// tick-for-tick. Distinct from `predictive_skew_scale` (measured
+    /// net-harmful, see that field's doc comment): that one *leads* recent
+    /// momentum (procyclical, leans into a move); this one pulls *back*
+    /// toward a value that doesn't move with short-term noise at all
+    /// (mean-reverting by construction, same direction as the de-risking/
+    /// taper machinery already in this file, not opposed to it). Defaults
+    /// 0.0 (old behavior, pure micro anchor) -- opt-in per scenario, same
+    /// convention as every other experimental knob in this struct.
+    pub fundamental_bias_frac: f64,
 }
 
 impl State {
@@ -847,6 +890,7 @@ impl State {
             // longer/smoother window) rather than ripped out.
             markout_widen_scale: params::get_f64(p, "markout_widen_scale", 0.0) * rng.gen_range(0.5..1.5),
             markout_size_scale: params::get_f64(p, "markout_size_scale", 0.0) * rng.gen_range(0.5..1.5),
+            fundamental_bias_frac: params::get_f64(p, "fundamental_bias_frac", 0.0),
             // Defaults 0.0 -- measured net-harmful in isolation on
             // human_80pct: trade count -62% (342k -> 130k), market_maker's
             // own volume share collapsed 32.6% -> 9.9%, equity *unchanged*
@@ -862,6 +906,7 @@ impl State {
             cross_asset_hedge_scale: params::get_f64(p, "cross_asset_hedge_scale", 0.0),
             cross_asset_hedge_threshold: params::get_f64(p, "cross_asset_hedge_threshold", 0.4),
             depth_collapse_frac: params::get_f64(p, "depth_collapse_frac", 0.35),
+            depth_collapse_max_wakes: params::get_f64(p, "depth_collapse_max_wakes", 50.0),
             depth_window: params::get_f64(p, "depth_window", 50.0),
             depth_levels: params::get_u32(p, "depth_levels", 3),
             depth_size_cap_frac: params::get_f64(p, "depth_size_cap_frac", 0.5),
@@ -880,6 +925,11 @@ struct AssetSnapshot {
     mid: f64,
     /// See module doc comment's "Microprice reservation anchor".
     micro: f64,
+    /// This asset's true (simulation-known) fundamental value -- see module
+    /// doc comment's "Fundamental-value reservation anchor". Falls back to
+    /// `mid` when the market doesn't expose one for this asset, same
+    /// fallback `grid.rs`'s own fundamental-bias fix already uses.
+    fair: f64,
     sigma: f64,
     toxicity: f64,
     momentum_signal: f64,
@@ -1028,12 +1078,13 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             asset.markout_window.push(frac);
         }
         let micro = microprice(ctx, asset.asset_id, mid);
+        let fair = *ctx.market.fundamental_value.get(&asset.asset_id).unwrap_or(&mid);
 
         let sigma = asset.vol_window.std().unwrap_or(0.0).max(1e-9);
         let toxicity = asset.toxicity_window.mean().unwrap_or(0.0);
         let momentum_signal = asset.momentum_window.mean().unwrap_or(0.0);
         let inventory = agent.inventory_of(asset.asset_id);
-        snaps.push(Some(AssetSnapshot { mid, micro, sigma, toxicity, momentum_signal, inventory }));
+        snaps.push(Some(AssetSnapshot { mid, micro, fair, sigma, toxicity, momentum_signal, inventory }));
     }
 
     // This agent's *total* equity across every asset it holds -- replaces
@@ -1092,6 +1143,11 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         let Some(snap) = &snaps[i] else { continue };
         let mid = snap.mid;
         let micro = snap.micro;
+        // Fundamental-value reservation anchor (module doc comment,
+        // `fundamental_bias_frac`'s own doc comment): blend `micro` toward
+        // `fair` before any variant below anchors its reservation on it.
+        // 0.0 (default) reproduces the old pure-`micro` anchor exactly.
+        let center = micro + s.fundamental_bias_frac * (snap.fair - micro);
         let sigma = snap.sigma;
         let toxicity = snap.toxicity;
         let momentum_signal = snap.momentum_signal;
@@ -1114,6 +1170,44 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         let depth_collapsed = asset.bid_depth_baseline > 1e-9
             && asset.ask_depth_baseline > 1e-9
             && (bid_depth < asset.bid_depth_baseline * s.depth_collapse_frac || ask_depth < asset.ask_depth_baseline * s.depth_collapse_frac);
+        // Bounded re-anchor (2026-10-24, direct user request: "fine tune the
+        // simulation so the worth of the stocks... represent the real
+        // world"), found by tracing a *permanent* market freeze on a
+        // 0%-human, no-noise-trader composition over a full 100,000s sweep:
+        // the EMA baseline below keeps chasing the depressed depth reading
+        // even while `depth_collapsed` is true, so on a book with no
+        // independent liquidity floor (no `noise`/`human` group injecting
+        // flow regardless of what market_maker does), every MM variant can
+        // withdraw from an asset at once and never come back -- baseline and
+        // live depth decay together, `depth_collapsed` stays true forever,
+        // and the asset shows literally zero trades for 90+ consecutive
+        // 500s legs (measured directly: Sweep XVIII validation run,
+        // human_0pct, both seeds). This was validated as net-positive on
+        // human_80pct (module doc comment's "Depth-collapse panic trigger"
+        // entry), a composition with enough independent (human) order flow
+        // that depth always recovered on its own within a few wakes -- that
+        // recovery path was never actually exercised by code, just by
+        // circumstance, so it silently assumed a liquidity floor this sim
+        // doesn't always have. A real exchange halts and *reopens* trading
+        // after a liquidity shock rather than closing it permanently; this
+        // mirrors that by re-anchoring the baseline to the current (still
+        // thin) reading after `depth_collapse_max_wakes` consecutive
+        // collapsed wakes, which lets this agent resume quoting at the new,
+        // lower-liquidity regime instead of waiting forever for depth to
+        // return to a pre-shock level that may never come back on its own.
+        if depth_collapsed {
+            asset.depth_collapsed_wakes += 1;
+        } else {
+            asset.depth_collapsed_wakes = 0;
+        }
+        let depth_collapsed = if depth_collapsed && (asset.depth_collapsed_wakes as f64) > s.depth_collapse_max_wakes {
+            asset.bid_depth_baseline = bid_depth;
+            asset.ask_depth_baseline = ask_depth;
+            asset.depth_collapsed_wakes = 0;
+            false
+        } else {
+            depth_collapsed
+        };
         let depth_alpha = 2.0 / (s.depth_window + 1.0);
         asset.bid_depth_baseline += depth_alpha * (bid_depth - asset.bid_depth_baseline);
         asset.ask_depth_baseline += depth_alpha * (ask_depth - asset.ask_depth_baseline);
@@ -1234,11 +1328,12 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                 // sub-half-price/over-double-price quotes in testing; see git history).
                 // Fixed by working entirely in *fractional* terms (`inventory_norm` above)
                 // and converting to a price only once, at the end, by multiplying by mid.
-                // `micro` (module doc comment's microprice), not raw `mid`, anchors the
-                // reservation -- order-book imbalance leads price, so centering on it
-                // instead of the last trade should reduce adverse selection on its own,
-                // independent of the inventory-skew term below.
-                let reservation = micro * (1.0 - inventory_norm * s.gamma * sigma.powi(2) * s.horizon_secs);
+                // `center` (microprice, optionally blended toward fundamental value --
+                // module doc comment's `fundamental_bias_frac`), not raw `mid`, anchors
+                // the reservation -- order-book imbalance leads price, so centering on
+                // it instead of the last trade should reduce adverse selection on its
+                // own, independent of the inventory-skew term below.
+                let reservation = center * (1.0 - inventory_norm * s.gamma * sigma.powi(2) * s.horizon_secs);
                 // The order-arrival-intensity term (2/gamma)*ln(1+gamma/k) is dimensionless
                 // by construction (a pure function of gamma/k), not a price or even a
                 // fraction of one -- rescaled so the module's own defaults land in the same
@@ -1247,7 +1342,7 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                 let spread_frac = s.gamma * sigma.powi(2) * s.horizon_secs + (2.0 / s.gamma) * (1.0 + s.gamma / s.k).ln() / K_TERM_SCALE;
                 (reservation, (spread_frac * mid / 2.0).max(mid * 1e-5))
             }
-            Variant::FixedOffset => (micro, mid * s.base_half_spread_frac),
+            Variant::FixedOffset => (center, mid * s.base_half_spread_frac),
             Variant::InventorySkew => {
                 // Linear-skew approximation of the Gueant-Lehalle-Fernandez-Tapia inventory
                 // adjustment: push the mid reference against the current inventory so quotes
@@ -1262,12 +1357,12 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                 // price, many multiples of DOGE's entire price at even a perfectly ordinary
                 // (e.g. half-of-max) inventory position, not an extreme one. Fixed the same
                 // way: react to `inventory_norm` (a fraction of max_inventory), not raw units.
-                let skewed = micro * (1.0 - s.skew_factor * inventory_norm);
+                let skewed = center * (1.0 - s.skew_factor * inventory_norm);
                 (skewed, mid * s.base_half_spread_frac)
             }
             Variant::AdaptiveSpread => {
                 let widen = 1.0 + (sigma / mid.max(1e-9)) * 50.0 + toxicity * 100.0;
-                (micro, mid * s.base_half_spread_frac * widen)
+                (center, mid * s.base_half_spread_frac * widen)
             }
         };
 
@@ -1387,21 +1482,46 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         }
 
         // Passive taper (module doc comment's fix 2): shrink the side that would
-        // *increase* an already-large position as inventory approaches the cap,
-        // reaching zero exactly at it -- previously quoted the same full
-        // `order_qty` on both sides regardless of current inventory, right up
-        // until a hard wall. The side that *reduces* the position keeps full
-        // size throughout; only the accumulating side tapers.
-        let buy_taper = if inventory_norm > 0.0 { (1.0 - inventory_norm.min(1.0)).max(0.0) } else { 1.0 };
-        let sell_taper = if inventory_norm < 0.0 { (1.0 - inventory_norm.abs().min(1.0)).max(0.0) } else { 1.0 };
+        // *increase* an already-large position as inventory approaches the cap.
+        // Floored at `MIN_TAPER`, not all the way to 0 (2026-10-24, direct user
+        // request: "fine tune the simulation so the worth of the stocks...
+        // represent the real world" -- see module doc comment's "One-sided book
+        // from fully-tapered inventory" entry): going fully one-sided,
+        // population-wide (every market_maker agent is seeded with a similar
+        // starting long position at construction, see sim.rs's
+        // `needs_inventory_seed`), lets `mid_price()` degenerate to tracking
+        // only the remaining side -- with no resting bid to average against,
+        // this agent's own `micro`/`reservation` (derived from that same
+        // degenerate mid) can drift for an extended dormant stretch with zero
+        // actual trades to ground it, then print a large, otherwise-
+        // unexplainable move the instant some other agent finally crosses into
+        // wherever it drifted to. Measured directly: a pure-bot (0% human) run
+        // printed zero BTC trades for 3,000+ seconds, then resumed over 60%
+        // lower with no intermediate prints at all. A real market maker at or
+        // past its own cap still keeps a token two-sided presence (at a worse
+        // price/size), it doesn't vanish from one side of the book entirely.
+        // The side that *reduces* the position keeps full size throughout;
+        // only the accumulating side tapers.
+        const MIN_TAPER: f64 = 0.1;
+        let buy_taper = if inventory_norm > 0.0 { (1.0 - inventory_norm.min(1.0)).max(MIN_TAPER) } else { 1.0 };
+        let sell_taper = if inventory_norm < 0.0 { (1.0 - inventory_norm.abs().min(1.0)).max(MIN_TAPER) } else { 1.0 };
         let buy_qty = order_qty * buy_taper;
         let sell_qty = order_qty * sell_taper;
 
         // Single order per side (2026-10-20, direct user request -- see
         // module doc comment's "Single order per side, deleted the ladder"):
         // `asset.bid_level`/`ask_level` were reset to default at the top of
-        // `step()`; this is the only place either gets set again.
-        if inventory < max_inventory && buy_qty > 1e-9 {
+        // `step()`; this is the only place either gets set again. The hard
+        // gate below widened from `max_inventory` to `max_inventory * 1.5`
+        // (same 2026-10-24 fix as the taper floor above) -- construction-time
+        // inventory seeding (sim.rs) sizes each agent's starting position off
+        // its *cash*, a different basis than this per-wake risk-budget-derived
+        // `max_inventory`, so a freshly built agent can start out already past
+        // its own cap; at the exact `max_inventory` gate, that agent's buy side
+        // (and hence the floored-taper fix above) would be blocked outright
+        // from the very first wake, with no way to ever work itself back under
+        // cap other than selling. The wider gate gives it room to do both.
+        if inventory < max_inventory * 1.5 && buy_qty > 1e-9 {
             let bid_price = (reservation - bid_half_spread).max(mid * 1e-4);
             if agent.cash > bid_price * buy_qty {
                 asset.bid_level.qty_placed = buy_qty;
@@ -1417,7 +1537,7 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                 }));
             }
         }
-        if inventory > -max_inventory && sell_qty > 1e-9 {
+        if inventory > -max_inventory * 1.5 && sell_qty > 1e-9 {
             let ask_price = (reservation + ask_half_spread).max(mid * 1e-4);
             asset.ask_level.qty_placed = sell_qty;
             asset.ask_level.price_placed = ask_price;

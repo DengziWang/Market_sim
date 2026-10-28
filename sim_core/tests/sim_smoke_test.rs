@@ -386,6 +386,20 @@ initial_cash_range = [1000.0, 8000.0]
     for a in human_states {
         assert!(a.inventory >= -1e-6, "human bots must never hold a short (negative) position: agent {} has {}", a.agent_id, a.inventory);
         assert!(a.cash.is_finite() && a.equity.is_finite());
-        assert!(!a.bankrupt || a.equity <= 0.0, "a bankrupt flag should correspond to non-positive equity");
+        // Not a numeric ceiling on `equity` (2026-10-23, second correction):
+        // tried `equity <= 0.0` first, then `equity <= 0.2 * initial_net_worth`
+        // (the bankruptcy *trigger* in `run_net_worth_bankruptcy_sweep`,
+        // sim.rs) -- both failed against a real bankrupt agent from this test
+        // run (equity 782.42 against a 20% line of 554.41). Root cause: the
+        // trigger checks equity against `mark_price_ema` (a smoothed snapshot,
+        // taken once per sweep), but `force_liquidate_and_bankrupt`'s actual
+        // IOC market order executes against the live book, which can realize
+        // a better price than that snapshot implied -- "was <=20% at the
+        // instant the sweep checked it" is the real, and only, guarantee; the
+        // realized-afterward equity isn't bounded by it. What IS a hard
+        // guarantee (`flatten_spot_inventory`/`force_liquidate_and_bankrupt`
+        // in sim.rs) is that a bankrupt agent ends up fully flat -- no spot
+        // inventory, no margin position -- so that's what this checks instead.
+        assert!(!a.bankrupt || (a.inventory.abs() < 1e-6 && !a.has_margin_position), "a bankrupt agent should hold no inventory and no margin position: agent {} has inventory {} has_margin={}", a.agent_id, a.inventory, a.has_margin_position);
     }
 }

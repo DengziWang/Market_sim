@@ -2,21 +2,21 @@
 symbol = "BTC"
 tick_size = 0.5
 initial_price = 60000.0
-fundamental_vol = 0.02
+fundamental_vol = 0.85
 fundamental_theta = 0.08
 
 [[assets]]
 symbol = "ETH"
 tick_size = 0.05
 initial_price = 3000.0
-fundamental_vol = 0.025
+fundamental_vol = 0.90
 fundamental_theta = 0.08
 
 [[assets]]
 symbol = "SOL"
 tick_size = 0.01
 initial_price = 150.0
-fundamental_vol = 0.035
+fundamental_vol = 1.20
 fundamental_theta = 0.1
 
 [[venues]]
@@ -111,7 +111,7 @@ initial_cash_range = [ 15000.0, 60000.0,]
 
 [population.groups.params]
 withdrawal_vol_frac = 0.006
-max_fundamental_vol = 0.021
+max_fundamental_vol = 1.5
 [[population.groups]]
 bot_type = "market_maker"
 variant = "avellaneda_stoikov"
@@ -119,7 +119,7 @@ count = 20
 initial_cash_range = [ 15000.0, 60000.0,]
 
 [population.groups.params]
-max_fundamental_vol = 0.021
+max_fundamental_vol = 1.5
 [[population.groups]]
 bot_type = "momentum"
 variant = "ma_crossover"

@@ -37,6 +37,21 @@ pub struct Market {
     pub mempool_cfg: MempoolConfig,
     books: FxHashMap<(VenueId, AssetId), OrderBook>,
     pub mark_price_ema: FxHashMap<AssetId, f64>,
+    /// The circuit breaker's own reference price -- see `MarketConfig::
+    /// max_price_move_frac`'s doc comment for why this is a *separate*,
+    /// deliberately slower-moving EMA from `mark_price_ema` above, not the same
+    /// series reused. `mark_price_ema`'s halflife (default 30s) is tuned for its
+    /// other consumers (market-maker pricing, equity marking) and fully tracks
+    /// any sustained move within a single ~500s measurement leg (500s is ~17
+    /// halflives), which measured out to barely resisting a sustained cascade at
+    /// all -- a 7-seed check still showed 146-294% single-leg moves with
+    /// `mark_price_ema` as the breaker's reference, nearly as bad as having no
+    /// window-independent reference at all. This series uses its own, much
+    /// longer `price_protection_ema_halflife_secs` instead, so the breaker's
+    /// band resists a cascade for most of a session while still never getting
+    /// permanently "stuck" favoring one side the way a periodically-reset
+    /// window reference did (see that doc comment's fuller history).
+    pub circuit_breaker_ema: FxHashMap<AssetId, f64>,
     pub fundamental_value: FxHashMap<AssetId, f64>,
     /// Collective market mood per asset, roughly in [-1, 1]. See
     /// `AssetConfig::sentiment_vol`/`sentiment_theta`'s doc comment.
@@ -90,6 +105,7 @@ impl Market {
     pub fn new(assets: Vec<AssetConfig>, venues: Vec<VenueConfig>, cfg: MarketConfig, fees: FeeConfig, mempool_cfg: MempoolConfig) -> Self {
         let mut books = FxHashMap::default();
         let mut mark_price_ema = FxHashMap::default();
+        let mut circuit_breaker_ema = FxHashMap::default();
         let mut fundamental_value = FxHashMap::default();
         let mut sentiment = FxHashMap::default();
         for (vid, _venue) in venues.iter().enumerate() {
@@ -100,6 +116,7 @@ impl Market {
         let mut last_tick_sample = FxHashMap::default();
         for (aid, asset) in assets.iter().enumerate() {
             mark_price_ema.insert(aid as AssetId, asset.initial_price);
+            circuit_breaker_ema.insert(aid as AssetId, asset.initial_price);
             fundamental_value.insert(aid as AssetId, asset.initial_price);
             sentiment.insert(aid as AssetId, 0.0);
             last_tick_sample.insert(aid as AssetId, asset.initial_price);
@@ -112,6 +129,7 @@ impl Market {
             mempool_cfg,
             books,
             mark_price_ema,
+            circuit_breaker_ema,
             fundamental_value,
             sentiment,
             last_trade_price: FxHashMap::default(),
@@ -225,7 +243,13 @@ impl Market {
             submitted_at: time,
             seq: 0,
         };
-        let result = self.book_mut(venue, asset_id).submit(order, time);
+        // The circuit breaker's reference (`OrderBook::submit`'s own doc comment,
+        // `Market::circuit_breaker_ema`'s own doc comment for why this is a
+        // separate, slower-moving series from `mark_price_ema`) -- fetched before
+        // the mutable borrow below, since `self.circuit_breaker_ema` and
+        // `self.books` are separate fields but `book_mut` borrows all of `self`.
+        let cb_reference_price = self.circuit_breaker_ema.get(&asset_id).copied();
+        let result = self.book_mut(venue, asset_id).submit(order, time, cb_reference_price);
         for f in &result.fills {
             self.last_trade_price.insert((venue, asset_id), self.assets[asset_id as usize].tick_size * f.price_ticks as f64);
         }
@@ -242,10 +266,39 @@ impl Market {
 
     /// Advance the EMA mark price, the latent fundamental value process, and the
     /// latent sentiment process for every asset (primary venue only feeds the mark
-    /// price -- see module docs). `dt` is the time elapsed since the previous tick.
+    /// price -- see module docs). `dt` is the time elapsed since the previous tick,
+    /// in seconds -- this engine's one native time unit everywhere else (every
+    /// `_secs` config field, every `SimTime`).
     pub fn tick_mark_and_fundamental(&mut self, dt: SimTime, rng: &mut ChaCha8Rng) {
         let halflife = self.cfg.mark_price_ema_halflife_secs.max(1e-6);
         let alpha = 1.0 - 0.5f64.powf(dt / halflife);
+        // See `Market::circuit_breaker_ema`'s doc comment for why this is its own,
+        // much slower-moving EMA rather than reusing `mark_price_ema`'s alpha.
+        let cb_halflife = self.cfg.price_protection_ema_halflife_secs.max(1e-6);
+        let cb_alpha = 1.0 - 0.5f64.powf(dt / cb_halflife);
+        // `AssetConfig::fundamental_vol`/`fundamental_theta`'s own doc comments call
+        // them "annualized-style" -- i.e. meant to be read the way a real quant
+        // reads sigma=0.7 ("70% annualized vol"), the units every per-asset value in
+        // every scenario file was actually chosen against. But `dt` above arrives in
+        // *seconds*, and this GBM/OU step used it directly, unconverted -- a bug
+        // fixed 2026-10-24 (direct user request: "fine tune the simulation so the
+        // worth of the stocks... represent the real world"). Before this fix, a
+        // sigma meant to read as "70% per year" was actually being applied as
+        // "70% per sqrt(second)", i.e. inflated by sqrt(seconds_per_year) (~5,617x)
+        // -- measured directly: a 10,000s human_80pct check run showed BTC crash
+        // 73% in ~33 simulated minutes and then round-trip back to its starting
+        // price within the next 8 minutes, a move no real asset (crypto included)
+        // produces on that timescale. `dt_years` converts once per tick so every
+        // asset's `fundamental_vol`/`fundamental_theta` can be read, and tuned,
+        // directly against real historical annualized volatility figures.
+        // `sentiment_vol`/`sentiment_theta` deliberately keep using raw-second
+        // `dt` below, unconverted -- mood has no real-world "annualized volatility"
+        // benchmark to calibrate against the way an asset's price does, and
+        // forcing it onto a yearly timescale would silence it within any
+        // realistic sim run (see its own doc comment: mood is supposed to swing
+        // *faster* than a well-anchored fundamental value, not slower).
+        const SECONDS_PER_YEAR: f64 = 365.25 * 24.0 * 3600.0;
+        let dt_years = dt / SECONDS_PER_YEAR;
         for aid in 0..self.assets.len() as AssetId {
             let sample = self
                 .last_trade_price
@@ -255,6 +308,26 @@ impl Market {
                 .unwrap_or(self.assets[aid as usize].initial_price);
             let prev = *self.mark_price_ema.get(&aid).unwrap();
             self.mark_price_ema.insert(aid, prev + alpha * (sample - prev));
+            // Deliberately a *different* sample than `mark_price_ema`'s above --
+            // this prefers the live quoted `mid_price` over `last_trade_price`,
+            // the opposite priority (2026-10-24 fix, direct user request: "fine
+            // tune the simulation so the worth of the stocks... represent the
+            // real world"). `last_trade_price` only updates on an actual trade,
+            // so once trading pauses for any reason, it stays frozen -- and
+            // since quotes keep evolving from this agent's own inventory/risk
+            // state even with nobody crossing them, the reference can fall
+            // permanently out of sync with where the book actually is. Once
+            // that happens, every new crossing attempt fails the band check
+            // against the stale reference, which blocks the very trade that
+            // would have updated `last_trade_price` and let the reference
+            // catch up -- a genuine deadlock, not just a slow catch-up. Measured
+            // directly: a pure-bot run traded normally in the first leg after
+            // warmup, then printed exactly zero trades for the rest of a
+            // 10,000s window. `mid_price` has no such gap -- it reflects the
+            // book's current best bid/ask on every tick, trade or no trade.
+            let cb_sample = self.mid_price(0, aid).unwrap_or(sample);
+            let cb_prev = *self.circuit_breaker_ema.get(&aid).unwrap();
+            self.circuit_breaker_ema.insert(aid, cb_prev + cb_alpha * (cb_sample - cb_prev));
 
             // See `Market::recent_log_returns`'s doc comment.
             let prev_sample = *self.last_tick_sample.get(&aid).unwrap_or(&sample);
@@ -272,8 +345,8 @@ impl Market {
             let f_prev = *self.fundamental_value.get(&aid).unwrap();
             let z: f64 = rng.sample(StandardNormal);
             let f_next = f_prev
-                + asset.fundamental_theta * (asset.initial_price - f_prev) * dt
-                + asset.fundamental_vol * f_prev * dt.sqrt() * z;
+                + asset.fundamental_theta * (asset.initial_price - f_prev) * dt_years
+                + asset.fundamental_vol * f_prev * dt_years.sqrt() * z;
             self.fundamental_value.insert(aid, f_next.max(asset.tick_size));
 
             // Independent draw and independent process from fundamental value above:
