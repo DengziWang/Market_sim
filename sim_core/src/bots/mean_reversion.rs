@@ -68,6 +68,14 @@ pub struct State {
     /// see module doc comment's "Fundamental-value bias" section. Unused by
     /// OuFairValue, which already trades directly against fundamental value.
     pub fundamental_bias_frac: f64,
+    /// OuFairValue only ("value fund" reconstruction): how strongly position
+    /// size scales up as `dev` moves past `deviation_threshold` -- 0.0 means
+    /// OuFairValue stays the old fixed-size +-max_pos flip. See `step()`'s
+    /// `size_mult` formula.
+    pub deviation_scale_factor: f64,
+    /// OuFairValue only: hard cap on `size_mult`, so the scale-up above can't
+    /// run away unbounded as `dev` grows.
+    pub max_position_scale: f64,
 }
 
 impl State {
@@ -107,6 +115,10 @@ impl State {
             in_position: false,
             // 0.3: same modest-lean default as grid.rs's own fundamental_bias_frac.
             fundamental_bias_frac: params::get_f64(p, "fundamental_bias_frac", 0.3),
+            // Off by default (0.0): a scenario has to opt an OuFairValue group
+            // into "value fund" behavior explicitly.
+            deviation_scale_factor: params::get_f64(p, "deviation_scale_factor", 0.0),
+            max_position_scale: params::get_f64(p, "max_position_scale", 10.0).max(1.0),
         }
     }
 }
@@ -166,12 +178,27 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
             // a "fundamentalist" archetype (Chiarella 1992) that expects price to
             // revert toward the known fair value, unlike Bollinger/ZScore which only
             // see the traded price series.
+            //
+            // Value-fund reconstruction (2026-11-01): position size scales with how
+            // far past `deviation_threshold` the mispricing has gone, instead of the
+            // old fixed +-max_pos flip -- the whole point of configuring this variant
+            // as a small, well-capitalized "value fund" rather than just another
+            // bounded mean-reverter. `size_mult` is 1.0 at the threshold itself and
+            // grows linearly with the excess deviation, capped at `max_position_scale`.
             let fair = *ctx.market.fundamental_value.get(&s.asset_id).unwrap_or(&mid);
             let dev = (mid - fair) / fair.max(1e-9);
+            let excess = (dev.abs() - s.deviation_threshold).max(0.0);
+            let size_mult = (1.0 + s.deviation_scale_factor * excess / s.deviation_threshold.max(1e-9))
+                .min(s.max_position_scale);
+            let scaled_pos = max_pos * size_mult;
             let target = if dev > s.deviation_threshold {
-                if s.allow_short { -max_pos } else { 0.0 }
+                if s.allow_short { -scaled_pos } else { 0.0 }
             } else if dev < -s.deviation_threshold {
-                max_pos
+                // Cash cap on the buy side -- same bug class this session's rebalance()
+                // fixes addressed elsewhere: don't let the scale-up above submit a buy
+                // bigger than this agent can actually afford in cash.
+                let affordable_target = inventory + (agent.cash / mid.max(1e-9)).max(0.0);
+                scaled_pos.min(affordable_target)
             } else {
                 0.0
             };
