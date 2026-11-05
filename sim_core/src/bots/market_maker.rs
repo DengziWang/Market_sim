@@ -532,6 +532,15 @@ pub struct AssetState {
     /// "Sustained-drift extra de-risking") -- starts at 0.0 (freshly
     /// constructed agent has no position yet either way).
     pub inventory_drift_ema: f64,
+    /// Fill-rate feedback (2026-11-05, direct user request): a slow EMA of
+    /// "was this side's resting quote touched at all since its last wake"
+    /// (1.0/0.0 per wake), one per side. Same `level_being_touched` signal
+    /// markout tracking already reads, just aggregated differently -- this
+    /// is about *how often* a side fills, not what happens to price
+    /// afterward. Starts at 0.0 (untrusted, same convention as
+    /// `bid_depth_baseline` above) -- the first real reading sets it.
+    pub bid_fill_rate_ema: f64,
+    pub ask_fill_rate_ema: f64,
 }
 
 impl AssetState {
@@ -569,6 +578,8 @@ impl AssetState {
             ask_depth_baseline: 0.0,
             depth_collapsed_wakes: 0,
             inventory_drift_ema: 0.0,
+            bid_fill_rate_ema: 0.0,
+            ask_fill_rate_ema: 0.0,
         }
     }
 }
@@ -596,6 +607,19 @@ pub struct State {
     /// noisy correlation reading every wake, which chronically skewed
     /// quoting without the position actually being a problem yet.
     pub cross_asset_hedge_threshold: f64,
+    /// Scale on the fill-rate-imbalance skew (2026-11-05, direct user
+    /// request -- see `AssetState::bid_fill_rate_ema`'s doc comment): 0.0 =
+    /// no effect (today's behavior). A real market-clearing signal, same
+    /// family as `cross_asset_hedge_scale`/`predictive_skew_scale` above --
+    /// one side's resting quote getting hit far more than the other is
+    /// direct, observed evidence of excess demand/supply at the current
+    /// price, not an inferred proxy. If asks are filling faster than bids
+    /// (people keep buying what this agent offers), that's simultaneously
+    /// "raise price, buyers are eager" and "bids aren't attractive enough to
+    /// sellers yet" -- the same conclusion both ways, so one signed term
+    /// covers both directions the user described: `ask_fill_rate_ema -
+    /// bid_fill_rate_ema`, positive raises `reservation`, negative lowers it.
+    pub fill_imbalance_scale: f64,
     /// Depth-collapse panic trigger (module doc comment, idea #5): panic
     /// withdraw on an asset whose current near-touch depth, either side, has
     /// fallen below this fraction of its own slow EMA baseline -- 0.0 (ratio
@@ -905,6 +929,7 @@ impl State {
             // magnitude, not applying it unconditionally).
             cross_asset_hedge_scale: params::get_f64(p, "cross_asset_hedge_scale", 0.0),
             cross_asset_hedge_threshold: params::get_f64(p, "cross_asset_hedge_threshold", 0.4),
+            fill_imbalance_scale: params::get_f64(p, "fill_imbalance_scale", 0.0),
             depth_collapse_frac: params::get_f64(p, "depth_collapse_frac", 0.35),
             depth_collapse_max_wakes: params::get_f64(p, "depth_collapse_max_wakes", 50.0),
             depth_window: params::get_f64(p, "depth_window", 50.0),
@@ -1017,6 +1042,24 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         }
         if asset.ask_level.qty_placed > 1e-9 && level_being_touched(ctx, asset.asset_id, &asset.ask_level) {
             asset.pending_markouts.push_back((ctx.now, Side::Sell, asset.ask_level.price_placed));
+        }
+        // Fill-rate EMA (see `AssetState::bid_fill_rate_ema`'s doc comment):
+        // reuses the exact touch check just above, aggregated as a rate
+        // instead of individual markout observations. Only updates on a wake
+        // that actually had a live quote on that side -- a wake with no
+        // quote to observe (e.g. panic-withdrawn) leaves the EMA as-is
+        // rather than forcing a spurious "didn't fill" reading toward 0.
+        // Same alpha as `ema_mid` below, for the same reason: a
+        // requote-interval-scaled discrete EMA reacting on this agent's own
+        // existing timescale, not a separate new tunable.
+        let fill_ema_alpha = s.wake_interval / (s.horizon_secs + s.wake_interval).max(1e-9);
+        if asset.bid_level.qty_placed > 1e-9 {
+            let touched = if level_being_touched(ctx, asset.asset_id, &asset.bid_level) { 1.0 } else { 0.0 };
+            asset.bid_fill_rate_ema += fill_ema_alpha * (touched - asset.bid_fill_rate_ema);
+        }
+        if asset.ask_level.qty_placed > 1e-9 {
+            let touched = if level_being_touched(ctx, asset.asset_id, &asset.ask_level) { 1.0 } else { 0.0 };
+            asset.ask_fill_rate_ema += fill_ema_alpha * (touched - asset.ask_fill_rate_ema);
         }
 
         if let Some(id) = asset.bid_level.order_id {
@@ -1416,6 +1459,14 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         // without actually improving equity, see module doc comment).
         let hedge_excess = (hedge_signal.abs() - s.cross_asset_hedge_threshold).max(0.0) * hedge_signal.signum();
         let reservation = reservation - mid * hedge_excess * s.cross_asset_hedge_scale;
+        // Fill-rate imbalance skew (see `fill_imbalance_scale`'s own doc
+        // comment above for the full reasoning). Unlike the hedge/predictive
+        // skews above, this isn't gated on a threshold or sized by inventory
+        // -- it's this agent's own direct, realized execution experience on
+        // this exact asset, the same epistemic standing as the markout
+        // feedback just below.
+        let fill_imbalance = asset.ask_fill_rate_ema - asset.bid_fill_rate_ema;
+        let reservation = reservation + mid * fill_imbalance * s.fill_imbalance_scale;
         // Markout feedback, spread side: same signal as the size shrink
         // above, applied as extra widening -- a direct, measured "I'm
         // getting picked off here," on top of the vol/toxicity proxies.
