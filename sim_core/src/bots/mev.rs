@@ -11,6 +11,7 @@ use super::{RiskGovernor, StepCtx};
 use crate::agent::{Action, AgentCommon, NewOrderRequest, StepResult};
 use crate::params;
 use crate::types::{AssetId, FxHashMap, OrderType, Side, SimTime, TimeInForce};
+use rand::Rng;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Variant {
@@ -42,6 +43,18 @@ pub struct State {
     pub seen_payloads: Vec<u64>,
     /// Self de-risking on drawdown -- see `RiskGovernor`'s doc comment.
     pub risk: RiskGovernor,
+    /// Fraction of noticed, qualifying victims actually acted on (2026-11-05,
+    /// found during random-walk tuning work: every scenario TOML in this
+    /// project already sets `reaction_prob` -- e.g. 0.0003 -- but `step()`
+    /// below never read or applied it at all, so every mev agent reacted to
+    /// *every* qualifying victim unconditionally. Measured consequence: an
+    /// 18-agent (1.8%-of-population) mev group was capturing 30-75% of total
+    /// trade notional in the realistic composition, vs. this project's own
+    /// <1-2% target. Default 1.0 (react to every opportunity) preserves
+    /// exactly that prior behavior for any scenario that doesn't set this
+    /// param, so this fix only changes behavior where the TOML already
+    /// expressed an intent this code wasn't honoring.
+    pub reaction_prob: f64,
 }
 
 impl State {
@@ -84,6 +97,7 @@ impl State {
             frontrun_qty: 0.0,
             seen_payloads: Vec::new(),
             risk: RiskGovernor::from_params(p),
+            reaction_prob: params::get_f64(p, "reaction_prob", 1.0).clamp(0.0, 1.0),
         }
     }
 
@@ -144,14 +158,16 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                     .cloned();
                 if let Some(v) = victim {
                     s.mark_seen(v.payload_id);
-                    let qty = v.qty * s.size_frac_of_victim * s.risk.size_multiplier;
-                    actions.push(market_order(s.asset_id, v.side, qty));
-                    s.pending_sandwich = Some(PendingSandwich {
-                        payload_id: v.payload_id,
-                        close_side: v.side.opposite(),
-                        qty,
-                        close_at: v.execute_at + 1e-3,
-                    });
+                    if agent.rng.gen_bool(s.reaction_prob) {
+                        let qty = v.qty * s.size_frac_of_victim * s.risk.size_multiplier;
+                        actions.push(market_order(s.asset_id, v.side, qty));
+                        s.pending_sandwich = Some(PendingSandwich {
+                            payload_id: v.payload_id,
+                            close_side: v.side.opposite(),
+                            qty,
+                            close_at: v.execute_at + 1e-3,
+                        });
+                    }
                 }
             }
         }
@@ -171,11 +187,13 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                     .cloned();
                 if let Some(v) = victim {
                     s.mark_seen(v.payload_id);
-                    let qty = v.qty * s.size_frac_of_victim * s.risk.size_multiplier;
-                    actions.push(market_order(s.asset_id, v.side, qty));
-                    s.frontrun_close_at = Some(ctx.now + s.frontrun_hold_secs);
-                    s.frontrun_close_side = Some(v.side.opposite());
-                    s.frontrun_qty = qty;
+                    if agent.rng.gen_bool(s.reaction_prob) {
+                        let qty = v.qty * s.size_frac_of_victim * s.risk.size_multiplier;
+                        actions.push(market_order(s.asset_id, v.side, qty));
+                        s.frontrun_close_at = Some(ctx.now + s.frontrun_hold_secs);
+                        s.frontrun_close_side = Some(v.side.opposite());
+                        s.frontrun_qty = qty;
+                    }
                 }
             }
         }
@@ -189,9 +207,11 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                     .cloned();
                 if let Some(v) = hit {
                     s.mark_seen(v.payload_id);
-                    // No front leg: exploit the price impact *after* the large order has
-                    // landed, trading in the same direction (pure impact/arbitrage capture).
-                    actions.push(market_order(s.asset_id, v.side, v.qty * s.size_frac_of_victim * s.risk.size_multiplier));
+                    if agent.rng.gen_bool(s.reaction_prob) {
+                        // No front leg: exploit the price impact *after* the large order has
+                        // landed, trading in the same direction (pure impact/arbitrage capture).
+                        actions.push(market_order(s.asset_id, v.side, v.qty * s.size_frac_of_victim * s.risk.size_multiplier));
+                    }
                 }
             }
         }
