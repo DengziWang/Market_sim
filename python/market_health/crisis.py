@@ -96,3 +96,91 @@ def flash_crash_summary(price_series: pd.Series, **kwargs) -> dict:
         "mean_recovery_secs": float(np.mean(recoveries)) if recoveries else np.nan,
         "unrecovered_count": sum(1 for e in events if e["recovery_secs"] is None),
     }
+
+
+def detect_flash_growths(
+    price_series: pd.Series,
+    runup_threshold: float = 0.05,
+    window_secs: float = 30.0,
+    reversion_frac: float = 0.8,
+    max_reversion_horizon_secs: float = 300.0,
+) -> List[dict]:
+    """The mirror image of `detect_flash_crashes`: a "flash growth" is price rising by
+    >= `runup_threshold` from its trailing `window_secs` running min, within that same
+    window -- a sudden pump, exactly as toxic/fragile a sign as a sudden crash (poor
+    price discovery, not healthy, regardless of direction). For each detected growth,
+    reports height (max run-up), duration (time from trough to peak), and reversion
+    time (time from peak until price is back within `reversion_frac` of the pre-growth
+    trough, or None if it never reverts within `max_reversion_horizon_secs`)."""
+    if price_series.empty:
+        return []
+    times = price_series.index.to_numpy(dtype=float)
+    prices = price_series.to_numpy(dtype=float)
+    n = len(prices)
+
+    events = []
+    i = 0
+    while i < n:
+        # trailing running min within window_secs behind i -- use the *last* index
+        # attaining that min (not argmin's first-occurrence default), so a flat
+        # pre-growth period reports the trough at the moment right before the rise,
+        # not at the start of the flat stretch.
+        lo = np.searchsorted(times, times[i] - window_secs, side="left")
+        window = prices[lo : i + 1]
+        min_val = window.min()
+        trough_idx = lo + int(np.max(np.flatnonzero(window == min_val)))
+        trough = prices[trough_idx]
+        if trough <= 0:
+            i += 1
+            continue
+        runup = (prices[i] - trough) / trough
+        if runup >= runup_threshold:
+            # extend forward to find the local peak within the window
+            j = i
+            peak_idx = i
+            while j < n and times[j] - times[trough_idx] <= window_secs:
+                if prices[j] > prices[peak_idx]:
+                    peak_idx = j
+                j += 1
+            peak = prices[peak_idx]
+            height = (peak - trough) / trough
+            duration = times[peak_idx] - times[trough_idx]
+
+            reversion_time = None
+            target = trough + (peak - trough) * (1.0 - reversion_frac)
+            k = peak_idx
+            while k < n and times[k] - times[peak_idx] <= max_reversion_horizon_secs:
+                if prices[k] <= target:
+                    reversion_time = times[k] - times[peak_idx]
+                    break
+                k += 1
+
+            events.append(
+                {
+                    "trough_time": float(times[trough_idx]),
+                    "peak_time": float(times[peak_idx]),
+                    "trough_price": float(trough),
+                    "peak_price": float(peak),
+                    "height_frac": float(height),
+                    "duration_secs": float(duration),
+                    "reversion_secs": reversion_time,
+                }
+            )
+            i = max(j, peak_idx + 1)
+        else:
+            i += 1
+    return events
+
+
+def flash_growth_summary(price_series: pd.Series, **kwargs) -> dict:
+    events = detect_flash_growths(price_series, **kwargs)
+    if not events:
+        return {"n_flash_growths": 0, "mean_height_frac": np.nan, "mean_reversion_secs": np.nan, "unreverted_count": 0}
+    heights = [e["height_frac"] for e in events]
+    reversions = [e["reversion_secs"] for e in events if e["reversion_secs"] is not None]
+    return {
+        "n_flash_growths": len(events),
+        "mean_height_frac": float(np.mean(heights)),
+        "mean_reversion_secs": float(np.mean(reversions)) if reversions else np.nan,
+        "unreverted_count": sum(1 for e in events if e["reversion_secs"] is None),
+    }

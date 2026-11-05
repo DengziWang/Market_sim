@@ -9,7 +9,7 @@ use std::time::Instant;
 use rand::Rng;
 
 use crate::agent::{Action, AgentCommon, LeverageCfg, LiquidationExecStyle, NewOrderRequest, StepResult};
-use crate::bots::{self, arbitrage, dca, grid, human, liquidation_trader, market_maker, mean_reversion, mev, momentum, noise, wash_trading, BotStrategy, StepCtx};
+use crate::bots::{self, arbitrage, dca, grid, human, institutional_seller, liquidation_trader, market_maker, mean_reversion, mev, momentum, noise, wash_trading, BotStrategy, StepCtx};
 use crate::config::ScenarioConfig;
 use crate::event::{EventKind, EventQueue};
 use crate::export::{AgentStateRow, OrderEventRow, SimResult, SnapshotRow, TradeRow};
@@ -203,6 +203,13 @@ impl Simulation {
             self.events.push(self.now + jitter, EventKind::AgentWake { agent_id });
         }
         Ok(())
+    }
+
+    /// See `Market::set_max_price_move_frac`'s doc comment -- this is the
+    /// `Simulation`-level passthrough `sim_pyo3::continue_simulation_with_breaker`
+    /// calls after loading a checkpoint and before resuming.
+    pub fn set_max_price_move_frac(&mut self, v: f64) {
+        self.market.set_max_price_move_frac(v);
     }
 
     /// Serializes the full simulation state (order books, agents, RNG streams,
@@ -968,7 +975,10 @@ fn build_population(cfg: &ScenarioConfig, starting_agent_id: AgentId, market: &M
         for i in 0..group.count {
             let mut rng = rng::agent_rng(cfg.run.seed, agent_id);
             let mut cash = if cash_hi > cash_lo { rng.gen_range(cash_lo..cash_hi) } else { cash_lo };
-            let asset_a = (i as usize % n_assets) as AssetId;
+            // `target_asset`, when set, pins every agent in this group onto one
+            // specific asset instead of the default round-robin-from-0 -- see
+            // `BotGroupConfig::target_asset`'s own doc comment.
+            let asset_a = group.target_asset.map(|a| a as AssetId).unwrap_or((i as usize % n_assets) as AssetId);
             let asset_b = ((i as usize + 1) % n_assets) as AssetId;
             let asset_c = ((i as usize + 2) % n_assets) as AssetId;
             let venue_b: VenueId = if n_venues > 1 { 1 } else { 0 };
@@ -1034,6 +1044,11 @@ fn build_population(cfg: &ScenarioConfig, starting_agent_id: AgentId, market: &M
                 "human" => {
                     BotStrategy::Human(human::State::from_params(parse_human_variant(&group.variant)?, asset_a, cfg.assets[asset_a as usize].initial_price, &params, &mut rng))
                 }
+                "institutional_seller" => BotStrategy::InstitutionalSeller(institutional_seller::State::from_params(
+                    parse_institutional_seller_variant(&group.variant)?,
+                    asset_a,
+                    &params,
+                )),
                 other => return Err(format!("unknown bot_type '{other}' in population config")),
             };
 
@@ -1215,4 +1230,7 @@ variant_parser!(parse_noise_variant, noise::Variant, {
 variant_parser!(parse_human_variant, human::Variant, {
     "retail" => human::Variant::Retail,
     "lite" => human::Variant::Lite,
+});
+variant_parser!(parse_institutional_seller_variant, institutional_seller::Variant, {
+    "pov" => institutional_seller::Variant::Pov,
 });

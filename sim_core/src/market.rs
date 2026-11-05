@@ -82,7 +82,19 @@ pub struct Market {
     last_tick_sample: FxHashMap<AssetId, f64>,
     next_order_id: OrderId,
     next_payload_id: u64,
+    /// Trailing (time, qty) trade history per asset, for `trailing_volume` --
+    /// the only consumer today is `bots::institutional_seller`'s
+    /// Percentage-of-Volume pacing, which needs a asset's own recent trade
+    /// volume that no existing field tracks (`last_trade_price` is a single
+    /// scalar, and per-agent `cumulative_volume` is lifetime, not windowed).
+    /// Pruned to `VOLUME_LOG_HORIZON_SECS` on every push rather than at read
+    /// time, so it never grows unbounded over a long run.
+    trade_volume_log: FxHashMap<AssetId, std::collections::VecDeque<(SimTime, f64)>>,
 }
+
+/// Comfortably above any trailing window actually configured (the real
+/// event's own window is 60s) -- just bounds memory, not a behavioral knob.
+const VOLUME_LOG_HORIZON_SECS: SimTime = 600.0;
 
 /// See `Market::recent_log_returns`'s doc comment.
 const MARKET_HISTORY_CAPACITY: usize = 30;
@@ -138,6 +150,7 @@ impl Market {
             last_tick_sample,
             next_order_id: 1,
             next_payload_id: 1,
+            trade_volume_log: FxHashMap::default(),
         }
     }
 
@@ -153,6 +166,23 @@ impl Market {
     }
     fn book_mut(&mut self, venue: VenueId, asset: AssetId) -> &mut OrderBook {
         self.books.get_mut(&(venue, asset)).expect("unknown (venue, asset)")
+    }
+
+    /// Overrides the circuit breaker's `max_price_move_frac` on every order book
+    /// (every venue/asset), immediately -- unlike every other `MarketConfig` field,
+    /// which is only ever read at construction, this one can be changed mid-run.
+    /// Added so a scenario can run with the breaker at its normal setting through a
+    /// warmup period, then switch it to a different value (e.g. `1e9` to disable)
+    /// shortly before some scripted shock, without needing a fresh `Simulation` --
+    /// see `sim_pyo3::continue_simulation_with_breaker`. `circuit_breaker_ema`
+    /// itself (the breaker's slow reference series) is untouched: this only changes
+    /// how wide a band is allowed around whatever that reference already is.
+    pub fn set_max_price_move_frac(&mut self, v: f64) {
+        let v = v.max(0.0);
+        self.cfg.max_price_move_frac = v;
+        for book in self.books.values_mut() {
+            book.max_price_move_frac = v;
+        }
     }
 
     /// The book's own mid price, or the asset's configured `initial_price` as a
@@ -252,8 +282,28 @@ impl Market {
         let result = self.book_mut(venue, asset_id).submit(order, time, cb_reference_price);
         for f in &result.fills {
             self.last_trade_price.insert((venue, asset_id), self.assets[asset_id as usize].tick_size * f.price_ticks as f64);
+            self.record_trade_volume(f.asset_id, f.time, f.qty);
         }
         (id, result)
+    }
+
+    /// See `trade_volume_log`'s doc comment.
+    fn record_trade_volume(&mut self, asset_id: AssetId, time: SimTime, qty: f64) {
+        let log = self.trade_volume_log.entry(asset_id).or_default();
+        log.push_back((time, qty));
+        while log.front().map_or(false, |&(t, _)| t < time - VOLUME_LOG_HORIZON_SECS) {
+            log.pop_front();
+        }
+    }
+
+    /// Total trade volume for `asset_id` over the trailing `window_secs` up to
+    /// `now`. `window_secs` beyond `VOLUME_LOG_HORIZON_SECS` would silently
+    /// under-count -- not a concern for any caller today (the only consumer,
+    /// `institutional_seller`, uses a 60s window by default).
+    pub fn trailing_volume(&self, asset_id: AssetId, now: SimTime, window_secs: SimTime) -> f64 {
+        let Some(log) = self.trade_volume_log.get(&asset_id) else { return 0.0 };
+        let cutoff = now - window_secs;
+        log.iter().rev().take_while(|&&(t, _)| t >= cutoff).map(|&(_, q)| q).sum()
     }
 
     pub fn cancel(&mut self, venue: VenueId, asset_id: AssetId, order_id: OrderId, time: SimTime) -> Option<OrderEvent> {

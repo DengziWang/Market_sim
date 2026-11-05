@@ -31,12 +31,10 @@ from market_health import wash_trading as washmod
 #   absent  : diagnostic only, not folded into the composite score
 METRIC_DIRECTION: Dict[str, Any] = {
     "liquidity.mean_rel_spread": -1,
-    "liquidity.median_rel_spread": -1,
     "liquidity.mean_bid_depth": 1,
     "liquidity.mean_ask_depth": 1,
-    "liquidity.amihud": -1,
-    "liquidity.kyle_lambda": -1,
-    "liquidity.mean_recovery_secs": -1,
+    "liquidity.n_trades": 1,
+    "liquidity.notional_volume": 1,
     "volatility.jump_variance_fraction": -1,
     "efficiency.variance_ratio": "dist1",
     "efficiency.return_autocorr_lag1": "dist0",
@@ -55,6 +53,10 @@ METRIC_DIRECTION: Dict[str, Any] = {
     "crisis.mean_depth_frac": -1,
     "crisis.mean_recovery_secs": -1,
     "crisis.unrecovered_count": -1,
+    "crisis.n_flash_growths": -1,
+    "crisis.mean_height_frac": -1,
+    "crisis.mean_reversion_secs": -1,
+    "crisis.unreverted_count": -1,
 }
 
 # Metric-name prefix -> which of the report's 6 dimensions it belongs to. Flash-crash
@@ -115,6 +117,8 @@ def compute_run_metrics(run: Dict[str, Any], asset_ids: Optional[Sequence[int]] 
             m.update({f"liquidity.{k}": v for k, v in liquidity.resilience(snapshots, aid).items()})
         m["liquidity.amihud"] = liquidity.amihud_illiquidity(trades, aid)
         m["liquidity.kyle_lambda"] = liquidity.kyle_lambda(trades, aid)
+        m["liquidity.n_trades"] = liquidity.trade_count(trades, aid)
+        m["liquidity.notional_volume"] = liquidity.notional_volume(trades, aid)
 
         price_series = volatility.trade_price_series(trades, aid)
         m["volatility.realized"] = volatility.realized_volatility(price_series)
@@ -138,6 +142,7 @@ def compute_run_metrics(run: Dict[str, Any], asset_ids: Optional[Sequence[int]] 
             m.update({f"wash.{k}": v for k, v in fn(sizes).items() if k not in ("n", "n_tail")})
 
         m.update({f"crisis.{k}": v for k, v in crisis.flash_crash_summary(price_series).items()})
+        m.update({f"crisis.{k}": v for k, v in crisis.flash_growth_summary(price_series).items()})
         m["_asset_id"] = aid
         rows.append(m)
 

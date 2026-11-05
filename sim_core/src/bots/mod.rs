@@ -8,6 +8,7 @@ pub mod arbitrage;
 pub mod dca;
 pub mod grid;
 pub mod human;
+pub mod institutional_seller;
 pub mod liquidation_trader;
 pub mod market_maker;
 pub mod mean_reversion;
@@ -137,6 +138,7 @@ pub enum BotStrategy {
     WashTrading(wash_trading::State),
     Noise(noise::State),
     Human(human::State),
+    InstitutionalSeller(institutional_seller::State),
 }
 
 impl BotStrategy {
@@ -152,6 +154,7 @@ impl BotStrategy {
             BotStrategy::WashTrading(s) => ("wash_trading", s.variant_name()),
             BotStrategy::Noise(s) => ("noise", s.variant_name()),
             BotStrategy::Human(s) => ("human", s.variant_name()),
+            BotStrategy::InstitutionalSeller(s) => ("institutional_seller", s.variant_name()),
         }
     }
 }
@@ -177,6 +180,7 @@ pub fn step(agent: &mut AgentCommon, strat: &mut BotStrategy, ctx: &StepCtx) -> 
         BotStrategy::WashTrading(s) => wash_trading::step(agent, s, ctx),
         BotStrategy::Noise(s) => noise::step(agent, s, ctx),
         BotStrategy::Human(s) => human::step(agent, s, ctx),
+        BotStrategy::InstitutionalSeller(s) => institutional_seller::step(agent, s, ctx),
     }
 }
 
@@ -195,6 +199,7 @@ pub fn primary_asset(strat: &BotStrategy) -> crate::types::AssetId {
         BotStrategy::WashTrading(s) => s.asset_id,
         BotStrategy::Noise(s) => s.asset_id,
         BotStrategy::Human(s) => s.asset_id,
+        BotStrategy::InstitutionalSeller(s) => s.asset_id,
     }
 }
 

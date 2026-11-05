@@ -357,12 +357,21 @@ impl Default for LiquidationConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotGroupConfig {
     /// One of: market_maker, arbitrage, momentum, mean_reversion, grid, dca,
-    /// liquidation_exec, mev, wash_trading, noise.
+    /// liquidation_exec, mev, wash_trading, noise, human, institutional_seller.
     pub bot_type: String,
     pub variant: String,
     pub count: u32,
     #[serde(default)]
     pub initial_cash_range: Option<(f64, f64)>,
+    /// Pins every agent in this group onto one specific asset index, instead
+    /// of the default round-robin-from-0 (`build_population`'s `asset_a = i %
+    /// n_assets`). Added so a scenario can target a sell program (or any
+    /// other single-asset bot) at a specific non-first asset -- e.g. "dump
+    /// only onto asset 3" -- without needing a dedicated single-asset
+    /// scenario file. Ignored by multi-asset strategies that manage every
+    /// asset regardless (market_maker).
+    #[serde(default)]
+    pub target_asset: Option<usize>,
     /// Fraction of this group that additionally carries a leveraged margin position
     /// (independent of bot_type, per spec 5.7 -- momentum/grid/etc. bots can be
     /// leveraged too).

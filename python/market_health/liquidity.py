@@ -63,6 +63,23 @@ def depth_stats(snapshots: pd.DataFrame, asset_id: int, levels: Optional[int] = 
     }
 
 
+def trade_count(trades: pd.DataFrame, asset_id: int) -> int:
+    """Realized liquidity: the number of trades that actually executed for this
+    asset in the window -- as opposed to the quoted-side metrics above (spread,
+    depth), which describe resting orders that may never fill. More executed
+    trades = more realized liquidity."""
+    return int((trades["asset_id"] == asset_id).sum())
+
+
+def notional_volume(trades: pd.DataFrame, asset_id: int) -> float:
+    """Total dollar (notional) volume traded -- sum(price * qty) over every trade
+    for this asset in the window. The size-weighted companion to `trade_count`:
+    a market can have many small trades (high count, low volume) or a few large
+    ones (low count, high volume); this captures the latter."""
+    t = trades[trades["asset_id"] == asset_id]
+    return float((t["price"] * t["qty"]).sum())
+
+
 def amihud_illiquidity(trades: pd.DataFrame, asset_id: int, bucket_seconds: float = 60.0) -> float:
     """Amihud (2002): mean( |return| / dollar_volume ) over time buckets. Larger =
     less liquid (a given amount of trading moves price more)."""

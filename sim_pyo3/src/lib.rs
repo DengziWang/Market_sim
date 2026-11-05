@@ -339,6 +339,21 @@ fn continue_simulation(py: Python<'_>, checkpoint: &[u8], additional_seconds: f6
     result_to_pyobject(py, sim, result, n_agents)
 }
 
+/// Same as `continue_simulation`, but first overrides the circuit breaker's
+/// `max_price_move_frac` (see `Market::set_max_price_move_frac`) to `max_price_move_frac`
+/// before resuming -- e.g. to switch it from its normal value to `1e9` (effectively
+/// disabled) shortly before a scripted shock, without needing a fresh `Simulation`.
+/// Every other config field is unaffected and stays whatever the checkpoint already
+/// had.
+#[pyfunction]
+fn continue_simulation_with_breaker(py: Python<'_>, checkpoint: &[u8], additional_seconds: f64, max_price_move_frac: f64) -> PyResult<PyObject> {
+    let mut sim = Simulation::from_checkpoint_bytes(checkpoint).map_err(PyValueError::new_err)?;
+    sim.set_max_price_move_frac(max_price_move_frac);
+    let n_agents = sim.agents.len() as u32;
+    let (sim, result) = py.allow_threads(|| sim.resume_keep_state(additional_seconds, None, None));
+    result_to_pyobject(py, sim, result, n_agents)
+}
+
 /// Same as `continue_simulation`, but accepts a `CancelToken` (see
 /// `run_simulation_cancellable`) so a long continuation can also be stopped early
 /// from another thread, and an optional `ProgressHandle`.
@@ -376,6 +391,7 @@ fn sim_pyo3(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_warmup_then_graft, m)?)?;
     m.add_function(wrap_pyfunction!(graft_from_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(continue_simulation, m)?)?;
+    m.add_function(wrap_pyfunction!(continue_simulation_with_breaker, m)?)?;
     m.add_function(wrap_pyfunction!(continue_simulation_cancellable, m)?)?;
     m.add_function(wrap_pyfunction!(validate_config, m)?)?;
     m.add_class::<CancelToken>()?;

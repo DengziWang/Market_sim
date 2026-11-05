@@ -527,6 +527,25 @@ pub struct State {
     /// rather than just another input into it. 1.0 = no extra dump beyond
     /// whatever the normal sizing already produced.
     pub panic_sell_qty_mult: f64,
+    /// Mirror of `panic_sell_signal_multiple` (2026-11-05, direct user request
+    /// after the crash investigation traced persistent human sell-bias --
+    /// price trading below fundamental value 65-77% of the time -- to this
+    /// file's override mechanisms all pushing one direction: panic_sell,
+    /// capitulation_sell, and the rising-trend profit-take override all only
+    /// ever force extra *selling*; nothing forced extra buying). Same
+    /// structure as `panic_sell`, mirrored: how many "units" (`price_component`)
+    /// a *rise* must clear, past the ordinary act-at-all dead zone, before it
+    /// counts as a rally worth chasing into rather than an everyday up move.
+    pub panic_buy_signal_multiple: f64,
+    /// Scale on how far the rise clears `panic_buy_signal_multiple` (the
+    /// "rally excess") that converts into this wake's panic-buy probability.
+    /// 0 = panic buying never fires (old behavior: no forced-buy override
+    /// existed at all). Mirrors `panic_sell_prob_scale`.
+    pub panic_buy_prob_scale: f64,
+    /// Multiplier applied to the buy quantity once panic buying fires, on top
+    /// of the ordinary sizing -- mirrors `panic_sell_qty_mult`, same "override,
+    /// not just another input" reasoning.
+    pub panic_buy_qty_mult: f64,
     /// Module doc comment's "Slow-bleed capitulation" section: consecutive wakes
     /// spent with an open position at an unrealized loss (CPT value < 0). Reset to
     /// 0 whenever the agent goes flat or the position's CPT value is >= 0 (back to
@@ -550,6 +569,28 @@ pub struct State {
     /// the hold instinct runs out, so applying the hold-and-hope shrink on top
     /// would defeat it.
     pub capitulation_qty_mult: f64,
+    /// Mirror of `avg_entry_price`/`wakes_underwater`'s machinery, opposite
+    /// direction (2026-11-05, direct user request -- see `panic_buy`'s own
+    /// comment for the full reasoning): the `mid` price at the moment this
+    /// agent most recently went flat (inventory crossed to ~0), so a long
+    /// stretch of price climbing *since* can be measured the same way
+    /// `avg_entry_price` measures a loss since entry. `None` while holding a
+    /// position (mirrors `avg_entry_price` being `None` while flat).
+    pub flat_since_price: Option<f64>,
+    /// Mirror of `wakes_underwater`: consecutive wakes spent flat (or holding
+    /// too little to matter) while price has climbed above `flat_since_price`
+    /// -- a long, grinding "I'm missing this rally" stretch, the FOMO
+    /// counterpart to a long grinding loss. Reset the moment the agent opens a
+    /// real position or price drops back to/below `flat_since_price`.
+    pub wakes_missed_rally: u32,
+    /// Mirror of `capitulation_fatigue_threshold_wakes`.
+    pub fomo_fatigue_threshold_wakes: f64,
+    /// Mirror of `capitulation_fatigue_prob_scale`.
+    pub fomo_fatigue_prob_scale: f64,
+    /// Mirror of `capitulation_qty_mult` -- overrides (not feeds into) the
+    /// ordinary buy sizing once FOMO fatigue fires, same "the resistance
+    /// finally gives out" reasoning as `capitulation_qty_mult`.
+    pub fomo_qty_mult: f64,
     /// Rolling, *biased* fitness (realized hypothetical payoff) of the chartist and
     /// fundamentalist signals -- see the module doc comment's "biased, not accurate,
     /// self-scoring" section. Updated each wake from what actually happened since
@@ -742,6 +783,11 @@ impl State {
             // -- a real capitulation sale, not a slightly-larger-than-usual
             // one.
             panic_sell_qty_mult: params::get_f64(p, "panic_sell_qty_mult", 2.0).max(1.0),
+            // Mirrors of the panic_sell defaults just above, same reasoning,
+            // opposite direction -- see State's own field comments.
+            panic_buy_signal_multiple: params::get_f64(p, "panic_buy_signal_multiple", 4.0),
+            panic_buy_prob_scale: params::get_f64(p, "panic_buy_prob_scale", 0.3),
+            panic_buy_qty_mult: params::get_f64(p, "panic_buy_qty_mult", 2.0).max(1.0),
             wakes_underwater: 0,
             // Default 20: at this agent's own average check-in interval
             // (`background_wake_min`/`max`'s midpoint, ~21.5 min at the defaults
@@ -758,6 +804,13 @@ impl State {
             // Default 1.5: more modest than panic_sell_qty_mult's 2.0 -- this is
             // "finally giving up on a slow bleed," not a frantic crash dump.
             capitulation_qty_mult: params::get_f64(p, "capitulation_qty_mult", 1.5).max(1.0),
+            // Mirrors of the capitulation_sell defaults just above, same
+            // reasoning, opposite direction -- see State's own field comments.
+            flat_since_price: None,
+            wakes_missed_rally: 0,
+            fomo_fatigue_threshold_wakes: params::get_f64(p, "fomo_fatigue_threshold_wakes", 20.0),
+            fomo_fatigue_prob_scale: params::get_f64(p, "fomo_fatigue_prob_scale", 0.05),
+            fomo_qty_mult: params::get_f64(p, "fomo_qty_mult", 1.5).max(1.0),
             chartist_fitness: 0.0,
             fundamentalist_fitness: 0.0,
             contrarian_fitness: {
@@ -939,6 +992,21 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
     let currently_underwater = inventory > 1e-9
         && s.avg_entry_price.is_some_and(|entry| mid < entry);
     s.wakes_underwater = if currently_underwater { s.wakes_underwater + 1 } else { 0 };
+
+    // FOMO-fatigue tracking -- mirrors the capitulation-sell tracking just
+    // above, opposite direction (see `flat_since_price`/`wakes_missed_rally`'s
+    // own field comments). `flat_since_price` is set once, the moment this
+    // agent becomes flat, and held fixed (not re-maxed every wake like
+    // `position_high_water_mark`) for as long as it stays flat -- mirrors
+    // `avg_entry_price` only updating on an actual trade, not every wake.
+    s.flat_since_price = if inventory <= 1e-9 {
+        Some(s.flat_since_price.unwrap_or(mid))
+    } else {
+        None
+    };
+    let currently_missing_rally = inventory <= 1e-9
+        && s.flat_since_price.is_some_and(|ref_price| mid > ref_price);
+    s.wakes_missed_rally = if currently_missing_rally { s.wakes_missed_rally + 1 } else { 0 };
 
     // Realized return since last check-in, time-normalized the same way regardless
     // of which downstream use it feeds (chartist signal below, and the Brock-Hommes
@@ -1190,6 +1258,22 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         crash_excess > 0.0 && agent.rng.gen_bool((s.panic_sell_prob_scale * crash_excess).clamp(0.0, 1.0))
     };
 
+    // Fast-rally panic buying -- mirrors `panic_sell` exactly, opposite
+    // direction (2026-11-05, direct user request: the crash investigation
+    // traced persistent sell-bias -- price trading below fundamental value
+    // 65-77% of the time -- to every override mechanism in this file forcing
+    // extra *selling*, with nothing forcing extra buying). Real FOMO/euphoria
+    // buying into a fast rally is exactly as well-documented a retail bias as
+    // panic selling into a fast crash. No inventory gate (unlike panic_sell,
+    // which requires an existing long to dump): FOMO buying is specifically
+    // about an agent who *isn't* positioned enough chasing in, not reducing
+    // an existing position -- the usual Buy-side cash/position caps below
+    // still apply, same as any other buy.
+    let panic_buy = prior_price_component > 0.0 && {
+        let rally_excess = (price_component - s.panic_buy_signal_multiple).max(0.0);
+        rally_excess > 0.0 && agent.rng.gen_bool((s.panic_buy_prob_scale * rally_excess).clamp(0.0, 1.0))
+    };
+
     // Slow-bleed capitulation (module doc comment): the chronic counterpart to
     // `panic_sell`'s acute one. Independent of `raw_signal`'s direction, same
     // construction as `panic_sell`/`spontaneous_take_profit` -- so an agent whose
@@ -1204,15 +1288,35 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         fatigue_excess > 0.0 && agent.rng.gen_bool((s.capitulation_fatigue_prob_scale * fatigue_excess).clamp(0.0, 1.0))
     };
 
-    let acts_this_time = signal_acts || spontaneous_take_profit || panic_sell || capitulation_sell;
+    // FOMO fatigue -- mirrors `capitulation_sell` exactly, opposite direction
+    // (2026-11-05, direct user request -- see `panic_buy`'s own comment for
+    // the full reasoning). The chronic counterpart to `panic_buy`'s acute one:
+    // an agent whose own signal has stayed stubbornly bearish/flat through a
+    // long, grinding rally still eventually gives in and buys, not holds out
+    // forever. Gated on `wakes_missed_rally` alone (duration), same shape as
+    // `capitulation_sell`.
+    let capitulation_buy = {
+        let fatigue_excess = (s.wakes_missed_rally as f64 - s.fomo_fatigue_threshold_wakes).max(0.0);
+        fatigue_excess > 0.0 && agent.rng.gen_bool((s.fomo_fatigue_prob_scale * fatigue_excess).clamp(0.0, 1.0))
+    };
+
+    let acts_this_time = signal_acts || spontaneous_take_profit || panic_sell || capitulation_sell || panic_buy || capitulation_buy;
 
     if acts_this_time {
         // `spontaneous_take_profit`/`panic_sell`/`capitulation_sell` only ever
         // reach here on their own terms (independent of `signal_acts`, see
         // above), so there's no real `raw_signal` direction to defer to -- all
         // three are always a sell, by construction (module doc comment).
+        // `panic_buy`/`capitulation_buy` are the forced-direction cases that
+        // are a Buy instead -- checked after the sell-forcing cases so a wake
+        // that somehow has both a sell- and a buy-forcing condition (shouldn't
+        // happen in practice: the sell-forcers all require an open long
+        // position, the buy-forcers' duration counters only run while flat)
+        // still resolves deterministically to Sell.
         let mut side = if spontaneous_take_profit || panic_sell || capitulation_sell {
             Side::Sell
+        } else if panic_buy || capitulation_buy {
+            Side::Buy
         } else if raw_signal > 0.0 {
             Side::Buy
         } else {
@@ -1304,6 +1408,21 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
                 qty = qty.min(inventory.max(0.0));
             }
             Side::Buy => {
+                if panic_buy {
+                    // Mirrors panic_sell's own qty_mult above -- an override on
+                    // top of whatever the ordinary sizing produced, applied
+                    // before the position/cash caps just below so it's still
+                    // subject to the same affordability limits as any other
+                    // buy, same as panic_sell still gets capped by `inventory`
+                    // at the end of the Sell branch.
+                    qty *= s.panic_buy_qty_mult;
+                }
+                if capitulation_buy {
+                    // Mirrors capitulation_sell's own qty_mult -- independent
+                    // of (stacks with, in the rare case both fire the same
+                    // wake) panic_buy's multiplier just above.
+                    qty *= s.fomo_qty_mult;
+                }
                 // `aggressive_sizing_propensity` (>= 1.0, see its field comment)
                 // loosens both caps together for this specific agent -- most
                 // agents' draw is close to the 1.0 floor (today's exact caps),
