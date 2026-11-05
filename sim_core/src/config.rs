@@ -217,6 +217,22 @@ pub struct MarketConfig {
     /// disable.
     #[serde(default = "default_max_resting_order_age")]
     pub max_resting_order_age_secs: f64,
+    /// Submit-time sanity band on any limit order's price, as a fraction of
+    /// that asset's current latent fundamental value (checked against
+    /// fundamental value rather than mid price specifically because it's a
+    /// ground-truth process immune to being corrupted by trading activity
+    /// itself -- see `Market::submit`'s `far_from_fundamental` doc comment).
+    /// This is a *separate* last-line-of-defense guard from the matching-time
+    /// circuit breaker (`max_price_move_frac`): it catches a bad resting
+    /// price before it ever reaches the book, including one that doesn't
+    /// cross anything and so would never trip the circuit breaker at all.
+    /// Set to 0.0 to effectively disable (every positive price then passes).
+    #[serde(default = "default_fundamental_sanity_min_frac")]
+    pub fundamental_sanity_min_frac: f64,
+    /// Upper bound counterpart to `fundamental_sanity_min_frac` -- see its
+    /// doc comment. Set very large (e.g. 1e12) to effectively disable.
+    #[serde(default = "default_fundamental_sanity_max_frac")]
+    pub fundamental_sanity_max_frac: f64,
 }
 fn default_snapshot_interval() -> f64 {
     1.0
@@ -236,6 +252,12 @@ fn default_price_protection_ema_halflife() -> f64 {
 fn default_max_resting_order_age() -> f64 {
     3600.0
 }
+fn default_fundamental_sanity_min_frac() -> f64 {
+    0.02
+}
+fn default_fundamental_sanity_max_frac() -> f64 {
+    50.0
+}
 impl Default for MarketConfig {
     fn default() -> Self {
         Self {
@@ -245,6 +267,8 @@ impl Default for MarketConfig {
             max_price_move_frac: default_max_price_move_frac(),
             price_protection_ema_halflife_secs: default_price_protection_ema_halflife(),
             max_resting_order_age_secs: default_max_resting_order_age(),
+            fundamental_sanity_min_frac: default_fundamental_sanity_min_frac(),
+            fundamental_sanity_max_frac: default_fundamental_sanity_max_frac(),
         }
     }
 }

@@ -240,7 +240,9 @@ impl Market {
         let invalid_price = matches!(order_type, OrderType::Limit) && price_ticks.map_or(true, |t| t <= 0);
         let far_from_fundamental = matches!(order_type, OrderType::Limit)
             && price.map_or(false, |p| {
-                self.fundamental_value.get(&asset_id).map_or(false, |&fv| fv > 0.0 && (p < fv * 0.02 || p > fv * 50.0))
+                self.fundamental_value.get(&asset_id).map_or(false, |&fv| {
+                    fv > 0.0 && (p < fv * self.cfg.fundamental_sanity_min_frac || p > fv * self.cfg.fundamental_sanity_max_frac)
+                })
             });
         let invalid_price = invalid_price || far_from_fundamental;
         let invalid_qty = !qty.is_finite() || qty <= 0.0;

@@ -232,7 +232,17 @@ impl State {
             // clone bursts (module doc comment) -- the widest jitter of the bunch,
             // since desynchronizing *when* agents act matters as much as *how*
             // they read the signal.
-            wake_interval: jittered(rng, params::get_f64(p, "wake_interval_secs", 5.0), 0.4).max(0.5),
+            // (2026-11-06, direct user request: "make everyone jitter every
+            // time") `wake_interval` now stores the un-jittered base; the
+            // +/-40% jitter is re-rolled every wake in `step()` instead of
+            // drawn once here and fixed for the agent's life -- same
+            // every-wake desync mechanism market_maker.rs already used.
+            // Every other jittered field below (lookback windows,
+            // thresholds) is unaffected and still drawn once per agent --
+            // that jitter is about giving each agent a distinct, *stable*
+            // trading personality, a separate concern from wake-clock
+            // desync.
+            wake_interval: params::get_f64(p, "wake_interval_secs", 5.0).max(0.5),
             order_qty,
             allow_short: params::get_bool(p, "allow_short", true),
             alpha_short: 2.0 / (short_p + 1.0),
@@ -296,7 +306,7 @@ fn rebalance(asset_id: AssetId, current: f64, target: f64) -> Option<Action> {
 pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult {
     let mut actions = Vec::new();
     let Some(mid) = ctx.market.mid_price(ctx.venue, s.asset_id) else {
-        return StepResult { actions, next_wake: Some(ctx.now + s.wake_interval) };
+        return StepResult { actions, next_wake: Some(ctx.now + jittered(&mut agent.rng, s.wake_interval, 0.4).max(0.5)) };
     };
     let inventory = agent.inventory_of(s.asset_id);
     let max_pos = if s.allow_short { s.order_qty } else { s.order_qty };
@@ -443,6 +453,5 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         }
     }
 
-    let _ = agent;
-    StepResult { actions, next_wake: Some(ctx.now + s.wake_interval) }
+    StepResult { actions, next_wake: Some(ctx.now + jittered(&mut agent.rng, s.wake_interval, 0.4).max(0.5)) }
 }

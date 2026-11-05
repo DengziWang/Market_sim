@@ -13,6 +13,13 @@ use crate::params;
 use crate::types::{AssetId, FxHashMap, OrderType, Side, SimTime, TimeInForce};
 use rand::Rng;
 
+/// Same two-line helper as momentum.rs/mean_reversion.rs/dca.rs. Draws
+/// `default * Uniform(1-frac, 1+frac)`.
+fn jittered(rng: &mut impl Rng, default: f64, frac: f64) -> f64 {
+    let frac = frac.clamp(0.0, 0.95);
+    default * rng.gen_range((1.0 - frac)..(1.0 + frac))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Variant {
     Sandwich,
@@ -82,6 +89,18 @@ impl State {
     /// Raising the threshold and slowing the wake interval took sandwich from
     /// -X%/60.7% bankrupt to +110%/10.7% bankrupt on the same 25,000s benchmark
     /// (frontrun: similar swing, from 67.9% to 14.3% bankrupt).
+    ///
+    /// **Small wake jitter, every wake (2026-11-06, direct user request)**: mev
+    /// agents previously shared one exact `wake_interval` with zero
+    /// randomization -- deliberate (module doc comment: "a handful of very
+    /// active agents..., not a large evenly spread population", modeling real
+    /// sandwich activity's concentration in a few dominant bots), but that
+    /// still means every agent of a variant polls in perfect lockstep.
+    /// `wake_interval` here stores the un-jittered base; a small (+/-5%)
+    /// jitter is re-rolled every wake in `step()` instead (same every-wake
+    /// desync mechanism market_maker.rs uses, nowhere near momentum's
+    /// +/-40%), keeping the intended concentration/homogeneity while still
+    /// breaking exact synchrony between the handful of agents.
     pub fn from_params(variant: Variant, asset_id: AssetId, initial_price: f64, p: &toml::Value) -> Self {
         let min_victim_qty = params::get_f64(p, "min_victim_notional", 80_000.0) / initial_price.max(1e-9);
         Self {
@@ -217,5 +236,5 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         }
     }
 
-    StepResult { actions, next_wake: Some(ctx.now + s.wake_interval) }
+    StepResult { actions, next_wake: Some(ctx.now + jittered(&mut agent.rng, s.wake_interval, 0.05)) }
 }

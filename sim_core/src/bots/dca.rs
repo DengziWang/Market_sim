@@ -4,6 +4,16 @@ use super::StepCtx;
 use crate::agent::{Action, AgentCommon, NewOrderRequest, StepResult};
 use crate::params;
 use crate::types::{AssetId, OrderType, Side, SimTime, TimeInForce};
+use rand::Rng;
+
+/// Same two-line helper as momentum.rs/mean_reversion.rs (not shared via
+/// `super` for the same reason those two don't share it with each other --
+/// no other dependency between the modules). Draws `default *
+/// Uniform(1-frac, 1+frac)`.
+fn jittered(rng: &mut impl Rng, default: f64, frac: f64) -> f64 {
+    let frac = frac.clamp(0.0, 0.95);
+    default * rng.gen_range((1.0 - frac)..(1.0 + frac))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Variant {
@@ -47,6 +57,17 @@ impl State {
     /// hundreds -- scaling automatically with however long this particular run
     /// actually is, rather than a fixed constant tuned for one specific length.
     /// An explicit `wake_interval_secs` param still overrides this.
+    ///
+    /// **Small wake jitter, every wake (2026-11-06, direct user request)**:
+    /// every dca agent of a given variant used to share the exact same
+    /// `wake_interval` with no randomization at all -- a deliberate choice
+    /// (this doc comment's own "real dollar-cost-averaging is a ... discipline"
+    /// reasoning), but it does mean every dca agent of a variant fires in
+    /// perfect lockstep on the same schedule. `wake_interval` here stores the
+    /// un-jittered base; a small (+/-5%) jitter is re-rolled every wake in
+    /// `step()` instead (same every-wake desync mechanism market_maker.rs
+    /// uses), breaking exact synchrony without otherwise changing the
+    /// mechanic being modeled.
     pub fn from_params(variant: Variant, asset_id: AssetId, session_seconds: SimTime, p: &toml::Value) -> Self {
         let default_wake_interval = (session_seconds / 6.0).max(60.0);
         Self {
@@ -83,7 +104,7 @@ fn buy_quote_amount(asset_id: AssetId, mid: f64, quote_amount: f64) -> Option<Ac
 pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult {
     let mut actions = Vec::new();
     let Some(mid) = ctx.market.mid_price(ctx.venue, s.asset_id) else {
-        return StepResult { actions, next_wake: Some(ctx.now + s.wake_interval) };
+        return StepResult { actions, next_wake: Some(ctx.now + jittered(&mut agent.rng, s.wake_interval, 0.05)) };
     };
 
     match s.variant {
@@ -140,5 +161,5 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         }
     }
 
-    StepResult { actions, next_wake: Some(ctx.now + s.wake_interval) }
+    StepResult { actions, next_wake: Some(ctx.now + jittered(&mut agent.rng, s.wake_interval, 0.05)) }
 }
