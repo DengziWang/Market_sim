@@ -1136,6 +1136,25 @@ fn build_population(cfg: &ScenarioConfig, starting_agent_id: AgentId, market: &M
                 }
             }
 
+            // Institutional seller: real starting inventory, not a synthetic
+            // net-short position built by going negative from zero (direct user
+            // request, 2026-11-05). Seeded with exactly `total_qty` of `asset_a`
+            // -- the exact position this bot unwinds over the run -- so its own
+            // `step()` can just read current holdings as "how much is left to
+            // sell," with no separate counter and no need to ever go net-short.
+            // Kept as its own branch rather than folded into
+            // `needs_inventory_seed` above: that seeds a *fraction of starting
+            // cash*, sized to fix a structural buy-only bias; this bot's position
+            // size is a scenario parameter in its own right, unrelated to its
+            // cash budget, and it's Sell-only by design -- there's no buy-only
+            // bias to correct for. Cash is left untouched: this models a position
+            // the institution already held going in, not one bought with its
+            // trading cash at spawn.
+            if group.bot_type == "institutional_seller" {
+                let seed_qty = params::get_f64(&params, "total_qty", 0.0).max(0.0);
+                inventory.insert(asset_a, seed_qty);
+            }
+
             // cash + any pre-funded inventory (only `noise`, above), valued at each
             // asset's own initial price -- the fixed baseline the universal 80%-loss
             // bankruptcy sweep compares current equity against (see

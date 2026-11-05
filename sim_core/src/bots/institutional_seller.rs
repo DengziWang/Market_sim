@@ -9,13 +9,24 @@
 //! bot reproduces that pacing mechanism -- not a lump-sum dump -- against a
 //! fixed total quantity.
 //!
+//! **Real inventory, not a synthetic short (2026-11-05, direct user
+//! request).** This agent is seeded at construction (`sim.rs`'s
+//! agent-build loop, the `institutional_seller` branch right after the
+//! generic `needs_inventory_seed` block) with exactly `total_qty` of its
+//! target asset as a genuine starting spot holding -- the real position
+//! it's unwinding, the same way a real institution's block already sits in
+//! its book before the execution algorithm starts working it. It never
+//! goes net-short: every wake it just sells down from whatever it actually
+//! still holds, so `step()` needs no running "sold so far" counter at all --
+//! current inventory already *is* "how much is left."
+//!
 //! Stays completely dormant (no orders, no further wakes scheduled until the
 //! trigger) until `start_time_secs`, so it can sit in the population from the
 //! very first leg without disturbing a warmup period -- avoids needing any
 //! mid-run order-injection plumbing (none exists in this engine; see
 //! `sim_pyo3::continue_simulation`, which only ever extends a checkpointed
 //! run by a duration, never mutates its agent roster). Once triggered it
-//! sells until `total_qty` is exhausted, then stops for good (no re-arming).
+//! sells until its holding is exhausted, then stops for good (no re-arming).
 
 use super::StepCtx;
 use crate::agent::{Action, AgentCommon, NewOrderRequest, StepResult};
@@ -37,16 +48,23 @@ pub struct State {
     pub asset_id: AssetId,
     /// Fixed total quantity to sell over the life of this run. Deliberately an
     /// absolute quantity, not volume-relative -- only the *pacing* below is
-    /// pegged to trailing volume, matching the real mechanism. How much is
-    /// still left to sell is deliberately NOT tracked as a separate mutable
-    /// counter here -- see `step`'s doc comment on why it's derived fresh
-    /// from the agent's own inventory every wake instead.
+    /// pegged to trailing volume, matching the real mechanism. This is also
+    /// the exact quantity `sim.rs`'s agent-build loop seeds this agent with
+    /// as real starting spot inventory (see this module's doc comment) --
+    /// read again here, independently, only because that seeding happens in
+    /// a different file before this `State` exists; the two must stay in
+    /// sync, which is why both read the same `total_qty` param rather than
+    /// one passing the other a pre-computed value.
     pub total_qty: f64,
     /// Target participation rate relative to trailing volume (0.09 = the real
     /// event's ~9%).
     pub participation_rate: f64,
-    /// Trailing window the participation rate is measured against, in seconds
-    /// (60.0 = the real event's 1-minute window).
+    /// Trailing window the participation rate is measured against, in
+    /// seconds. Default 15.0 (direct user request, 2026-11-05) -- shorter
+    /// and more reactive than the real event's own 1-minute window (60.0),
+    /// which is still what `participation_rate`'s default of 0.09 is
+    /// calibrated against; shortening this window alone makes the bot
+    /// re-peg to recent volume faster without changing that calibration.
     pub trailing_window_secs: SimTime,
     /// Sim time at which this bot wakes up and starts selling. Before this,
     /// every wake is a no-op that reschedules straight to this time rather
@@ -55,8 +73,11 @@ pub struct State {
     pub start_time_secs: SimTime,
     /// How often (once active) this bot re-samples trailing volume and submits
     /// its next slice. Not the real event's own internal cadence (not
-    /// disclosed at that granularity in the report) -- a few seconds is fine
-    /// given the participation rate, not the wake cadence, sets the pacing.
+    /// disclosed at that granularity in the report). Default 0.5 (direct
+    /// user request, 2026-11-05) -- the participation rate, not the wake
+    /// cadence, sets the pacing, so a faster wake just re-samples trailing
+    /// volume more often and slices the same total pacing into smaller,
+    /// more frequent orders rather than selling faster overall.
     pub wake_interval_secs: SimTime,
 }
 
@@ -73,28 +94,29 @@ impl State {
             asset_id,
             total_qty: params::get_f64(p, "total_qty", 0.0).max(0.0),
             participation_rate: params::get_f64(p, "participation_rate", 0.09).max(0.0),
-            trailing_window_secs: params::get_f64(p, "trailing_window_secs", 60.0).max(1.0),
+            trailing_window_secs: params::get_f64(p, "trailing_window_secs", 15.0).max(1.0),
             start_time_secs: params::get_f64(p, "start_time_secs", 0.0).max(0.0),
-            wake_interval_secs: params::get_f64(p, "wake_interval_secs", 3.0).max(0.1),
+            wake_interval_secs: params::get_f64(p, "wake_interval_secs", 0.5).max(0.1),
         }
     }
 }
 
 pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult {
-    // How much has actually sold so far is read back from the agent's own
-    // inventory (updated by `Sim::settle` with the *actual* fill quantity on
-    // every trade), not a self-reported running counter decremented by the
-    // *requested* order size. An IOC market order against a thin book or the
-    // circuit breaker routinely fills far less than requested -- an earlier
-    // version of this bot decremented its own counter by the request size
-    // regardless, so it would believe a single mostly-unfilled order had
-    // exhausted the whole total and go dormant after selling a tiny fraction
-    // of `total_qty` (confirmed directly: logged <1% filled before stopping).
-    // This agent starts with zero inventory in this asset and only ever
-    // submits Sell orders on it, so `-inventory_of` is exactly cumulative
-    // actual sold volume, with no possibility of drifting out of sync.
-    let sold_so_far = (-agent.inventory_of(s.asset_id)).max(0.0);
-    let remaining = (s.total_qty - sold_so_far).max(0.0);
+    // How much is left to sell is just this agent's current holding of the
+    // asset -- no running counter to keep in sync. `sim.rs` seeds this agent
+    // with exactly `total_qty` of real spot inventory at construction (see
+    // this module's doc comment), and `Sim::settle` decrements that holding
+    // by the *actual* fill quantity on every sell, so `inventory_of` already
+    // reflects exactly what's left after every wake, including partial fills
+    // (an IOC market order against a thin book or the circuit breaker
+    // routinely fills less than requested -- confirmed directly in an
+    // earlier version of this bot, which instead decremented a separate
+    // counter by the *requested* size regardless, and so believed a single
+    // mostly-unfilled order had exhausted the whole total: logged <1% filled
+    // before going dormant). This version never goes net-short, since it
+    // only ever requests up to what it currently holds (`qty` below is
+    // capped at `remaining`).
+    let remaining = agent.inventory_of(s.asset_id).max(0.0);
     if remaining <= 1e-9 {
         return StepResult { actions: Vec::new(), next_wake: None };
     }

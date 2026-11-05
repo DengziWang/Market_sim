@@ -598,6 +598,26 @@ pub struct State {
     /// (that previous wake's signals, i.e. what each strategy "predicted" then).
     pub chartist_fitness: f64,
     pub fundamentalist_fitness: f64,
+    /// Overall damping on the chartist/fundamentalist trend blend below
+    /// (2026-11-05, direct user request: a pure-human market with no
+    /// market_maker/mean_reversion counterforce runs away into explosive,
+    /// high-variance bubbles/crashes once the sell-only override mechanisms
+    /// are relaxed enough to stop biasing it downward -- the actual driver
+    /// turned out to be unchecked trend-following, not those overrides. 1.0 =
+    /// no change from the original, undamped blend; lower values shrink the
+    /// whole trend signal's contribution to `raw_signal` uniformly.
+    pub trend_damping: f64,
+    /// Standing, *structural* counter-trend pull -- always present,
+    /// continuously scaled by `price_component` (this wake's own
+    /// momentum reading), independent of the *learned* chartist-vs-contrarian
+    /// switch above (`contrarian_fitness`, which only engages after
+    /// trend-following has provably been losing). 0.0 = no effect (backward
+    /// compatible: the learned switch is the only contrarian force, as
+    /// before). A positive value sells into a rise and buys into a fall every
+    /// wake, proportionally, rather than waiting for fitness-learning to
+    /// eventually catch up -- the real-time stabilizer a pure-human market
+    /// has nothing else to provide.
+    pub counter_trend_scale: f64,
     /// Rolling, *biased* fitness of betting *against* last wake's chartist
     /// signal -- module doc comment's "Chartist vs. contrarian sub-switching"
     /// section. Updated by the exact same salience/confirmation-bias mechanism
@@ -811,6 +831,8 @@ impl State {
             fomo_fatigue_threshold_wakes: params::get_f64(p, "fomo_fatigue_threshold_wakes", 20.0),
             fomo_fatigue_prob_scale: params::get_f64(p, "fomo_fatigue_prob_scale", 0.05),
             fomo_qty_mult: params::get_f64(p, "fomo_qty_mult", 1.5).max(1.0),
+            trend_damping: params::get_f64(p, "trend_damping", 1.0),
+            counter_trend_scale: params::get_f64(p, "counter_trend_scale", 0.0),
             chartist_fitness: 0.0,
             fundamentalist_fitness: 0.0,
             contrarian_fitness: {
@@ -1149,7 +1171,15 @@ pub fn step(agent: &mut AgentCommon, s: &mut State, ctx: &StepCtx) -> StepResult
         }
         Variant::Lite => price_component,
     };
-    let trend_component = chartist_weight * chartist_signal + (1.0 - chartist_weight) * fundamentalist_component;
+    // `trend_damping`/`counter_trend_scale` (2026-11-05, direct user request --
+    // see their own field comments): the learned chartist-vs-contrarian blend
+    // above still runs unchanged; this adds a damping factor on the whole
+    // trend blend plus a standing, always-on counter-trend pull scaled
+    // directly off `price_component` -- continuous, not a gated override, so
+    // it folds into this same blended value like every other component here
+    // rather than branching separately later in `step()`.
+    let trend_component = s.trend_damping * (chartist_weight * chartist_signal + (1.0 - chartist_weight) * fundamentalist_component)
+        - s.counter_trend_scale * price_component;
 
     // Mood component: the latent, price-independent sentiment process, read with
     // individual perception noise (no two people read "the mood" identically) and
