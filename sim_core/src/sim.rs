@@ -1227,6 +1227,7 @@ variant_parser!(parse_grid_variant, grid::Variant, {
     "static" => grid::Variant::Static,
     "geometric" => grid::Variant::Geometric,
     "dynamic_atr" => grid::Variant::DynamicAtr,
+    "passive" => grid::Variant::Passive,
 });
 variant_parser!(parse_dca_variant, dca::Variant, {
     "time_based" => dca::Variant::TimeBased,
