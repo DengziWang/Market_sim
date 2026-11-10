@@ -8,5 +8,6 @@ venv/
 *.egg-info/
 runs/
 *.whl
+*.so
 .DS_Store
 *.png

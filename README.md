@@ -131,6 +131,50 @@ A killed/interrupted `run_experiment` call can just be re-run with the same `pla
 completed cells (those with a `run_metadata.json`) are skipped (`resume=True` is the
 default).
 
+### Paper-reproduction scripts
+
+Two standalone programs reproducing the two experiments from "The Role of
+Humans on Market Quality and Flash-Crash Dynamics in a Simulated Crypto
+Market" (five identical submarkets, a human share that varies while the
+relative mix of market_maker/momentum/dca/mean_reversion stays fixed -- see
+`scripts/paper_lib.py`). Each installs and runs in one line; every run's full
+trade/order-event/snapshot/agent-state history is saved to disk, and once the
+sweep finishes a `report.pdf` is generated reproducing the paper's own tables
+(`scripts/paper_metrics.py`): liquidity, stability and relative net worth
+growth by human share for the first program (its Tables 6-8), and price
+impact of the dump by human share plus with- vs. without-seller comparison
+for the second (its Tables 9 and 11) -- pass `--no-report` to skip it.
+
+Install (from the repo root, in a virtualenv):
+
+```bash
+pip install -e .
+```
+
+Run the human-share sweep (Section 5 -- market quality as a function of
+human share), saving every (composition, seed) run under `runs/human_pct_sweep/`:
+
+```bash
+python scripts/human_pct_sweep.py --runs 3
+```
+
+Run the institutional-seller "flash crash" sweep (Section 6), which for every
+human-share point runs both a "with dump" and a same-seed "no dump" control
+side by side under `runs/dump_sim_sweep/human_<pct>pct/seed_<seed>/{with_dump,no_dump}/`:
+
+```bash
+python scripts/dump_sim_sweep.py --runs 3
+```
+
+Both default to a modest size/duration so they run out of the box; pass
+`--n-total 1000 --session-seconds 100000` (human sweep) or `--n-total 1000`
+(dump sweep, which uses `--warmup-seconds`/`--post-shock-seconds` instead of
+`--session-seconds`) to match the paper's own run scale. `--help` on either
+lists every knob (which human-share points to sweep, number of seeds,
+population size, seller participation rate, output directory, ...). Both
+resume cleanly if interrupted -- re-running with the same `--out-dir` skips
+whatever already completed.
+
 ### Crash-/stress-test experiments
 
 Spec 6a treats these as a distinct experiment *type* (short focused window, more
